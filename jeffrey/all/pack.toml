@@ -1,0 +1,12 @@
+[pack]
+name = "jeffrey"
+schema = 1
+includes = [
+    "../planning-workflow",
+    "../de-slopify",
+    "../ui-polish",
+    "../code-review",
+    "../robot-mode",
+    "../readme-revise",
+    "../idea-wizard",
+]
