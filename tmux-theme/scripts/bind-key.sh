@@ -6,6 +6,10 @@
 # Otherwise captures the existing binding as fallback, then installs
 # an if-shell binding that runs <gc-command> in GC sessions and the
 # original binding in non-GC sessions.
+#
+# With per-city socket isolation, all sessions on the socket are GC
+# sessions. The guard checks for the GC_AGENT env var (set by the
+# controller on every agent session) as a reliable indicator.
 set -e
 
 # Socket-aware tmux command (uses GC_TMUX_SOCKET when set).
@@ -13,7 +17,7 @@ gcmux() { tmux ${GC_TMUX_SOCKET:+-L "$GC_TMUX_SOCKET"} "$@"; }
 
 key="$1"
 gc_command="$2"
-guard_pattern="${3:-^gc-}"
+guard_pattern="${3:-GC_AGENT}"
 
 [ -z "$key" ] || [ -z "$gc_command" ] && exit 1
 
@@ -55,5 +59,7 @@ if [ -z "$fallback" ]; then
 fi
 
 # Install the if-shell binding.
-guard="echo '#{session_name}' | grep -Eq '${guard_pattern}'"
+# Guard checks for GC_AGENT env var in the session environment,
+# which the controller sets on every agent session at startup.
+guard="tmux ${GC_TMUX_SOCKET:+-L $GC_TMUX_SOCKET} show-environment -t '#{session_name}' ${guard_pattern} >/dev/null 2>&1"
 gcmux bind-key -T prefix "$key" if-shell "$guard" "$gc_command" "$fallback"

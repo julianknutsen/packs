@@ -3,12 +3,17 @@
 # Usage: agent-menu.sh <client-tty>
 # Called via tmux run-shell from a keybinding (typically prefix-g).
 # Always exits 0 — tmux must never see errors from run-shell.
+#
+# With per-city socket isolation, all sessions on the socket are GC sessions.
 
 client="$1"
 [ -z "$client" ] && exit 0
 
-# Collect GC sessions (sorted, one per line).
-sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^gc-' | sort)
+# Socket-aware tmux command (uses GC_TMUX_SOCKET when set).
+gcmux() { tmux ${GC_TMUX_SOCKET:+-L "$GC_TMUX_SOCKET"} "$@"; }
+
+# Collect all sessions (all are GC sessions on this socket).
+sessions=$(gcmux list-sessions -F '#{session_name}' 2>/dev/null | sort)
 [ -z "$sessions" ] && exit 0
 
 # Build tmux display-menu arguments.
@@ -26,11 +31,8 @@ for s in $sessions; do
         key=""
     fi
 
-    # Display label: strip "gc-" prefix for readability.
-    label=$(printf '%s' "$s" | sed 's/^gc-//')
-
-    set -- "$@" "$label" "$key" "switch-client -c '$client' -t '$s'"
+    set -- "$@" "$s" "$key" "switch-client -c '$client' -t '$s'"
     i=$((i + 1))
 done
 
-tmux "$@"
+gcmux "$@"

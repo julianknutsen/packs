@@ -8,17 +8,20 @@
 #   Rig crew:      {rig}--{name} members  (per rig)
 #   Town group:    mayor ↔ deacon
 #   Dog pool:      dog-1 ↔ dog-2 ↔ dog-3
-#   Fallback:      all gc-* sessions (works for any pack)
+#   Fallback:      all sessions on this socket (all are GC sessions)
 #
-# Session name format: gc-{city}-{agent}
-#   City-scoped:  gc-mycity-mayor, gc-mycity-deacon, gc-mycity-dog-1
-#   Rig-scoped:   gc-mycity-myrig--witness, gc-mycity-myrig--polecat-1
+# Session name format (per-city socket isolation): {agent}
+#   City-scoped:  mayor, deacon, dog-1
+#   Rig-scoped:   myrig--witness, myrig--polecat-1
 
 direction="$1"
 current="$2"
 client="$3"
 
 [ -z "$direction" ] || [ -z "$current" ] || [ -z "$client" ] && exit 0
+
+# Socket-aware tmux command (uses GC_TMUX_SOCKET when set).
+gcmux() { tmux ${GC_TMUX_SOCKET:+-L "$GC_TMUX_SOCKET"} "$@"; }
 
 # Determine the group filter pattern based on session name conventions.
 case "$current" in
@@ -33,24 +36,21 @@ case "$current" in
         pattern="^${rig}--"
         ;;
     # Town group: mayor ↔ deacon.
-    *-mayor|*-deacon)
-        city="${current%-mayor}"
-        city="${city%-deacon}"
-        pattern="^${city}-\(mayor\|deacon\)$"
+    mayor|deacon)
+        pattern="^\(mayor\|deacon\)$"
         ;;
     # Dog pool: cycle between dog instances.
-    *-dog-[0-9]*)
-        prefix=$(printf '%s' "$current" | sed 's/dog-[0-9]*$/dog-/')
-        pattern="^${prefix}[0-9]"
+    dog-[0-9]*)
+        pattern="^dog-[0-9]"
         ;;
-    # Unknown — cycle all gc-* sessions as fallback.
+    # Unknown — cycle all sessions on this socket (all are GC sessions).
     *)
-        pattern="^gc-"
+        pattern="."
         ;;
 esac
 
 # Get target session: filter to same group, find current, pick next/prev.
-target=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+target=$(gcmux list-sessions -F '#{session_name}' 2>/dev/null \
     | grep "$pattern" \
     | sort \
     | awk -v cur="$current" -v dir="$direction" '
@@ -63,4 +63,4 @@ target=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
         }')
 
 [ -z "$target" ] && exit 0
-tmux switch-client -c "$client" -t "$target"
+gcmux switch-client -c "$client" -t "$target"
