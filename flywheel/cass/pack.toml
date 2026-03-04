@@ -1,0 +1,15 @@
+# CASS — Coding Agent Session Search.
+#
+# Adds a skill for searching past agent sessions for solutions,
+# patterns, and debugging history. Pure CLI tool, no MCP server.
+#
+# Prerequisites:
+#   - cass binary installed and in PATH
+#
+# Usage in city.toml:
+#   [workspace]
+#   packs = ["packs/cass"]
+
+[pack]
+name = "cass"
+schema = 1

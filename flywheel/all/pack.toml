@@ -1,0 +1,18 @@
+# Flywheel All — rolls up all four flywheel enhancement packs.
+#
+# Includes: mcp-agent-mail, cass, cm, ubs.
+# All settings.json files are deep-merged, skills are additive.
+#
+# Usage in city.toml:
+#   [workspace]
+#   includes = ["packs/all"]
+
+[pack]
+name = "flywheel-all"
+schema = 1
+includes = [
+    "../mcp-agent-mail",
+    "../cass",
+    "../cm",
+    "../ubs",
+]

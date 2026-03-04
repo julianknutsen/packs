@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "agent-mail": {
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MCP_AGENT_MAIL_TOKEN}"
+      }
+    }
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "am inbox --count 2>/dev/null || true"
+      }
+    ]
+  }
+}

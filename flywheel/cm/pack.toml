@@ -1,0 +1,18 @@
+# CM — CASS Memory System.
+#
+# Adds the cass-memory MCP server and memory/reflection skills to all agents.
+# Agents can query a persistent playbook of rules learned from past sessions
+# and trigger reflection to extract new insights.
+#
+# Prerequisites:
+#   - cm binary installed and in PATH
+#   - cass-memory server running on 127.0.0.1:8766
+#   - CM_TOKEN env var set
+#
+# Usage in city.toml:
+#   [workspace]
+#   packs = ["packs/cm"]
+
+[pack]
+name = "cm"
+schema = 1

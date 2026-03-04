@@ -1,0 +1,16 @@
+# MCP Agent Mail — inter-agent messaging via Jeffrey Emmanuel's mail server.
+#
+# Adds the mcp-agent-mail MCP server and messaging skills to all agents.
+# No agents defined — this is a pure enhancement pack.
+#
+# Prerequisites:
+#   - mcp-agent-mail server running on 127.0.0.1:8765
+#   - MCP_AGENT_MAIL_TOKEN env var set
+#
+# Usage in city.toml:
+#   [workspace]
+#   packs = ["packs/mcp-agent-mail"]
+
+[pack]
+name = "mcp-agent-mail"
+schema = 1

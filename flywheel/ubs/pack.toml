@@ -1,0 +1,15 @@
+# UBS — Ultimate Bug Scanner.
+#
+# Adds a pre-commit bug scanning hook and a manual scan skill.
+# Agents automatically scan staged files before committing.
+#
+# Prerequisites:
+#   - ubs binary installed and in PATH
+#
+# Usage in city.toml:
+#   [workspace]
+#   packs = ["packs/ubs"]
+
+[pack]
+name = "ubs"
+schema = 1
