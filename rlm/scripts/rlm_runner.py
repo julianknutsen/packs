@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -112,7 +113,12 @@ def build_tools(
         compiled = re.compile(pattern)
         limit = max(1, min(int(limit), MAX_GREP_RESULTS))
         results: list[str] = []
-        for path in list_files(glob_pattern=glob_pattern, limit=5000):
+        paths = sorted(manifest_by_path.keys())
+        if glob_pattern:
+            import fnmatch
+
+            paths = [path for path in paths if fnmatch.fnmatch(path, glob_pattern)]
+        for path in paths:
             entry = manifest_by_path[path]
             lines = (context_root / entry["staged_relpath"]).read_text(encoding="utf-8").splitlines()
             for index, line in enumerate(lines, start=1):
@@ -434,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         return 5
     except Exception as exc:  # noqa: BLE001
         error = summarize_error(exc)
+        tb = traceback.format_exc()
         result = {
             "answer": "",
             "complete": False,
@@ -442,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
             "max_depth_reached": False,
             "max_iterations_reached": False,
             "truncated_paths": list(spec.get("truncated_paths", [])),
-            "notes": [error],
+            "notes": [error, tb],
         }
         if persist_summary:
             write_summary(
@@ -459,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
                 log_path=log_path,
                 error=error,
             )
+        print(tb, file=sys.stderr, end="")
         print(error, file=sys.stderr)
         if spec["output"] == "json":
             print(json.dumps(result, indent=2, sort_keys=True))

@@ -51,7 +51,7 @@ from rlm_common import (
     save_runtime_config,
     stage_corpus,
 )
-from rlm_runner import SourceTracker, parse_final_payload, summary_result
+from rlm_runner import SourceTracker, build_tools, parse_final_payload, summary_result
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -223,7 +223,7 @@ class StageCorpusTests(unittest.TestCase):
             (city_root / "keep.txt").write_text("hello\n", encoding="utf-8")
 
             with mock.patch("rlm_common.read_text_file", side_effect=PermissionError("denied")):
-                with self.assertRaises(PermissionError):
+                with self.assertRaises(CLIError):
                     stage_corpus(
                         city_root=city_root,
                         cwd=city_root,
@@ -269,6 +269,24 @@ class RunnerPayloadTests(unittest.TestCase):
         self.assertEqual(summary["answer"], "")
         self.assertEqual(summary["sources"], [])
         self.assertEqual(summary["notes"], ["kept"])
+
+    def test_grep_scans_beyond_list_files_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context_root = Path(tmp)
+            manifest = []
+            for index in range(600):
+                name = f"f{index:03d}.txt"
+                text = "needle\n" if index == 599 else "hay\n"
+                (context_root / name).write_text(text, encoding="utf-8")
+                manifest.append({"display_path": name, "staged_relpath": name, "line_count": 1})
+            tracker = SourceTracker(manifest, context_root)
+            grep_tool = build_tools(
+                manifest=manifest,
+                context_root=context_root,
+                tracker=tracker,
+            )["grep"]["tool"]
+            matches = grep_tool("needle")
+            self.assertEqual(matches, ["f599.txt:1: needle"])
 
 
 if __name__ == "__main__":

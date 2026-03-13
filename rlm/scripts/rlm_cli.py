@@ -25,6 +25,7 @@ from rlm_common import (
     build_context_payload,
     check_python_version,
     city_root_from_env,
+    config_path,
     default_backend_api_key_env,
     docker_image_exists,
     docker_image_tag,

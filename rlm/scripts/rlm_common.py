@@ -752,7 +752,7 @@ def stage_corpus(
                 continue
             try:
                 text, size_bytes, digest = read_text_file(candidate)
-            except CLIError:
+            except (CLIError, OSError):
                 truncated_paths.append(display_path(candidate, cwd))
                 continue
             if total_bytes + size_bytes > MAX_STAGED_BYTES:

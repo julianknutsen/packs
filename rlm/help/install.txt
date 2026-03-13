@@ -12,12 +12,15 @@ Key flags:
   --backend-api-key-env <name>   Environment variable holding the API key. Empty string disables the check.
   --allow-remote-backend         Required for backends that need non-loopback network egress.
   --max-depth <n>                Default recursion depth policy.
+  --max-depth-ceiling <n>        Hard upper bound for per-call depth overrides.
   --max-iterations <n>           Default iteration policy.
+  --max-iterations-ceiling <n>   Hard upper bound for per-call iteration overrides.
   --max-calls-per-hour <n>       Hourly per-city safety limit for ask calls.
   --max-duration-seconds <n>     Max runtime budget per call.
   --max-tokens-per-call <n>      Max token budget passed to the upstream RLM run.
   --log-retention-days <n>       Days to keep persisted summary metadata.
   --disable-logging              Disable persisted run summaries and trajectory logs.
+  --ignore-gitignore             Stage files even when they are ignored by Git.
 
 This command creates .gc/rlm/, a virtualenv, a runtime config file, and a
 Docker image when Docker mode is allowed. Rerunning the command is safe.
