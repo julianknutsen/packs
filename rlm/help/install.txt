@@ -5,7 +5,7 @@ Usage:
   gc rlm install --backend openai --model local-model --base-url http://127.0.0.1:8000/v1 --backend-api-key-env '' --environment local
 
 Key flags:
-  --backend <name>               Backend identifier passed to the upstream rlms package.
+  --backend <openai>             Phase-1 backend support. Use OpenAI-compatible endpoints only.
   --model <name>                 Root model name used for RLM calls.
   --environment <docker|local>   Default execution environment. Local is explicit opt-in.
   --base-url <url>               Optional OpenAI-compatible base URL.

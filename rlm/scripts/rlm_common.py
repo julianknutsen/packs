@@ -19,12 +19,27 @@ from typing import Any
 from urllib.parse import urlparse
 
 import fcntl
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
 
 
 RUNTIME_SCHEMA = 1
 RUNTIME_VERSION = "0.1.0"
-DEFAULT_SECRET_DENYLIST = [".env", ".env.*", "*.pem", "*credentials*", "*token*"]
+DEFAULT_SECRET_DENYLIST = [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*credentials*.json",
+    "*credentials*.yaml",
+    "*credentials*.yml",
+    "*token*.json",
+    "*token*.yaml",
+    "*token*.yml",
+]
 DEFAULT_ALLOWED_ENVIRONMENTS = ["docker"]
 DEFAULT_MAX_DEPTH = 2
 DEFAULT_MAX_DEPTH_CEILING = 3
@@ -115,6 +130,12 @@ class RuntimeConfig:
         if self.schema != RUNTIME_SCHEMA:
             raise CLIError(
                 f"Unsupported .gc/rlm/config.toml schema {self.schema}; expected {RUNTIME_SCHEMA}.",
+                exit_code=2,
+            )
+        self.backend = self.backend.strip().lower()
+        if self.backend not in {"openai"}:
+            raise CLIError(
+                f"Unsupported backend {self.backend!r}; phase-1 support is limited to OpenAI-compatible backends.",
                 exit_code=2,
             )
         allowed = []
@@ -286,12 +307,23 @@ def file_lock(path: Path):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        with os.fdopen(fd, "a+", encoding="utf-8") as handle:
+        try:
+            handle = os.fdopen(fd, "a+", encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            raise
+        with handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             yield handle
     finally:
         # fd is closed by fdopen context manager
         pass
+
+
+def require_tomllib() -> Any:
+    if tomllib is None:
+        raise CLIError("python3 3.11+ is required for the rlm pack.", exit_code=2)
+    return tomllib
 
 
 def load_runtime_config(city_root: Path) -> RuntimeConfig:
@@ -302,7 +334,7 @@ def load_runtime_config(city_root: Path) -> RuntimeConfig:
             exit_code=2,
         )
     with path.open("rb") as handle:
-        data = tomllib.load(handle)
+        data = require_tomllib().load(handle)
     return RuntimeConfig.from_dict(data)
 
 
@@ -492,9 +524,6 @@ def safe_stage_relpath(display_value: str) -> Path:
     normalized = display_value.replace("\\", "/")
     if normalized.startswith("/"):
         normalized = f"_abs{normalized}"
-    while normalized.startswith("../"):
-        normalized = normalized[3:]
-        normalized = f"_outside/{normalized}"
     if normalized in {"", ".", ".."}:
         normalized = "_root"
     normalized = normalized.replace(":", "_")
@@ -601,6 +630,14 @@ def matches_secret_denylist(path: Path, denylist: list[str], cwd: Path) -> bool:
     return any(fnmatch.fnmatch(candidate, pattern) for candidate in candidates for pattern in denylist)
 
 
+def is_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def gather_candidates(
     *,
     cwd: Path,
@@ -641,6 +678,8 @@ def gather_candidates(
         for match in matches:
             resolved = resolve_input_path(match, cwd)
             if resolved.is_file():
+                if not is_within_root(resolved, cwd):
+                    continue
                 candidates.append(resolved)
             elif resolved.is_dir():
                 for dirpath, dirnames, filenames in os.walk(resolved, followlinks=False):
@@ -651,7 +690,14 @@ def gather_candidates(
                         if name not in EXCLUDED_WALK_DIRS and not (current / name).is_symlink()
                     ]
                     for filename in filenames:
-                        candidates.append((current / filename).resolve())
+                        candidate = (current / filename)
+                        if candidate.is_symlink():
+                            if not is_within_root(candidate, cwd):
+                                continue
+                        resolved_candidate = candidate.resolve()
+                        if not is_within_root(resolved_candidate, cwd):
+                            continue
+                        candidates.append(resolved_candidate)
 
     deduped: list[Path] = []
     seen: set[Path] = set()
@@ -673,98 +719,102 @@ def stage_corpus(
 ) -> CorpusBundle:
     run_id = uuid.uuid4().hex
     run_dir = Path(tempfile.mkdtemp(prefix=f"rlm-{run_id}-", dir=cache_dir(city_root)))
-    context_dir = run_dir / "context"
-    output_dir = run_dir / "output"
-    context_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        context_dir = run_dir / "context"
+        output_dir = run_dir / "output"
+        context_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    candidates, roots = gather_candidates(cwd=cwd, path_args=path_args, glob_args=glob_args)
-    respect_gitignore = not cfg.ignore_gitignore
-    candidates, ignored_paths = filter_gitignored(candidates, respect_gitignore)
+        candidates, roots = gather_candidates(cwd=cwd, path_args=path_args, glob_args=glob_args)
+        respect_gitignore = not cfg.ignore_gitignore
+        candidates, ignored_paths = filter_gitignored(candidates, respect_gitignore)
 
-    files: list[CorpusFile] = []
-    inline_files: dict[str, str] = {}
-    truncated_paths = list(ignored_paths)
-    total_bytes = 0
-    inline_budget = MAX_INLINE_BYTES
+        files: list[CorpusFile] = []
+        inline_files: dict[str, str] = {}
+        truncated_paths = list(ignored_paths)
+        total_bytes = 0
+        inline_budget = MAX_INLINE_BYTES
 
-    for candidate in candidates:
-        if not candidate.is_file():
-            continue
-        if matches_secret_denylist(candidate, cfg.secret_denylist, cwd):
-            truncated_paths.append(display_path(candidate, cwd))
-            continue
-        try:
-            text, size_bytes, digest = read_text_file(candidate)
-        except CLIError:
-            truncated_paths.append(display_path(candidate, cwd))
-            continue
-        if total_bytes + size_bytes > MAX_STAGED_BYTES:
-            truncated_paths.append(display_path(candidate, cwd))
-            continue
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            if matches_secret_denylist(candidate, cfg.secret_denylist, cwd):
+                truncated_paths.append(display_path(candidate, cwd))
+                continue
+            try:
+                text, size_bytes, digest = read_text_file(candidate)
+            except CLIError:
+                truncated_paths.append(display_path(candidate, cwd))
+                continue
+            if total_bytes + size_bytes > MAX_STAGED_BYTES:
+                truncated_paths.append(display_path(candidate, cwd))
+                continue
 
-        total_bytes += size_bytes
-        shown_path = display_path(candidate, cwd)
-        staged_rel = safe_stage_relpath(shown_path)
-        staged_path = reserve_staged_path(context_dir, staged_rel)
-        staged_rel = staged_path.relative_to(context_dir)
-        staged_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        staged_path.write_text(text, encoding="utf-8")
-        line_count = text.count("\n") + (1 if text else 0)
-        files.append(
-            CorpusFile(
-                display_path=shown_path,
-                original_path=candidate.as_posix(),
-                staged_relpath=staged_rel.as_posix(),
-                size_bytes=size_bytes,
-                line_count=line_count,
-                sha256=digest,
+            total_bytes += size_bytes
+            shown_path = display_path(candidate, cwd)
+            staged_rel = safe_stage_relpath(shown_path)
+            staged_path = reserve_staged_path(context_dir, staged_rel)
+            staged_rel = staged_path.relative_to(context_dir)
+            staged_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            staged_path.write_text(text, encoding="utf-8")
+            line_count = text.count("\n") + (1 if text else 0)
+            files.append(
+                CorpusFile(
+                    display_path=shown_path,
+                    original_path=candidate.as_posix(),
+                    staged_relpath=staged_rel.as_posix(),
+                    size_bytes=size_bytes,
+                    line_count=line_count,
+                    sha256=digest,
+                )
             )
-        )
-        text_bytes = len(text.encode("utf-8"))
-        if text_bytes <= inline_budget and len(inline_files) < 12:
-            inline_files[shown_path] = text
-            inline_budget -= text_bytes
+            text_bytes = len(text.encode("utf-8"))
+            if text_bytes <= inline_budget and len(inline_files) < 12:
+                inline_files[shown_path] = text
+                inline_budget -= text_bytes
 
-    if stdin_text:
-        staged_rel = Path("_stdin/stdin.txt")
-        staged_path = reserve_staged_path(context_dir, staged_rel)
-        staged_rel = staged_path.relative_to(context_dir)
-        staged_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        staged_path.write_text(stdin_text, encoding="utf-8")
-        digest = hashlib.sha256(stdin_text.encode("utf-8")).hexdigest()
-        line_count = stdin_text.count("\n") + (1 if stdin_text else 0)
-        files.append(
-            CorpusFile(
-                display_path="stdin.txt",
-                original_path="<stdin>",
-                staged_relpath=staged_rel.as_posix(),
-                size_bytes=len(stdin_text.encode("utf-8")),
-                line_count=line_count,
-                sha256=digest,
+        if stdin_text:
+            staged_rel = Path("_stdin/stdin.txt")
+            staged_path = reserve_staged_path(context_dir, staged_rel)
+            staged_rel = staged_path.relative_to(context_dir)
+            staged_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            staged_path.write_text(stdin_text, encoding="utf-8")
+            digest = hashlib.sha256(stdin_text.encode("utf-8")).hexdigest()
+            line_count = stdin_text.count("\n") + (1 if stdin_text else 0)
+            files.append(
+                CorpusFile(
+                    display_path="stdin.txt",
+                    original_path="<stdin>",
+                    staged_relpath=staged_rel.as_posix(),
+                    size_bytes=len(stdin_text.encode("utf-8")),
+                    line_count=line_count,
+                    sha256=digest,
+                )
             )
-        )
-        if len(stdin_text.encode("utf-8")) <= inline_budget:
-            inline_files["stdin.txt"] = stdin_text
+            if len(stdin_text.encode("utf-8")) <= inline_budget:
+                inline_files["stdin.txt"] = stdin_text
 
-    if not files:
-        raise CLIError(
-            "No eligible text files were staged for RLM analysis. Expand the scope, disable the deny-list patterns, or pass --stdin.",
-            exit_code=2,
-        )
+        if not files:
+            raise CLIError(
+                "No eligible text files were staged for RLM analysis. Expand the scope, disable the deny-list patterns, or pass --stdin.",
+                exit_code=2,
+            )
 
-    return CorpusBundle(
-        run_id=run_id,
-        run_dir=run_dir,
-        context_dir=context_dir,
-        output_dir=output_dir,
-        files=files,
-        inline_files=inline_files,
-        truncated_paths=sorted(set(truncated_paths)),
-        roots=roots,
-        total_bytes=total_bytes,
-        file_count=len(files),
-    )
+        return CorpusBundle(
+            run_id=run_id,
+            run_dir=run_dir,
+            context_dir=context_dir,
+            output_dir=output_dir,
+            files=files,
+            inline_files=inline_files,
+            truncated_paths=sorted(set(truncated_paths)),
+            roots=roots,
+            total_bytes=total_bytes,
+            file_count=len(files),
+        )
+    except BaseException:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise
 
 
 def build_context_payload(bundle: CorpusBundle) -> dict[str, Any]:

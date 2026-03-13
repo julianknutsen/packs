@@ -9,3 +9,4 @@ The report includes:
 
 Usage:
   gc rlm status
+  gc rlm status --json

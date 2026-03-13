@@ -5,6 +5,7 @@ Recursive Language Model sidecar for Gas City.
 This pack adds an optional long-context helper without changing the city's
 primary agent provider. Agents keep using Claude/Codex/Gemini for normal work
 and can call `gc rlm ask` when a task needs repo-wide or log-wide synthesis.
+Phase 1 supports OpenAI-compatible backends only.
 
 ## What it provides
 

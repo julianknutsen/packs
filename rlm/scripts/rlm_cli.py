@@ -58,7 +58,7 @@ def positive_int(value: str) -> int:
 
 def install_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gc rlm install")
-    parser.add_argument("--backend", default="openai")
+    parser.add_argument("--backend", choices=["openai"], default="openai")
     parser.add_argument("--model", required=True)
     parser.add_argument("--environment", choices=["docker", "local"], default="docker")
     parser.add_argument("--base-url", default="")
@@ -128,6 +128,7 @@ def create_runtime_config(args: argparse.Namespace, pack_dir: Path) -> RuntimeCo
         docker_image=docker_image_tag(pack_dir) if args.environment == "docker" else "",
         installed_at=utc_now_iso(),
     )
+    cfg.validate()
     if backend_requires_network(cfg) and not cfg.remote_backend_allowed:
         raise CLIError(
             "This install uses a networked backend. Pass --allow-remote-backend to acknowledge that policy.",
@@ -262,7 +263,6 @@ def ask_runtime(args: argparse.Namespace) -> int:
     cfg.validate()
     ensure_remote_backend_policy(cfg)
     prune_old_logs(city_root, cfg.log_retention_days)
-    update_rate_limit(city_root, cfg.max_calls_per_hour)
     cwd = Path.cwd().resolve()
 
     stdin_text = sys.stdin.read() if args.stdin else None
@@ -277,6 +277,7 @@ def ask_runtime(args: argparse.Namespace) -> int:
         stdin_text=stdin_text,
         cfg=cfg,
     )
+    update_rate_limit(city_root, cfg.max_calls_per_hour)
     try:
         if cfg.default_environment == "docker":
             require_docker()
@@ -418,14 +419,13 @@ def status_runtime(args: argparse.Namespace) -> int:
 def uninstall_runtime(args: argparse.Namespace) -> int:
     city_root = city_root_from_env()
     runtime_root = runtime_dir(city_root)
-    cfg = maybe_read_json(runtime_root / "install-summary.json")
-    docker_image = ""
-    try:
-        docker_image = load_runtime_config(city_root).docker_image
-    except CLIError:
-        docker_image = cfg.get("docker_image", "") if cfg else ""
-
     with file_lock(lock_path(city_root)):
+        cfg = maybe_read_json(runtime_root / "install-summary.json")
+        docker_image = ""
+        try:
+            docker_image = load_runtime_config(city_root).docker_image
+        except CLIError:
+            docker_image = cfg.get("docker_image", "") if cfg else ""
         for rel in ["venv", "cache", "config.toml", "install-summary.json"]:
             path = runtime_root / rel
             if path.is_dir():
