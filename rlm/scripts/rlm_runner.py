@@ -259,6 +259,21 @@ def write_summary(
     return summary_path
 
 
+def summary_result(result: dict[str, Any], *, include_content: bool) -> dict[str, Any]:
+    if include_content:
+        return result
+    return {
+        "answer": "",
+        "complete": bool(result.get("complete", False)),
+        "sources": [],
+        "recursion_depth_used": int(result.get("recursion_depth_used", 0)),
+        "max_depth_reached": bool(result.get("max_depth_reached", False)),
+        "max_iterations_reached": bool(result.get("max_iterations_reached", False)),
+        "truncated_paths": list(result.get("truncated_paths", [])),
+        "notes": list(result.get("notes", [])),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = runner_parser().parse_args(argv)
     spec_path = Path(args.spec)
@@ -266,11 +281,14 @@ def main(argv: list[str] | None = None) -> int:
     context_root = Path(spec["context_root"])
     logs_dir = Path(spec["logs_dir"])
     logs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    log_enabled = bool(spec.get("log_enabled", True))
+    persist_summary = log_enabled
+    include_summary_content = log_enabled and not bool(spec.get("no_log_content"))
 
     tracker = SourceTracker(spec["manifest"], context_root)
     tools = build_tools(manifest=spec["manifest"], context_root=context_root, tracker=tracker)
     logger: RLMLogger | None
-    if spec.get("log_enabled", True):
+    if log_enabled:
         if spec.get("no_log_content"):
             logger = RLMLogger()
             log_path = ""
@@ -299,20 +317,21 @@ def main(argv: list[str] | None = None) -> int:
                 "truncated_paths": spec.get("truncated_paths", []),
                 "notes": [error],
             }
-            write_summary(
-                logs_dir=logs_dir,
-                run_id=spec["run_id"],
-                status="error",
-                payload={
-                    "started_at": utc_now_iso(),
-                    "backend": spec["backend"],
-                    "model": spec["model"],
-                    "environment": spec.get("default_environment"),
-                    "result": result,
-                },
-                log_path=log_path,
-                error=error,
-            )
+            if persist_summary:
+                write_summary(
+                    logs_dir=logs_dir,
+                    run_id=spec["run_id"],
+                    status="error",
+                    payload={
+                        "started_at": utc_now_iso(),
+                        "backend": spec["backend"],
+                        "model": spec["model"],
+                        "environment": spec.get("default_environment"),
+                        "result": summary_result(result, include_content=include_summary_content),
+                    },
+                    log_path=log_path,
+                    error=error,
+                )
             print(error, file=sys.stderr)
             if spec["output"] == "json":
                 print(json.dumps(result, indent=2, sort_keys=True))
@@ -355,19 +374,20 @@ def main(argv: list[str] | None = None) -> int:
             max_iterations=int(spec["max_iterations"]),
         )
         status = "ok" if result["complete"] else "partial"
-        write_summary(
-            logs_dir=logs_dir,
-            run_id=spec["run_id"],
-            status=status,
-            payload={
-                "started_at": started_at,
-                "backend": spec["backend"],
-                "model": spec["model"],
-                "environment": spec.get("default_environment"),
-                "result": result,
-            },
-            log_path=log_path,
-        )
+        if persist_summary:
+            write_summary(
+                logs_dir=logs_dir,
+                run_id=spec["run_id"],
+                status=status,
+                payload={
+                    "started_at": started_at,
+                    "backend": spec["backend"],
+                    "model": spec["model"],
+                    "environment": spec.get("default_environment"),
+                    "result": summary_result(result, include_content=include_summary_content),
+                },
+                log_path=log_path,
+            )
         if log_path:
             print(f"rlm log: {log_path}", file=sys.stderr)
         if spec["output"] == "json":
@@ -391,20 +411,21 @@ def main(argv: list[str] | None = None) -> int:
             max_iterations=int(spec["max_iterations"]),
         )
         error = summarize_error(exc)
-        write_summary(
-            logs_dir=logs_dir,
-            run_id=spec["run_id"],
-            status="error",
-            payload={
-                "started_at": started_at,
-                "backend": spec["backend"],
-                "model": spec["model"],
-                "environment": spec.get("default_environment"),
-                "result": result,
-            },
-            log_path=log_path,
-            error=error,
-        )
+        if persist_summary:
+            write_summary(
+                logs_dir=logs_dir,
+                run_id=spec["run_id"],
+                status="error",
+                payload={
+                    "started_at": started_at,
+                    "backend": spec["backend"],
+                    "model": spec["model"],
+                    "environment": spec.get("default_environment"),
+                    "result": summary_result(result, include_content=include_summary_content),
+                },
+                log_path=log_path,
+                error=error,
+            )
         print(error, file=sys.stderr)
         if spec["output"] == "json":
             print(json.dumps(result, indent=2, sort_keys=True))
@@ -423,20 +444,21 @@ def main(argv: list[str] | None = None) -> int:
             "truncated_paths": list(spec.get("truncated_paths", [])),
             "notes": [error],
         }
-        write_summary(
-            logs_dir=logs_dir,
-            run_id=spec["run_id"],
-            status="error",
-            payload={
-                "started_at": started_at,
-                "backend": spec["backend"],
-                "model": spec["model"],
-                "environment": spec.get("default_environment"),
-                "result": result,
-            },
-            log_path=log_path,
-            error=error,
-        )
+        if persist_summary:
+            write_summary(
+                logs_dir=logs_dir,
+                run_id=spec["run_id"],
+                status="error",
+                payload={
+                    "started_at": started_at,
+                    "backend": spec["backend"],
+                    "model": spec["model"],
+                    "environment": spec.get("default_environment"),
+                    "result": summary_result(result, include_content=include_summary_content),
+                },
+                log_path=log_path,
+                error=error,
+            )
         print(error, file=sys.stderr)
         if spec["output"] == "json":
             print(json.dumps(result, indent=2, sort_keys=True))

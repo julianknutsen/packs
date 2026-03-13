@@ -12,8 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-if "rlm" not in sys.modules:
-    fake_rlm = types.ModuleType("rlm")
+existing_rlm = sys.modules.get("rlm")
+if existing_rlm is None or not hasattr(existing_rlm, "BudgetExceededError"):
+    fake_rlm = existing_rlm or types.ModuleType("rlm")
 
     class _DummyRLMError(Exception):
         pass
@@ -24,7 +25,8 @@ if "rlm" not in sys.modules:
     fake_rlm.TimeoutExceededError = _DummyRLMError
     fake_rlm.TokenLimitExceededError = _DummyRLMError
     fake_rlm.RLM = object
-    sys.modules["rlm"] = fake_rlm
+    if existing_rlm is None:
+        sys.modules["rlm"] = fake_rlm
 
     fake_logger = types.ModuleType("rlm.logger")
     fake_logger.RLMLogger = object
@@ -49,7 +51,7 @@ from rlm_common import (
     save_runtime_config,
     stage_corpus,
 )
-from rlm_runner import SourceTracker, parse_final_payload
+from rlm_runner import SourceTracker, parse_final_payload, summary_result
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -103,6 +105,28 @@ class RuntimeConfigTests(unittest.TestCase):
             allow_remote_backend=False,
             environment="local",
             max_depth=5,
+            max_depth_ceiling=3,
+            max_iterations=16,
+            max_iterations_ceiling=24,
+            max_calls_per_hour=12,
+            max_duration_seconds=300,
+            max_tokens_per_call=120000,
+            disable_logging=False,
+            log_retention_days=7,
+            ignore_gitignore=False,
+        )
+        with self.assertRaises(CLIError):
+            create_runtime_config(args, Path("/tmp/fake-pack"))
+
+    def test_docker_loopback_backend_is_rejected(self) -> None:
+        args = SimpleNamespace(
+            backend="openai",
+            model="test-model",
+            base_url="http://127.0.0.1:8000/v1",
+            backend_api_key_env="",
+            allow_remote_backend=False,
+            environment="docker",
+            max_depth=2,
             max_depth_ceiling=3,
             max_iterations=16,
             max_iterations_ceiling=24,
@@ -171,26 +195,26 @@ class StageCorpusTests(unittest.TestCase):
             city_root = Path(tmp)
             ensure_runtime_layout(city_root)
             (city_root / "keep.txt").write_text("keep\n", encoding="utf-8")
-            outside_dir = city_root.parent / "outside"
-            outside_dir.mkdir()
-            (outside_dir / "secret.txt").write_text("secret\n", encoding="utf-8")
-            try:
-                (city_root / "linked.txt").symlink_to(outside_dir / "secret.txt")
-            except OSError as exc:
-                self.skipTest(f"symlinks unavailable: {exc}")
+            with tempfile.TemporaryDirectory() as outside_tmp:
+                outside_dir = Path(outside_tmp)
+                (outside_dir / "secret.txt").write_text("secret\n", encoding="utf-8")
+                try:
+                    (city_root / "linked.txt").symlink_to(outside_dir / "secret.txt")
+                except OSError as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
 
-            bundle = stage_corpus(
-                city_root=city_root,
-                cwd=city_root,
-                path_args=[],
-                glob_args=["*.txt"],
-                stdin_text=None,
-                cfg=RuntimeConfig(default_environment="local", allowed_environments=["local"]),
-            )
+                bundle = stage_corpus(
+                    city_root=city_root,
+                    cwd=city_root,
+                    path_args=[],
+                    glob_args=["*.txt"],
+                    stdin_text=None,
+                    cfg=RuntimeConfig(default_environment="local", allowed_environments=["local"]),
+                )
 
-            staged_paths = {entry.display_path for entry in bundle.files}
-            self.assertIn("keep.txt", staged_paths)
-            self.assertNotIn(str((outside_dir / "secret.txt").as_posix()), staged_paths)
+                staged_paths = {entry.display_path for entry in bundle.files}
+                self.assertIn("keep.txt", staged_paths)
+                self.assertNotIn(str((outside_dir / "secret.txt").as_posix()), staged_paths)
 
     def test_stage_corpus_cleans_temp_dir_on_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -229,6 +253,22 @@ class RunnerPayloadTests(unittest.TestCase):
             max_iterations=4,
         )
         self.assertEqual(payload["sources"], [{"path": "keep.txt", "start_line": 1, "end_line": 2}])
+
+    def test_summary_result_strips_content_when_disabled(self) -> None:
+        result = {
+            "answer": "secret",
+            "complete": True,
+            "sources": [{"path": "keep.txt", "start_line": 1, "end_line": 2}],
+            "recursion_depth_used": 2,
+            "max_depth_reached": False,
+            "max_iterations_reached": False,
+            "truncated_paths": ["skipped.txt"],
+            "notes": ["kept"],
+        }
+        summary = summary_result(result, include_content=False)
+        self.assertEqual(summary["answer"], "")
+        self.assertEqual(summary["sources"], [])
+        self.assertEqual(summary["notes"], ["kept"])
 
 
 if __name__ == "__main__":

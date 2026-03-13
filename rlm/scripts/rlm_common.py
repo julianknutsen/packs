@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -155,6 +156,11 @@ class RuntimeConfig:
                 "default_environment must be present in allowed_environments.",
                 exit_code=2,
             )
+        if self.default_environment == "docker" and is_loopback_url(self.base_url):
+            raise CLIError(
+                "Docker execution cannot use a loopback base_url. Use --environment local or a routable host.",
+                exit_code=2,
+            )
         if self.max_depth < 1 or self.max_depth > self.max_depth_ceiling:
             raise CLIError("Invalid max_depth policy in .gc/rlm/config.toml.", exit_code=2)
         if self.max_iterations < 1 or self.max_iterations > self.max_iterations_ceiling:
@@ -236,7 +242,13 @@ class CorpusBundle:
 
 
 def toml_quote(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
     return f'"{escaped}"'
 
 
@@ -294,6 +306,10 @@ def ensure_runtime_layout(city_root: Path) -> None:
     root = runtime_dir(city_root)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(root, 0o700)
+    ignore = root / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("*\n!.gitignore\n", encoding="utf-8")
+        os.chmod(ignore, 0o600)
     logs = logs_dir(city_root)
     logs.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(logs, 0o700)
@@ -303,7 +319,7 @@ def ensure_runtime_layout(city_root: Path) -> None:
 
 
 @contextmanager
-def file_lock(path: Path):
+def file_lock(path: Path, *, exclusive: bool = True):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
@@ -313,7 +329,8 @@ def file_lock(path: Path):
             os.close(fd)
             raise
         with handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(handle.fileno(), mode)
             yield handle
     finally:
         # fd is closed by fdopen context manager
@@ -403,39 +420,21 @@ def ensure_remote_backend_policy(cfg: RuntimeConfig) -> None:
         )
 
 
-def ensure_gitignore_entry(city_root: Path, entry: str = ".gc/rlm/") -> None:
-    path = city_root / ".gitignore"
-    if path.exists():
-        current = path.read_text(encoding="utf-8")
-        if any(line.strip() == entry for line in current.splitlines()):
-            return
-        suffix = "" if current.endswith("\n") or current == "" else "\n"
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{suffix}{entry}\n")
-        return
-    path.write_text(f"{entry}\n", encoding="utf-8")
-
-
 def docker_image_tag(pack_dir: Path) -> str:
     hasher = hashlib.sha256()
-    for rel in [
-        "requirements.lock",
-        "docker/Dockerfile",
-        "scripts/rlm_common.py",
-        "scripts/rlm_runner.py",
-    ]:
+    for rel in ["requirements.lock", "docker/Dockerfile"]:
         path = pack_dir / rel
         if path.exists():
+            hasher.update(path.read_bytes())
+    scripts_dir = pack_dir / "scripts"
+    if scripts_dir.exists():
+        for path in sorted(scripts_dir.glob("*.py")):
             hasher.update(path.read_bytes())
     return f"gascity-rlm:{RUNTIME_VERSION}-{hasher.hexdigest()[:12]}"
 
 
 def check_python_version() -> tuple[int, ...]:
-    proc = run(
-        ["python3", "-c", "import sys, json; print(json.dumps(list(sys.version_info[:3])))"],
-        capture_output=True,
-    )
-    version_info = json.loads(proc.stdout.strip())
+    version_info = tuple(sys.version_info[:3])
     if tuple(version_info) < (3, 11, 0):
         raise CLIError("python3 3.11+ is required for the rlm pack.", exit_code=2)
     return tuple(version_info)
@@ -466,6 +465,16 @@ def prune_old_logs(city_root: Path, days: int) -> None:
                     shutil.rmtree(path, ignore_errors=True)
                 else:
                     path.unlink(missing_ok=True)
+        except FileNotFoundError:
+            continue
+
+
+def prune_stale_cache_runs(city_root: Path, max_age_seconds: int = 3600) -> None:
+    cutoff = time.time() - max_age_seconds
+    for path in cache_dir(city_root).glob("rlm-*"):
+        try:
+            if path.is_dir() and path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
         except FileNotFoundError:
             continue
 

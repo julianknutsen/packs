@@ -12,17 +12,22 @@ from typing import Any
 
 from rlm_common import (
     CLIError,
+    DEFAULT_LOG_RETENTION_DAYS,
+    DEFAULT_MAX_CALLS_PER_HOUR,
+    DEFAULT_MAX_DEPTH,
+    DEFAULT_MAX_DEPTH_CEILING,
+    DEFAULT_MAX_DURATION_SECONDS,
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MAX_ITERATIONS_CEILING,
+    DEFAULT_MAX_TOKENS_PER_CALL,
     RuntimeConfig,
     backend_requires_network,
     build_context_payload,
-    cache_dir,
     check_python_version,
     city_root_from_env,
-    config_path,
     default_backend_api_key_env,
     docker_image_exists,
     docker_image_tag,
-    ensure_gitignore_entry,
     ensure_remote_backend_policy,
     ensure_runtime_layout,
     file_lock,
@@ -35,6 +40,7 @@ from rlm_common import (
     maybe_read_json,
     pack_dir_from_env,
     prune_old_logs,
+    prune_stale_cache_runs,
     recent_run_summaries,
     require_docker,
     require_runtime_python,
@@ -64,14 +70,26 @@ def install_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default="")
     parser.add_argument("--backend-api-key-env", default=None)
     parser.add_argument("--allow-remote-backend", action="store_true")
-    parser.add_argument("--max-depth", type=positive_int, default=2)
-    parser.add_argument("--max-depth-ceiling", type=positive_int, default=3)
-    parser.add_argument("--max-iterations", type=positive_int, default=16)
-    parser.add_argument("--max-iterations-ceiling", type=positive_int, default=24)
-    parser.add_argument("--max-calls-per-hour", type=positive_int, default=12)
-    parser.add_argument("--max-duration-seconds", type=positive_int, default=300)
-    parser.add_argument("--max-tokens-per-call", type=positive_int, default=120000)
-    parser.add_argument("--log-retention-days", type=int, default=7)
+    parser.add_argument("--max-depth", type=positive_int, default=DEFAULT_MAX_DEPTH)
+    parser.add_argument("--max-depth-ceiling", type=positive_int, default=DEFAULT_MAX_DEPTH_CEILING)
+    parser.add_argument("--max-iterations", type=positive_int, default=DEFAULT_MAX_ITERATIONS)
+    parser.add_argument(
+        "--max-iterations-ceiling",
+        type=positive_int,
+        default=DEFAULT_MAX_ITERATIONS_CEILING,
+    )
+    parser.add_argument("--max-calls-per-hour", type=positive_int, default=DEFAULT_MAX_CALLS_PER_HOUR)
+    parser.add_argument(
+        "--max-duration-seconds",
+        type=positive_int,
+        default=DEFAULT_MAX_DURATION_SECONDS,
+    )
+    parser.add_argument(
+        "--max-tokens-per-call",
+        type=positive_int,
+        default=DEFAULT_MAX_TOKENS_PER_CALL,
+    )
+    parser.add_argument("--log-retention-days", type=int, default=DEFAULT_LOG_RETENTION_DAYS)
     parser.add_argument("--ignore-gitignore", action="store_true")
     parser.add_argument("--disable-logging", action="store_true")
     return parser
@@ -154,10 +172,8 @@ def install_runtime(args: argparse.Namespace) -> int:
         if "docker" in cfg.allowed_environments:
             require_docker()
 
-        ensure_gitignore_entry(city_root)
-
         venv_dir = runtime_dir(city_root) / "venv"
-        run(["python3", "-m", "venv", str(venv_dir)])
+        run([sys.executable, "-m", "venv", str(venv_dir)])
         python = venv_python(city_root)
         run([str(python), "-m", "pip", "install", "--upgrade", "pip"])
         run(
@@ -259,88 +275,90 @@ def build_runner_spec(
 def ask_runtime(args: argparse.Namespace) -> int:
     city_root = city_root_from_env()
     ensure_runtime_layout(city_root)
-    cfg = load_runtime_config(city_root)
-    cfg.validate()
-    ensure_remote_backend_policy(cfg)
-    prune_old_logs(city_root, cfg.log_retention_days)
-    cwd = Path.cwd().resolve()
+    with file_lock(lock_path(city_root), exclusive=False):
+        cfg = load_runtime_config(city_root)
+        cfg.validate()
+        ensure_remote_backend_policy(cfg)
+        prune_old_logs(city_root, cfg.log_retention_days)
+        prune_stale_cache_runs(city_root)
+        cwd = Path.cwd().resolve()
 
-    stdin_text = sys.stdin.read() if args.stdin else None
-    if not args.path and not args.globs and not stdin_text:
-        raise CLIError("Pass at least one --path/--glob or supply --stdin.", exit_code=2)
+        stdin_text = sys.stdin.read() if args.stdin else None
+        if not args.path and not args.globs and not stdin_text:
+            raise CLIError("Pass at least one --path/--glob or supply --stdin.", exit_code=2)
 
-    bundle = stage_corpus(
-        city_root=city_root,
-        cwd=cwd,
-        path_args=args.path,
-        glob_args=args.globs,
-        stdin_text=stdin_text,
-        cfg=cfg,
-    )
-    update_rate_limit(city_root, cfg.max_calls_per_hour)
-    try:
-        if cfg.default_environment == "docker":
-            require_docker()
+        bundle = stage_corpus(
+            city_root=city_root,
+            cwd=cwd,
+            path_args=args.path,
+            glob_args=args.globs,
+            stdin_text=stdin_text,
+            cfg=cfg,
+        )
+        update_rate_limit(city_root, cfg.max_calls_per_hour)
+        try:
+            if cfg.default_environment == "docker":
+                require_docker()
+                spec_path = build_runner_spec(
+                    args=args,
+                    cfg=cfg,
+                    bundle=bundle,
+                    cwd=cwd,
+                    city_root=city_root,
+                    container_mode=True,
+                )
+                command = [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--user",
+                    f"{os.getuid()}:{os.getgid()}",
+                    "--read-only",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--pids-limit",
+                    "256",
+                    "--memory",
+                    "2g",
+                    "--mount",
+                    f"type=bind,src={bundle.context_dir},dst=/workspace/context,ro",
+                    "--mount",
+                    f"type=bind,src={bundle.output_dir},dst=/workspace/output,rw",
+                    "--mount",
+                    f"type=bind,src={logs_dir(city_root)},dst=/workspace/logs,rw",
+                    "--mount",
+                    "type=tmpfs,dst=/tmp,tmpfs-size=256m",
+                    "--workdir",
+                    "/workspace/output",
+                ]
+                if not cfg.remote_backend_allowed:
+                    command.extend(["--network", "none"])
+                if cfg.backend_api_key_env:
+                    value = os.environ.get(cfg.backend_api_key_env, "")
+                    if value:
+                        command.extend(["-e", cfg.backend_api_key_env])
+                command.extend([cfg.docker_image, "--spec", "/workspace/output/spec.json"])
+                proc = run(command, check=False)
+                return proc.returncode
+
+            python = require_runtime_python(city_root)
             spec_path = build_runner_spec(
                 args=args,
                 cfg=cfg,
                 bundle=bundle,
                 cwd=cwd,
                 city_root=city_root,
-                container_mode=True,
+                container_mode=False,
             )
-            command = [
-                "docker",
-                "run",
-                "--rm",
-                "--user",
-                f"{os.getuid()}:{os.getgid()}",
-                "--read-only",
-                "--cap-drop",
-                "ALL",
-                "--security-opt",
-                "no-new-privileges",
-                "--pids-limit",
-                "256",
-                "--memory",
-                "2g",
-                "--mount",
-                f"type=bind,src={bundle.context_dir},dst=/workspace/context,ro",
-                "--mount",
-                f"type=bind,src={bundle.output_dir},dst=/workspace/output,rw",
-                "--mount",
-                f"type=bind,src={logs_dir(city_root)},dst=/workspace/logs,rw",
-                "--mount",
-                "type=tmpfs,dst=/tmp,tmpfs-size=256m",
-                "--workdir",
-                "/workspace/output",
-            ]
-            if not cfg.remote_backend_allowed:
-                command.extend(["--network", "none"])
-            if cfg.backend_api_key_env:
-                value = os.environ.get(cfg.backend_api_key_env, "")
-                if value:
-                    command.extend(["-e", cfg.backend_api_key_env])
-            command.extend([cfg.docker_image, "--spec", "/workspace/output/spec.json"])
-            proc = run(command, check=False)
+            proc = run(
+                [str(python), str(pack_dir_from_env() / "scripts" / "rlm_runner.py"), "--spec", str(spec_path)],
+                check=False,
+            )
             return proc.returncode
-
-        python = require_runtime_python(city_root)
-        spec_path = build_runner_spec(
-            args=args,
-            cfg=cfg,
-            bundle=bundle,
-            cwd=cwd,
-            city_root=city_root,
-            container_mode=False,
-        )
-        proc = run(
-            [str(python), str(pack_dir_from_env() / "scripts" / "rlm_runner.py"), "--spec", str(spec_path)],
-            check=False,
-        )
-        return proc.returncode
-    finally:
-        shutil.rmtree(bundle.run_dir, ignore_errors=True)
+        finally:
+            shutil.rmtree(bundle.run_dir, ignore_errors=True)
 
 
 def status_runtime(args: argparse.Namespace) -> int:
