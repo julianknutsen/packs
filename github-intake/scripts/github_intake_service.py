@@ -253,7 +253,13 @@ def close_failed_bead(bead_id: str, reason: str) -> bool:
     bd_bin = os.environ.get("BD_BIN", "bd")
     city_root = common.city_root() or "."
     try:
-        result = run_subprocess([bd_bin, "close", bead_id, "--reason", f"github-intake:{reason or 'dispatch_failed'}"], city_root)
+        set_reason = run_subprocess(
+            [bd_bin, "update", bead_id, "--set-metadata", f"close_reason=github-intake:{reason or 'dispatch_failed'}"],
+            city_root,
+        )
+        if set_reason.returncode != 0:
+            return False
+        result = run_subprocess([bd_bin, "close", bead_id], city_root)
     except FileNotFoundError:
         return False
     return result.returncode == 0

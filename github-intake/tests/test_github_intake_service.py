@@ -103,14 +103,19 @@ class GitHubIntakeServiceTests(unittest.TestCase):
             service,
             "create_fix_bead",
             return_value={"status": "dispatch_failed", "reason": "bead_update_failed", "bead_id": "bd-1"},
-        ), mock.patch.object(service, "run_subprocess") as run_subprocess:
+        ), mock.patch.object(
+            service,
+            "run_subprocess",
+            side_effect=[mock.Mock(returncode=0), mock.Mock(returncode=0)],
+        ) as run_subprocess:
             outcome = service.run_fix_issue_dispatch(request, mapping, command_cfg, app_cfg)
 
         self.assertEqual(outcome["status"], "dispatch_failed")
         self.assertEqual(outcome["reason"], "bead_update_failed")
         self.assertEqual(outcome["bead_id"], "bd-1")
         commands = [call.args[0] for call in run_subprocess.call_args_list]
-        self.assertEqual(commands[0], ["bd", "close", "bd-1", "--reason", "github-intake:bead_update_failed"])
+        self.assertEqual(commands[0], ["bd", "update", "bd-1", "--set-metadata", "close_reason=github-intake:bead_update_failed"])
+        self.assertEqual(commands[1], ["bd", "close", "bd-1"])
         self.assertNotIn("gc", [command[0] for command in commands])
 
     def test_close_failed_bead_updates_and_closes(self) -> None:
@@ -120,7 +125,8 @@ class GitHubIntakeServiceTests(unittest.TestCase):
 
         self.assertTrue(closed)
         commands = [call.args[0] for call in run_subprocess.call_args_list]
-        self.assertEqual(commands[0], ["bd", "close", "bd-1", "--reason", "github-intake:dispatch_failed"])
+        self.assertEqual(commands[0], ["bd", "update", "bd-1", "--set-metadata", "close_reason=github-intake:dispatch_failed"])
+        self.assertEqual(commands[1], ["bd", "close", "bd-1"])
 
     def test_process_request_releases_workflow_link_after_dispatch_failure_with_bead(self) -> None:
         request = {
