@@ -199,6 +199,41 @@ class GitHubIntakeServiceTests(unittest.TestCase):
 
         self.assertIsNotNone(service.common.load_workflow_link(request["workflow_key"]))
 
+    def test_process_request_closes_existing_bead_on_internal_error(self) -> None:
+        request = {
+            "request_id": "gh-123-102-fix",
+            "workflow_key": "gh:123:issue:45:fix",
+            "command": "fix",
+            "repository_full_name": "owner/repo",
+            "repository_id": "123",
+            "issue_number": "45",
+            "bead_id": "bd-9",
+        }
+        mapping = {
+            "target": "product/polecat",
+            "commands": {"fix": {"formula": "mol-github-fix-issue"}},
+        }
+        service.common.save_request(request)
+        service.common.save_workflow_link(request["workflow_key"], request["request_id"])
+
+        with mock.patch.object(service.common, "load_config", return_value={"app": {"app_id": "1"}}), mock.patch.object(
+            service.common,
+            "resolve_repo_mapping",
+            return_value=mapping,
+        ), mock.patch.object(
+            service,
+            "run_fix_issue_dispatch",
+            side_effect=RuntimeError("boom"),
+        ), mock.patch.object(
+            service,
+            "close_failed_bead",
+            return_value=True,
+        ) as close_failed_bead:
+            service.process_request(request["request_id"])
+
+        close_failed_bead.assert_called_once_with("bd-9", "internal_error")
+        self.assertIsNone(service.common.load_workflow_link(request["workflow_key"]))
+
     def test_process_request_does_not_remove_newer_workflow_owner(self) -> None:
         request = {
             "request_id": "gh-123-99-fix",

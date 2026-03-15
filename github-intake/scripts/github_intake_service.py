@@ -301,6 +301,7 @@ def run_fix_issue_dispatch(
     if "bead_id" not in bead_outcome:
         return bead_outcome
     bead_id = str(bead_outcome["bead_id"])
+    request["bead_id"] = bead_id
 
     gc_bin = os.environ.get("GC_BIN", "gc")
     command = [gc_bin, "sling", target, bead_id, "--on", formula]
@@ -368,7 +369,10 @@ def process_request(request_id: str) -> None:
             request.update(outcome)
         common.save_request(request)
     except Exception as exc:  # noqa: BLE001
-        payload = common.load_request(request_id) or {"request_id": request_id}
+        payload = request or common.load_request(request_id) or {"request_id": request_id}
+        bead_id = str(payload.get("bead_id", ""))
+        if bead_id and not close_failed_bead(bead_id, "internal_error"):
+            payload["cleanup_failed"] = True
         payload["status"] = "internal_error"
         payload["reason"] = str(exc)
         payload["traceback"] = traceback.format_exc(limit=20)
