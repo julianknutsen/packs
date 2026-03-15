@@ -82,3 +82,9 @@ name = "push-branch"
 description = "Push the current branch to GitHub using the workspace GitHub App installation"
 long_description = "help/push-branch.txt"
 script = "commands/push-branch.sh"
+
+[[commands]]
+name = "release-workflow"
+description = "Release a stuck workflow lock so the same GitHub issue can be retried"
+long_description = "help/release-workflow.txt"
+script = "commands/release-workflow.sh"

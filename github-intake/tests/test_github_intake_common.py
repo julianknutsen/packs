@@ -159,6 +159,33 @@ class GitHubIntakeCommonTests(unittest.TestCase):
         common.remove_workflow_link("gh:123:issue:42:fix")
         self.assertIsNone(common.load_workflow_link("gh:123:issue:42:fix"))
 
+    def test_find_request_returns_latest_matching_issue_command(self) -> None:
+        first = {
+            "request_id": "gh-123-99-fix",
+            "repository_full_name": "owner/repo",
+            "issue_number": "42",
+            "command": "fix",
+            "workflow_key": "gh:123:issue:42:fix",
+            "created_at": "2026-03-15T22:00:00Z",
+        }
+        second = {
+            "request_id": "gh-123-100-fix",
+            "repository_full_name": "owner/repo",
+            "issue_number": "42",
+            "command": "fix",
+            "workflow_key": "gh:123:issue:42:fix",
+            "created_at": "2026-03-15T22:05:00Z",
+        }
+
+        common.save_request(first)
+        common.save_request(second)
+
+        found = common.find_request("Owner/Repo", "42", "fix")
+
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found["request_id"], "gh-123-100-fix")
+
     def test_app_identifier_requires_app_id(self) -> None:
         self.assertEqual(common.app_identifier({"app_id": "123456"}), "123456")
         with self.assertRaises(common.GitHubAPIError):

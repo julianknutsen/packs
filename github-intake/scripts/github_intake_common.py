@@ -196,7 +196,7 @@ def set_repo_mapping(
     mapping: dict[str, Any] = cfg["repositories"].get(repo_key, {})
     mapping["repository"] = repo_key
     mapping["target"] = target
-    commands: dict[str, Any] = {}
+    commands: dict[str, Any] = mapping.get("commands", {})
     commands = _set_command_formula(commands, "fix", fix_formula)
     mapping["commands"] = commands
     cfg["repositories"][repo_key] = mapping
@@ -442,6 +442,27 @@ def list_recent_requests(limit: int = 20) -> list[dict[str, Any]]:
             entries.append(data)
     entries.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return entries[:limit]
+
+
+def find_request(repository_full_name: str, issue_number: str, command: str) -> dict[str, Any] | None:
+    ensure_layout()
+    repo_key = normalize_repo_key(repository_full_name)
+    matches: list[dict[str, Any]] = []
+    for path in pathlib.Path(requests_dir()).glob("*.json"):
+        data = read_json(str(path))
+        if not isinstance(data, dict):
+            continue
+        if normalize_repo_key(str(data.get("repository_full_name", ""))) != repo_key:
+            continue
+        if str(data.get("issue_number", "")) != str(issue_number):
+            continue
+        if str(data.get("command", "")) != command:
+            continue
+        matches.append(data)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return matches[0]
 
 
 def build_status_snapshot(limit: int = 20) -> dict[str, Any]:

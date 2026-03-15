@@ -291,13 +291,14 @@ if [ -z "$PR_URL" ]; then
   BODY=$(mktemp)
   cat >"$BODY" <<EOF
 ## Summary
-- <what changed>
+- summarize the actual code changes you made for this issue
 
 ## Validation
-- <tests and checks you ran>
+- list the actual tests and checks you ran for this fix
 
 Closes #{{github_issue_number}}
 EOF
+  echo "Before creating the PR, replace the template bullets in $BODY with the real summary and validation from this run."
   PR_JSON=$(gc github-intake create-pr {{github_repo_full_name}} \
     --installation-id {{github_installation_id}} \
     --base {{github_default_branch}} \

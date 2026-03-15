@@ -25,6 +25,13 @@ The current slice ships:
 The new `/gc fix` path does not post an immediate ack comment. The workflow
 itself comments when work starts and when the PR is ready for review.
 
+If a dispatched workflow gets wedged and you need to retry the same issue
+before cancel/retry automation exists, release the intake lock manually:
+
+```bash
+gc github-intake release-workflow owner/repo 42
+```
+
 ## Include It
 
 ```toml

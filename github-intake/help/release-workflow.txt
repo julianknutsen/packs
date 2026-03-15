@@ -1,0 +1,15 @@
+Release a stuck workflow lock for a GitHub issue.
+
+This is an operator recovery command. It does not touch the bead or the pull
+request; it only clears the intake-side workflow lock so `/gc fix` can be
+accepted again for the same issue.
+
+Example:
+  gc github-intake release-workflow owner/repo 42
+
+Arguments:
+  <repository>    owner/repo
+  <issue_number>  GitHub issue number
+
+Flags:
+  --command <name>  slash command to unlock, default: fix

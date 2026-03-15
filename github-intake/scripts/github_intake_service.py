@@ -65,7 +65,6 @@ def request_summary(request: dict[str, Any]) -> dict[str, Any]:
         "bead_id": request.get("bead_id", ""),
         "dispatch_target": request.get("dispatch_target", ""),
         "dispatch_formula": request.get("dispatch_formula", ""),
-        "pull_request_url": request.get("pull_request_url", ""),
         "reason": request.get("reason", ""),
     }
 
