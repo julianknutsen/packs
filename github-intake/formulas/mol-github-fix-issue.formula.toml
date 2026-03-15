@@ -368,7 +368,17 @@ if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
   git worktree remove "$WORKTREE" --force
   bd update {{issue}} --unset-metadata work_dir
 fi
-bd update {{issue}} --notes "PR ready for review: $PR_URL"
+CURRENT_NOTES=$(bd show {{issue}} --json | jq -r '.notes // empty')
+FINAL_NOTES=$(mktemp)
+cat >"$FINAL_NOTES" <<EOF
+$CURRENT_NOTES
+
+## Outcome
+
+PR ready for review: $PR_URL
+EOF
+bd update {{issue}} --notes "$(cat "$FINAL_NOTES")"
+rm -f "$FINAL_NOTES"
 bd close {{issue}}
 gc runtime drain-ack
 exit

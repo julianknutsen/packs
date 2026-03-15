@@ -110,17 +110,17 @@ class GitHubIntakeServiceTests(unittest.TestCase):
         self.assertEqual(outcome["reason"], "bead_update_failed")
         self.assertEqual(outcome["bead_id"], "bd-1")
         commands = [call.args[0] for call in run_subprocess.call_args_list]
-        self.assertEqual(commands[0][:3], ["bd", "update", "bd-1"])
-        self.assertEqual(commands[1], ["bd", "close", "bd-1", "--reason", "github-intake:bead_update_failed"])
+        self.assertEqual(commands[0], ["bd", "close", "bd-1", "--reason", "github-intake:bead_update_failed"])
         self.assertNotIn("gc", [command[0] for command in commands])
 
     def test_close_failed_bead_updates_and_closes(self) -> None:
-        with mock.patch.object(service, "run_subprocess") as run_subprocess:
-            service.close_failed_bead("bd-1", "dispatch_failed")
+        result = mock.Mock(returncode=0)
+        with mock.patch.object(service, "run_subprocess", return_value=result) as run_subprocess:
+            closed = service.close_failed_bead("bd-1", "dispatch_failed")
 
+        self.assertTrue(closed)
         commands = [call.args[0] for call in run_subprocess.call_args_list]
-        self.assertEqual(commands[0][:3], ["bd", "update", "bd-1"])
-        self.assertEqual(commands[1], ["bd", "close", "bd-1", "--reason", "github-intake:dispatch_failed"])
+        self.assertEqual(commands[0], ["bd", "close", "bd-1", "--reason", "github-intake:dispatch_failed"])
 
     def test_process_request_releases_workflow_link_after_dispatch_failure_with_bead(self) -> None:
         request = {
@@ -158,6 +158,40 @@ class GitHubIntakeServiceTests(unittest.TestCase):
         assert saved is not None
         self.assertEqual(saved["status"], "dispatch_failed")
         self.assertIsNone(service.common.load_workflow_link(request["workflow_key"]))
+
+    def test_process_request_keeps_workflow_link_when_cleanup_fails(self) -> None:
+        request = {
+            "request_id": "gh-123-101-fix",
+            "workflow_key": "gh:123:issue:43:fix",
+            "command": "fix",
+            "repository_full_name": "owner/repo",
+            "repository_id": "123",
+            "issue_number": "43",
+        }
+        mapping = {
+            "target": "product/polecat",
+            "commands": {"fix": {"formula": "mol-github-fix-issue"}},
+        }
+        service.common.save_request(request)
+        service.common.save_workflow_link(request["workflow_key"], request["request_id"])
+
+        with mock.patch.object(service.common, "load_config", return_value={"app": {"app_id": "1"}}), mock.patch.object(
+            service.common,
+            "resolve_repo_mapping",
+            return_value=mapping,
+        ), mock.patch.object(
+            service,
+            "run_fix_issue_dispatch",
+            return_value={
+                "status": "dispatch_failed",
+                "reason": "dispatch_failed",
+                "bead_id": "bd-2",
+                "cleanup_failed": True,
+            },
+        ):
+            service.process_request(request["request_id"])
+
+        self.assertIsNotNone(service.common.load_workflow_link(request["workflow_key"]))
 
 
 if __name__ == "__main__":

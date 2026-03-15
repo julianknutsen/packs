@@ -246,20 +246,17 @@ def build_fix_vars(request: dict[str, Any], bead_id: str) -> dict[str, str]:
     }
 
 
-def close_failed_bead(bead_id: str, reason: str) -> None:
+def close_failed_bead(bead_id: str, reason: str) -> bool:
     bead_id = bead_id.strip()
     if not bead_id:
-        return
+        return True
     bd_bin = os.environ.get("BD_BIN", "bd")
     city_root = common.city_root() or "."
     try:
-        run_subprocess(
-            [bd_bin, "update", bead_id, "--notes", f"GitHub intake dispatch failed: {human_reason(reason)}"],
-            city_root,
-        )
-        run_subprocess([bd_bin, "close", bead_id, "--reason", f"github-intake:{reason or 'dispatch_failed'}"], city_root)
+        result = run_subprocess([bd_bin, "close", bead_id, "--reason", f"github-intake:{reason or 'dispatch_failed'}"], city_root)
     except FileNotFoundError:
-        return
+        return False
+    return result.returncode == 0
 
 
 def run_fix_issue_dispatch(
@@ -291,7 +288,9 @@ def run_fix_issue_dispatch(
 
     bead_outcome = create_fix_bead(request, target)
     if bead_outcome.get("status") == "dispatch_failed":
-        close_failed_bead(str(bead_outcome.get("bead_id", "")), str(bead_outcome.get("reason", "")))
+        cleanup_ok = close_failed_bead(str(bead_outcome.get("bead_id", "")), str(bead_outcome.get("reason", "")))
+        if not cleanup_ok:
+            bead_outcome["cleanup_failed"] = True
         return bead_outcome
     if "bead_id" not in bead_outcome:
         return bead_outcome
@@ -305,12 +304,15 @@ def run_fix_issue_dispatch(
     try:
         result = run_subprocess(command, common.city_root() or ".")
     except FileNotFoundError:
-        close_failed_bead(bead_id, "gc_not_available")
-        return {
+        cleanup_ok = close_failed_bead(bead_id, "gc_not_available")
+        outcome = {
             "status": "dispatch_failed",
             "reason": "gc_not_available",
             "bead_id": bead_id,
         }
+        if not cleanup_ok:
+            outcome["cleanup_failed"] = True
+        return outcome
     outcome = {
         "bead_id": bead_id,
         "dispatch_target": target,
@@ -326,16 +328,19 @@ def run_fix_issue_dispatch(
     else:
         outcome["status"] = "dispatch_failed"
         outcome["reason"] = "dispatch_failed"
-        close_failed_bead(bead_id, "dispatch_failed")
+        if not close_failed_bead(bead_id, "dispatch_failed"):
+            outcome["cleanup_failed"] = True
     return outcome
 
 
 def process_request(request_id: str) -> None:
     request: dict[str, Any] | None = None
+    workflow_key_hint = ""
     try:
         request = common.load_request(request_id)
         if not request:
             return
+        workflow_key_hint = str(request.get("workflow_key", ""))
         config = common.load_config()
         app_cfg = config.get("app", {})
         mapping = common.resolve_repo_mapping(
@@ -365,8 +370,12 @@ def process_request(request_id: str) -> None:
         request = payload
     finally:
         if request:
-            workflow_key = str(request.get("workflow_key", ""))
-            if workflow_key and request.get("status") in {"ignored", "dispatch_failed", "internal_error"}:
+            workflow_key = str(request.get("workflow_key", "")) or workflow_key_hint
+            if (
+                workflow_key
+                and request.get("status") in {"ignored", "dispatch_failed", "internal_error"}
+                and not request.get("cleanup_failed")
+            ):
                 common.remove_workflow_link(workflow_key)
         with PROCESSING_LOCK:
             PROCESSING_REQUESTS.discard(request_id)
