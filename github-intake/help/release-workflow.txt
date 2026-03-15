@@ -13,3 +13,4 @@ Arguments:
 
 Flags:
   --command <name>  slash command to unlock, default: fix
+  --force           release even if the previous bead already posted GitHub side effects

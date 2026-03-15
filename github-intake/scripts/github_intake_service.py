@@ -376,7 +376,7 @@ def process_request(request_id: str) -> None:
                 and request.get("status") in {"ignored", "dispatch_failed", "internal_error"}
                 and not request.get("cleanup_failed")
             ):
-                common.remove_workflow_link(workflow_key)
+                common.remove_workflow_link_if_request(workflow_key, request_id)
         with PROCESSING_LOCK:
             PROCESSING_REQUESTS.discard(request_id)
 

@@ -159,6 +159,25 @@ class GitHubIntakeCommonTests(unittest.TestCase):
         common.remove_workflow_link("gh:123:issue:42:fix")
         self.assertIsNone(common.load_workflow_link("gh:123:issue:42:fix"))
 
+    def test_remove_workflow_link_if_request_matches_current_owner(self) -> None:
+        common.save_workflow_link("gh:123:issue:42:fix", "gh-123-99-fix")
+
+        removed = common.remove_workflow_link_if_request("gh:123:issue:42:fix", "gh-123-99-fix")
+
+        self.assertTrue(removed)
+        self.assertIsNone(common.load_workflow_link("gh:123:issue:42:fix"))
+
+    def test_remove_workflow_link_if_request_leaves_newer_owner_in_place(self) -> None:
+        common.save_workflow_link("gh:123:issue:42:fix", "gh-123-100-fix")
+
+        removed = common.remove_workflow_link_if_request("gh:123:issue:42:fix", "gh-123-99-fix")
+
+        self.assertFalse(removed)
+        loaded = common.load_workflow_link("gh:123:issue:42:fix")
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded["request_id"], "gh-123-100-fix")
+
     def test_find_request_returns_latest_matching_issue_command(self) -> None:
         first = {
             "request_id": "gh-123-99-fix",

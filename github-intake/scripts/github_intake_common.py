@@ -428,6 +428,16 @@ def remove_workflow_link(workflow_key: str) -> None:
         return
 
 
+def remove_workflow_link_if_request(workflow_key: str, request_id: str) -> bool:
+    current = load_workflow_link(workflow_key)
+    if not current:
+        return False
+    if str(current.get("request_id", "")) != request_id:
+        return False
+    remove_workflow_link(workflow_key)
+    return True
+
+
 def list_recent_requests(limit: int = 20) -> list[dict[str, Any]]:
     ensure_layout()
     entries: list[dict[str, Any]] = []

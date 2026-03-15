@@ -4,9 +4,41 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 
 import github_intake_common as common
+
+
+def bead_metadata(bead_id: str) -> dict[str, object]:
+    bead_id = bead_id.strip()
+    if not bead_id:
+        return {}
+    bd_bin = os.environ.get("BD_BIN", "bd")
+    city_root = common.city_root() or "."
+    try:
+        result = subprocess.run(
+            [bd_bin, "show", bead_id, "--json"],
+            cwd=city_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {}
+    if result.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        return metadata
+    return {}
 
 
 def main() -> int:
@@ -14,6 +46,7 @@ def main() -> int:
     parser.add_argument("repository", help="owner/repo")
     parser.add_argument("issue_number", help="GitHub issue number")
     parser.add_argument("--command", default="fix", help="slash command name to unlock (default: fix)")
+    parser.add_argument("--force", action="store_true", help="release even if the previous bead already recorded GitHub side effects")
     args = parser.parse_args()
 
     request = common.find_request(args.repository, args.issue_number, args.command)
@@ -45,6 +78,26 @@ def main() -> int:
             )
         )
         return 1
+
+    if not args.force:
+        metadata = bead_metadata(str(request.get("bead_id", "")))
+        for key in ("github_fix_started_comment_id", "github_fix_pr_url", "github_fix_complete_comment_id"):
+            if str(metadata.get(key, "")).strip():
+                print(
+                    json.dumps(
+                        {
+                            "status": "blocked",
+                            "reason": "workflow_has_github_side_effects",
+                            "request_id": request.get("request_id", ""),
+                            "workflow_key": workflow_key,
+                            "bead_id": request.get("bead_id", ""),
+                            "metadata_key": key,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return 1
 
     common.remove_workflow_link(workflow_key)
     print(
