@@ -274,7 +274,7 @@ def run_fix_issue_dispatch(
         }
 
     bead_outcome = create_fix_bead(request, target)
-    if "bead_id" not in bead_outcome:
+    if bead_outcome.get("status") == "dispatch_failed" or "bead_id" not in bead_outcome:
         return bead_outcome
     bead_id = str(bead_outcome["bead_id"])
 

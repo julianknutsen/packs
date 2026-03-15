@@ -88,6 +88,29 @@ class GitHubIntakeServiceTests(unittest.TestCase):
         assert duplicate is not None
         self.assertEqual(duplicate["request_id"], "gh-123-99-fix")
 
+    def test_run_fix_issue_dispatch_returns_bead_init_failure_without_slinging(self) -> None:
+        request = {
+            "installation_id": "88",
+            "repository_owner": "owner",
+            "repository_name": "repo",
+            "comment_author": "alice",
+        }
+        mapping = {"target": "product/polecat"}
+        command_cfg = {"formula": "mol-github-fix-issue"}
+        app_cfg = {"app_id": "1"}
+
+        with mock.patch.object(service.common, "repository_permission", return_value="write"), mock.patch.object(
+            service,
+            "create_fix_bead",
+            return_value={"status": "dispatch_failed", "reason": "bead_update_failed", "bead_id": "bd-1"},
+        ), mock.patch.object(service, "run_subprocess") as run_subprocess:
+            outcome = service.run_fix_issue_dispatch(request, mapping, command_cfg, app_cfg)
+
+        self.assertEqual(outcome["status"], "dispatch_failed")
+        self.assertEqual(outcome["reason"], "bead_update_failed")
+        self.assertEqual(outcome["bead_id"], "bd-1")
+        run_subprocess.assert_not_called()
+
     def test_process_request_releases_workflow_link_after_dispatch_failure_with_bead(self) -> None:
         request = {
             "request_id": "gh-123-99-fix",
