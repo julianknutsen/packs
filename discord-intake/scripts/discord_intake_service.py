@@ -9,6 +9,7 @@ import secrets
 import socketserver
 import subprocess
 import threading
+import time
 import traceback
 import urllib.parse
 from http import HTTPStatus
@@ -268,6 +269,26 @@ def rig_from_target(target: str) -> str:
     return rig.strip()
 
 
+def extract_json_output(raw: str) -> dict[str, Any]:
+    raw = raw.strip()
+    if not raw:
+        return {}
+    for left, right in (("{", "}"), ("[", "]")):
+        start = raw.find(left)
+        end = raw.rfind(right)
+        if start == -1 or end == -1 or end < start:
+            continue
+        try:
+            payload = json.loads(raw[start : end + 1])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+    return {}
+
+
 def build_fix_bead_title(request: dict[str, Any]) -> str:
     summary = str(request.get("summary", "")).strip() or "Discord fix request"
     return f"Fix Discord request: {summary}"[:180]
@@ -314,13 +335,7 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
             "dispatch_stdout": trim_output(create_result.stdout),
             "dispatch_stderr": trim_output(create_result.stderr),
         }
-    created = {}
-    raw = create_result.stdout.strip()
-    if raw:
-        try:
-            created = json.loads(raw)
-        except json.JSONDecodeError:
-            created = {}
+    created = extract_json_output(create_result.stdout)
     bead_id = str(created.get("id", "")).strip()
     if not bead_id:
         return {
@@ -628,13 +643,15 @@ def replay_response_from_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
 
 def accept_fix_request(payload: dict[str, Any], summary: str, context_markdown: str, interaction_id: str) -> dict[str, Any]:
     config = common.load_config()
-    command_name_value = common.command_name(config)
     if not str(payload.get("guild_id", "")).strip():
         return build_message_response(human_reason("guild_only"), ephemeral=True)
+    if not common.load_bot_token():
+        return build_message_response(human_reason("discord_app_not_configured"), ephemeral=True)
     channel_context = common.load_channel_context(
         config,
         str(payload.get("guild_id", "")),
         str(payload.get("channel_id", "")),
+        str((payload.get("channel") or {}).get("parent_id", "")),
     )
     mapping = channel_context.get("mapping") or {}
     if not mapping:
@@ -742,8 +759,21 @@ class IntakeHandler(BaseHTTPRequestHandler):
                 json_response(self, HTTPStatus.BAD_REQUEST, {"error": "guild_id or guild_ids is required"})
                 return
             config = common.load_config()
-            results = {str(guild_id): common.sync_guild_commands(config, str(guild_id)) for guild_id in guild_ids}
-            json_response(self, HTTPStatus.OK, {"guilds": results})
+            results: dict[str, Any] = {}
+            had_errors = False
+            for guild_id in guild_ids:
+                try:
+                    results[str(guild_id)] = {
+                        "status": "ok",
+                        "commands": common.sync_guild_commands(config, str(guild_id)),
+                    }
+                except common.DiscordAPIError as exc:
+                    had_errors = True
+                    results[str(guild_id)] = {
+                        "status": "error",
+                        "error": str(exc),
+                    }
+            json_response(self, HTTPStatus.BAD_GATEWAY if had_errors else HTTPStatus.OK, {"guilds": results})
             return
         json_response(self, HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -779,7 +809,7 @@ class IntakeHandler(BaseHTTPRequestHandler):
         timestamp = self.headers.get("X-Signature-Timestamp", "")
         signature = self.headers.get("X-Signature-Ed25519", "")
         try:
-            skew = abs(int(timestamp) - int(__import__("time").time()))
+            skew = abs(int(timestamp) - int(time.time()))
         except ValueError:
             skew = common.REQUEST_RETENTION_SECONDS
         if skew > 10:
@@ -813,6 +843,9 @@ class IntakeHandler(BaseHTTPRequestHandler):
                 return
 
         if interaction_type == 2:
+            if not str(payload.get("guild_id", "")).strip():
+                interaction_response(self, build_message_response(human_reason("guild_only"), ephemeral=True))
+                return
             parsed_command = parse_application_command(payload, common.command_name(config))
             command = str(parsed_command.get("command", "")).strip()
             if command != "fix":

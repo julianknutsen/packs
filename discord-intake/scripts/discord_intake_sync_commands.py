@@ -16,10 +16,21 @@ def main(argv: list[str]) -> int:
 
     config = common.load_config()
     results: dict[str, object] = {}
+    had_errors = False
     for guild_id in args.guild_id:
-        results[guild_id] = common.sync_guild_commands(config, guild_id)
+        try:
+            results[guild_id] = {
+                "status": "ok",
+                "commands": common.sync_guild_commands(config, guild_id),
+            }
+        except common.DiscordAPIError as exc:
+            had_errors = True
+            results[guild_id] = {
+                "status": "error",
+                "error": str(exc),
+            }
     print(json.dumps({"guilds": results}, indent=2, sort_keys=True))
-    return 0
+    return 1 if had_errors else 0
 
 
 if __name__ == "__main__":

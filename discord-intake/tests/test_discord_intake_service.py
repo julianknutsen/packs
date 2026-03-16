@@ -118,6 +118,7 @@ class DiscordIntakeServiceTests(unittest.TestCase):
     def test_accept_fix_request_saves_and_enqueues_new_request(self) -> None:
         common.import_app_config(common.load_config(), {"application_id": "1", "public_key": "ab" * 32})
         common.set_channel_mapping(common.load_config(), "1", "22", "product/polecat", "mol-discord-fix-issue")
+        common.save_bot_token("bot-token")
         payload = {
             "id": "interaction-1",
             "guild_id": "1",
@@ -134,6 +135,50 @@ class DiscordIntakeServiceTests(unittest.TestCase):
         self.assertEqual(request["summary"], "Crash on startup")
         self.assertEqual(request["dispatch_target"], "product/polecat")
         enqueue_request.assert_called_once()
+
+    def test_accept_fix_request_rejects_when_bot_token_missing(self) -> None:
+        common.import_app_config(common.load_config(), {"application_id": "1", "public_key": "ab" * 32})
+        common.set_channel_mapping(common.load_config(), "1", "22", "product/polecat", "mol-discord-fix-issue")
+        payload = {
+            "id": "interaction-1",
+            "guild_id": "1",
+            "channel_id": "22",
+            "member": {"user": {"id": "99", "username": "alice"}, "roles": []},
+        }
+
+        response = service.accept_fix_request(payload, "Crash on startup", "unset env X", "interaction-1")
+
+        self.assertEqual(response["type"], 4)
+        self.assertIn("not fully configured", response["data"]["content"])
+        self.assertEqual(response["data"]["flags"], 64)
+        self.assertEqual(common.list_recent_requests(limit=20), [])
+
+    def test_create_fix_bead_parses_json_after_cli_noise(self) -> None:
+        request = {
+            "summary": "Crash on startup",
+            "dispatch_target": "product/polecat",
+            "guild_id": "1",
+            "channel_id": "22",
+            "thread_id": "",
+            "conversation_id": "22",
+            "jump_url": "https://discord.com/channels/1/22",
+            "request_id": "dc-1-fix",
+            "invoking_user_display_name": "alice",
+            "invoking_user_id": "99",
+            "context_markdown": "unset env X",
+        }
+
+        with mock.patch.object(
+            service,
+            "run_subprocess",
+            side_effect=[
+                mock.Mock(returncode=0, stdout="warning: something\n{\"id\":\"bd-1\"}\n", stderr=""),
+                mock.Mock(returncode=0, stdout="", stderr=""),
+            ],
+        ):
+            outcome = service.create_fix_bead(request, "product/polecat")
+
+        self.assertEqual(outcome["bead_id"], "bd-1")
 
     def test_run_fix_dispatch_returns_bead_init_failure_without_slinging(self) -> None:
         request = {

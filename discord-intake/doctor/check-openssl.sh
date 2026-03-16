@@ -3,7 +3,7 @@ set -eu
 
 if ! command -v openssl >/dev/null 2>&1; then
   echo "openssl not found"
-  echo "Install openssl so github-intake can sign GitHub App JWTs."
+  echo "Install openssl so discord-intake can verify Discord interaction signatures."
   exit 2
 fi
 

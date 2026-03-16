@@ -28,10 +28,17 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         payload = common.build_command_payload("gc")
 
         self.assertEqual(payload[0]["name"], "gc")
-        self.assertEqual(payload[0]["contexts"], [0])
-        self.assertEqual(payload[0]["integration_types"], [0])
+        self.assertNotIn("contexts", payload[0])
+        self.assertNotIn("integration_types", payload[0])
+        self.assertNotIn("default_member_permissions", payload[0])
         self.assertEqual(payload[0]["options"][0]["name"], "fix")
         self.assertEqual(payload[0]["options"][0]["options"][0]["name"], "prompt")
+
+    def test_build_global_command_payload_adds_global_only_fields(self) -> None:
+        payload = common.build_command_payload("gc", scope="global")
+
+        self.assertEqual(payload[0]["contexts"], [0])
+        self.assertEqual(payload[0]["integration_types"], [0])
 
     def test_import_app_config_redacts_bot_token_presence(self) -> None:
         config = common.import_app_config(
@@ -76,6 +83,29 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         self.assertEqual(context["thread_id"], "33")
         self.assertEqual(context["mapping"]["target"], "product/polecat")
 
+    def test_load_channel_context_prefers_parent_hint_without_discord_lookup(self) -> None:
+        config = common.set_channel_mapping(common.load_config(), "1", "22", "product/polecat", "mol-discord-fix-issue")
+
+        with mock.patch.object(common, "discord_api_request") as discord_api_request:
+            context = common.load_channel_context(config, "1", "33", "22")
+
+        self.assertEqual(context["parent_channel_id"], "22")
+        self.assertEqual(context["thread_id"], "33")
+        self.assertEqual(context["mapping"]["target"], "product/polecat")
+        discord_api_request.assert_not_called()
+
+    def test_sync_guild_commands_omits_global_only_fields(self) -> None:
+        config = common.import_app_config(common.load_config(), {"application_id": "123", "public_key": "ab" * 32})
+
+        with mock.patch.object(common, "discord_api_request", return_value={"ok": True}) as discord_api_request:
+            common.sync_guild_commands(config, "55")
+
+        payload = discord_api_request.call_args.kwargs["payload"]
+        self.assertEqual(payload[0]["name"], "gc")
+        self.assertNotIn("contexts", payload[0])
+        self.assertNotIn("integration_types", payload[0])
+        self.assertNotIn("default_member_permissions", payload[0])
+
     def test_save_interaction_receipt_is_unique(self) -> None:
         first = common.save_interaction_receipt("abc", {"response_kind": "accepted", "request_id": "dc-1"})
         second = common.save_interaction_receipt("abc", {"response_kind": "accepted", "request_id": "dc-1"})
@@ -83,6 +113,17 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         self.assertTrue(first)
         self.assertFalse(second)
         self.assertEqual(common.load_interaction_receipt("abc")["request_id"], "dc-1")
+
+    def test_verify_discord_signature_returns_true_when_openssl_verifies(self) -> None:
+        with mock.patch.object(common.subprocess, "run", return_value=mock.Mock(returncode=0)):
+            verified = common.verify_discord_signature("ab" * 32, "1700000000", b"{}", "cd" * 64)
+
+        self.assertTrue(verified)
+
+    def test_verify_discord_signature_rejects_invalid_hex(self) -> None:
+        verified = common.verify_discord_signature("not-hex", "1700000000", b"{}", "cd" * 64)
+
+        self.assertFalse(verified)
 
 
 if __name__ == "__main__":

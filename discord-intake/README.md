@@ -32,6 +32,8 @@ manually:
 
 ```bash
 gc discord-intake release-workflow 123456789012345678 223456789012345678
+# or
+gc discord-intake release-workflow --request-id dc-interaction-fix
 ```
 
 ## Include It
@@ -75,6 +77,9 @@ After import, point the app's Interactions Endpoint URL at:
 https://<discord-interactions-public-url>/v0/discord/interactions
 ```
 
+The bot token is required for this slice because the workflow posts back to
+Discord when work starts and when it completes.
+
 ## Channel Mapping
 
 Map Discord channels to workflow targets:
@@ -93,6 +98,10 @@ Register the guild-scoped `/gc fix` command after the bot is installed:
 ```bash
 gc discord-intake sync-commands 123456789012345678
 ```
+
+Discord command delivery stays broad at the platform edge. Access control is
+enforced inside the workspace service with the configured guild, channel, and
+role allowlists.
 
 ## Inspect Status
 

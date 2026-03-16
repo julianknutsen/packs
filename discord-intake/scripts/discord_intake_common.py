@@ -20,7 +20,6 @@ SCHEMA_VERSION = 1
 DISCORD_API_BASE = os.environ.get("GC_DISCORD_API_BASE", "https://discord.com/api/v10")
 REQUEST_RETENTION_SECONDS = 24 * 60 * 60
 PENDING_MODAL_RETENTION_SECONDS = 15 * 60
-OPERATOR_ASSERTION_RETENTION_SECONDS = 5 * 60
 COMMAND_NAME_DEFAULT = "gc"
 FIX_FORMULA_DEFAULT = "mol-discord-fix-issue"
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
@@ -300,7 +299,12 @@ def resolve_channel_mapping(config: dict[str, Any], guild_id: str, channel_id: s
     return channels.get(normalize_channel_key(guild_id, channel_id))
 
 
-def load_channel_context(config: dict[str, Any], guild_id: str, channel_id: str) -> dict[str, Any]:
+def load_channel_context(
+    config: dict[str, Any],
+    guild_id: str,
+    channel_id: str,
+    parent_channel_id_hint: str = "",
+) -> dict[str, Any]:
     mapping = resolve_channel_mapping(config, guild_id, channel_id)
     if mapping:
         return {
@@ -310,10 +314,21 @@ def load_channel_context(config: dict[str, Any], guild_id: str, channel_id: str)
             "thread_id": "",
             "mapping": mapping,
         }
-    parent_channel_id = ""
+    parent_channel_id = str(parent_channel_id_hint).strip()
     channel_info = {}
+    if parent_channel_id:
+        mapping = resolve_channel_mapping(config, guild_id, parent_channel_id)
+        if mapping:
+            return {
+                "guild_id": str(guild_id),
+                "channel_id": parent_channel_id,
+                "parent_channel_id": parent_channel_id,
+                "thread_id": str(channel_id),
+                "mapping": mapping,
+                "channel_info": channel_info,
+            }
     bot_token = load_bot_token()
-    if bot_token:
+    if not parent_channel_id and bot_token:
         try:
             info = discord_api_request("GET", f"/channels/{urllib.parse.quote(str(channel_id))}", bot_token=bot_token)
             if isinstance(info, dict):
@@ -571,20 +586,24 @@ def verify_discord_signature(public_key_hex: str, timestamp: str, payload: bytes
         public_key_pem = discord_public_key_pem(public_key_hex)
     except ValueError:
         return False
-    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as key_handle:
-        key_handle.write(public_key_pem)
-        key_handle.flush()
-        os.fchmod(key_handle.fileno(), 0o600)
-        key_path = key_handle.name
-    with tempfile.NamedTemporaryFile(delete=False) as message_handle:
-        message_handle.write(message)
-        message_handle.flush()
-        message_path = message_handle.name
-    with tempfile.NamedTemporaryFile(delete=False) as signature_handle:
-        signature_handle.write(signature)
-        signature_handle.flush()
-        signature_path = signature_handle.name
+    key_path = ""
+    message_path = ""
+    signature_path = ""
+    result: subprocess.CompletedProcess[str] | None = None
     try:
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as key_handle:
+            key_handle.write(public_key_pem)
+            key_handle.flush()
+            os.fchmod(key_handle.fileno(), 0o600)
+            key_path = key_handle.name
+        with tempfile.NamedTemporaryFile(delete=False) as message_handle:
+            message_handle.write(message)
+            message_handle.flush()
+            message_path = message_handle.name
+        with tempfile.NamedTemporaryFile(delete=False) as signature_handle:
+            signature_handle.write(signature)
+            signature_handle.flush()
+            signature_path = signature_handle.name
         result = subprocess.run(
             [
                 "openssl",
@@ -603,13 +622,17 @@ def verify_discord_signature(public_key_hex: str, timestamp: str, payload: bytes
             text=True,
             check=False,
         )
+    except OSError:
+        return False
     finally:
         for path in (key_path, message_path, signature_path):
+            if not path:
+                continue
             try:
                 os.remove(path)
             except FileNotFoundError:
                 continue
-    return result.returncode == 0
+    return bool(result and result.returncode == 0)
 
 
 def discord_api_request(
@@ -655,32 +678,31 @@ def command_name(config: dict[str, Any]) -> str:
     return str(normalize_config(config).get("app", {}).get("command_name", COMMAND_NAME_DEFAULT)).strip() or COMMAND_NAME_DEFAULT
 
 
-def build_command_payload(command_name_value: str) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": command_name_value,
-            "type": 1,
-            "description": "GC workspace actions",
-            "default_member_permissions": "0",
-            "contexts": [0],
-            "integration_types": [0],
-            "options": [
-                {
-                    "type": 1,
-                    "name": "fix",
-                    "description": "Create a GC fix workflow",
-                    "options": [
-                        {
-                            "type": 3,
-                            "name": "prompt",
-                            "description": "Optional fallback when modal collection is disabled",
-                            "required": False,
-                        }
-                    ],
-                }
-            ],
-        }
-    ]
+def build_command_payload(command_name_value: str, scope: str = "guild") -> list[dict[str, Any]]:
+    command: dict[str, Any] = {
+        "name": command_name_value,
+        "type": 1,
+        "description": "GC workspace actions",
+        "options": [
+            {
+                "type": 1,
+                "name": "fix",
+                "description": "Create a GC fix workflow",
+                "options": [
+                    {
+                        "type": 3,
+                        "name": "prompt",
+                        "description": "Optional fallback when modal collection is disabled",
+                        "required": False,
+                    }
+                ],
+            }
+        ],
+    }
+    if scope == "global":
+        command["contexts"] = [0]
+        command["integration_types"] = [0]
+    return [command]
 
 
 def sync_guild_commands(config: dict[str, Any], guild_id: str) -> Any:
@@ -688,7 +710,7 @@ def sync_guild_commands(config: dict[str, Any], guild_id: str) -> Any:
     application_id = str(app_cfg.get("application_id", "")).strip()
     if not application_id:
         raise DiscordAPIError("Discord application_id is not configured")
-    payload = build_command_payload(command_name(config))
+    payload = build_command_payload(command_name(config), scope="guild")
     return discord_api_request(
         "PUT",
         f"/applications/{urllib.parse.quote(application_id)}/guilds/{urllib.parse.quote(str(guild_id))}/commands",

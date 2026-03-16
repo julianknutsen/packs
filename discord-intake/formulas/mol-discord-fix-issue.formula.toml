@@ -239,7 +239,7 @@ BRANCH=$(bd show {{issue}} --json | jq -r '.metadata.branch // empty')
 WORKTREE=$(bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
 ```
 
-**2. Post the completion message:**
+**2. Attempt the completion message:**
 ```bash
 BODY=$(mktemp)
 cat >"$BODY" <<EOF
@@ -251,15 +251,21 @@ Discord `/gc fix` workflow finished.
 
 Please inspect the bead notes and local branch for the resulting patch.
 EOF
-gc discord-intake post-message --request-id {{discord_request_id}} --body-file "$BODY"
+POST_STATUS=0
+gc discord-intake post-message --request-id {{discord_request_id}} --body-file "$BODY" || POST_STATUS=$?
 rm -f "$BODY"
 ```
 
-**3. Release the intake workflow lock and close the bead:**
+**3. Release the intake workflow lock and close the bead even if the final
+Discord callback failed:**
 ```bash
 gc discord-intake release-workflow --request-id {{discord_request_id}}
+if [ "$POST_STATUS" -ne 0 ]; then
+  echo "warning: failed to post Discord completion update" >&2
+fi
 bd close {{issue}}
 ```
 
 **Exit criteria:** Discord has the completion update, the workflow lock is
-released, and the bead is closed."""
+released, and the bead is closed. If the callback fails, the workflow still
+unlocks the conversation and surfaces the warning in the formula output."""
