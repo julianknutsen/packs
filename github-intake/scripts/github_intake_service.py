@@ -295,7 +295,9 @@ def run_fix_issue_dispatch(
     bead_outcome = create_fix_bead(request, target)
     if bead_outcome.get("status") == "dispatch_failed":
         cleanup_ok = close_failed_bead(str(bead_outcome.get("bead_id", "")), str(bead_outcome.get("reason", "")))
-        if not cleanup_ok:
+        if cleanup_ok:
+            bead_outcome["bead_closed"] = True
+        else:
             bead_outcome["cleanup_failed"] = True
         return bead_outcome
     if "bead_id" not in bead_outcome:
@@ -317,7 +319,9 @@ def run_fix_issue_dispatch(
             "reason": "gc_not_available",
             "bead_id": bead_id,
         }
-        if not cleanup_ok:
+        if cleanup_ok:
+            outcome["bead_closed"] = True
+        else:
             outcome["cleanup_failed"] = True
         return outcome
     outcome = {
@@ -335,7 +339,9 @@ def run_fix_issue_dispatch(
     else:
         outcome["status"] = "dispatch_failed"
         outcome["reason"] = "dispatch_failed"
-        if not close_failed_bead(bead_id, "dispatch_failed"):
+        if close_failed_bead(bead_id, "dispatch_failed"):
+            outcome["bead_closed"] = True
+        else:
             outcome["cleanup_failed"] = True
     return outcome
 
@@ -371,8 +377,11 @@ def process_request(request_id: str) -> None:
     except Exception as exc:  # noqa: BLE001
         payload = request or common.load_request(request_id) or {"request_id": request_id}
         bead_id = str(payload.get("bead_id", ""))
-        if bead_id and not close_failed_bead(bead_id, "internal_error"):
-            payload["cleanup_failed"] = True
+        if bead_id and not payload.get("bead_closed"):
+            if close_failed_bead(bead_id, "internal_error"):
+                payload["bead_closed"] = True
+            else:
+                payload["cleanup_failed"] = True
         payload["status"] = "internal_error"
         payload["reason"] = str(exc)
         payload["traceback"] = traceback.format_exc(limit=20)

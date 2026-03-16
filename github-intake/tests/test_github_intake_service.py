@@ -113,6 +113,7 @@ class GitHubIntakeServiceTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "dispatch_failed")
         self.assertEqual(outcome["reason"], "bead_update_failed")
         self.assertEqual(outcome["bead_id"], "bd-1")
+        self.assertTrue(outcome["bead_closed"])
         commands = [call.args[0] for call in run_subprocess.call_args_list]
         self.assertEqual(commands[0], ["bd", "update", "bd-1", "--set-metadata", "close_reason=github-intake:bead_update_failed"])
         self.assertEqual(commands[1], ["bd", "close", "bd-1"])
@@ -232,6 +233,45 @@ class GitHubIntakeServiceTests(unittest.TestCase):
             service.process_request(request["request_id"])
 
         close_failed_bead.assert_called_once_with("bd-9", "internal_error")
+        self.assertIsNone(service.common.load_workflow_link(request["workflow_key"]))
+
+    def test_process_request_skips_reclosing_bead_already_closed_by_dispatch_failure(self) -> None:
+        request = {
+            "request_id": "gh-123-103-fix",
+            "workflow_key": "gh:123:issue:46:fix",
+            "command": "fix",
+            "repository_full_name": "owner/repo",
+            "repository_id": "123",
+            "issue_number": "46",
+            "bead_id": "bd-10",
+        }
+        mapping = {
+            "target": "product/polecat",
+            "commands": {"fix": {"formula": "mol-github-fix-issue"}},
+        }
+        service.common.save_request(request)
+        service.common.save_workflow_link(request["workflow_key"], request["request_id"])
+
+        def dispatch_then_blow_up(current_request: dict[str, object], *_args: object, **_kwargs: object) -> dict[str, object]:
+            current_request["bead_closed"] = True
+            raise RuntimeError("save failed after cleanup")
+
+        with mock.patch.object(service.common, "load_config", return_value={"app": {"app_id": "1"}}), mock.patch.object(
+            service.common,
+            "resolve_repo_mapping",
+            return_value=mapping,
+        ), mock.patch.object(
+            service,
+            "run_fix_issue_dispatch",
+            side_effect=dispatch_then_blow_up,
+        ), mock.patch.object(
+            service,
+            "close_failed_bead",
+            return_value=True,
+        ) as close_failed_bead:
+            service.process_request(request["request_id"])
+
+        close_failed_bead.assert_not_called()
         self.assertIsNone(service.common.load_workflow_link(request["workflow_key"]))
 
     def test_process_request_does_not_remove_newer_workflow_owner(self) -> None:
