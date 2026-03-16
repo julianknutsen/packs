@@ -85,6 +85,7 @@ def human_reason(code: str) -> str:
         "modal_expired": "that modal submission has expired; run /gc fix again",
         "bad_modal_context": "that modal submission does not match the original slash command",
         "summary_required": "a short summary is required before the workflow can start",
+        "internal_error": "an internal error occurred while starting the workflow",
     }
     return mapping.get(code, code or "unknown_error")
 
@@ -504,7 +505,8 @@ def process_request(request_id: str) -> None:
             else:
                 payload["cleanup_failed"] = True
         payload["status"] = "internal_error"
-        payload["reason"] = str(exc)
+        payload["reason"] = "internal_error"
+        payload["error_message"] = str(exc)
         payload["traceback"] = traceback.format_exc(limit=20)
         maybe_notify_dispatch_failure(payload)
         common.save_request(payload)
@@ -693,18 +695,14 @@ def maybe_notify_dispatch_failure(request: dict[str, Any]) -> dict[str, Any]:
 
 def finalize_modal_origin_receipt(
     original_interaction_id: str,
-    modal_interaction_id: str,
     response: dict[str, Any],
+    receipt: dict[str, Any],
 ) -> None:
     original_interaction_id = original_interaction_id.strip()
     if not original_interaction_id:
         return
-    modal_receipt = common.load_interaction_receipt(modal_interaction_id) or {}
-    payload = receipt_payload(
-        response,
-        response_kind=str(modal_receipt.get("response_kind", "message")).strip() or "message",
-        request_id=str(modal_receipt.get("request_id", "")).strip(),
-    )
+    payload = dict(receipt)
+    payload.setdefault("response", response)
     common.replace_interaction_receipt(original_interaction_id, payload)
 
 
@@ -977,8 +975,8 @@ class IntakeHandler(BaseHTTPRequestHandler):
             summary = str(fields.get("summary", "")).strip()
             context_markdown = str(fields.get("context", "")).strip()
             common.remove_pending_modal(nonce)
-            response, _ = accept_fix_request(payload, summary, context_markdown, interaction_id)
-            finalize_modal_origin_receipt(str(pending.get("interaction_id", "")), interaction_id, response)
+            response, receipt = accept_fix_request(payload, summary, context_markdown, interaction_id)
+            finalize_modal_origin_receipt(str(pending.get("interaction_id", "")), response, receipt)
             interaction_response(self, response)
             return
 

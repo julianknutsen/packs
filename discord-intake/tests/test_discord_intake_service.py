@@ -262,12 +262,38 @@ class DiscordIntakeServiceTests(unittest.TestCase):
         self.assertEqual(post_channel_message.call_args.args[0], "44")
         self.assertIn("could not be started", post_channel_message.call_args.args[1])
 
+    def test_process_request_sanitizes_internal_error_followup(self) -> None:
+        common.save_bot_token("bot-token")
+        request = {
+            "request_id": "dc-5-fix",
+            "workflow_key": "dc:guild:1:conversation:5:fix",
+            "command": "fix",
+            "summary": "Crash on startup",
+            "channel_id": "22",
+            "dispatch_target": "product/polecat",
+            "dispatch_formula": "mol-discord-fix-issue",
+        }
+        common.save_request(request)
+
+        with mock.patch.object(service, "run_fix_dispatch", side_effect=RuntimeError("leak this path")), mock.patch.object(
+            common,
+            "post_channel_message",
+            return_value={"id": "msg-2"},
+        ) as post_channel_message:
+            service.process_request(request["request_id"])
+
+        saved = common.load_request(request["request_id"])
+        self.assertEqual(saved["reason"], "internal_error")
+        self.assertEqual(saved["error_message"], "leak this path")
+        self.assertIn("internal error occurred", post_channel_message.call_args.args[1])
+        self.assertNotIn("leak this path", post_channel_message.call_args.args[1])
+
     def test_finalize_modal_origin_receipt_replaces_stale_modal_replay(self) -> None:
         common.save_interaction_receipt("slash-1", {"response_kind": "modal", "modal_nonce": "nonce-1"})
-        common.save_interaction_receipt("modal-1", {"response_kind": "accepted", "request_id": "dc-1"})
         response = service.build_message_response("Accepted /gc fix for this conversation.", ephemeral=False)
+        receipt = {"response_kind": "accepted", "request_id": "dc-1", "response": response}
 
-        service.finalize_modal_origin_receipt("slash-1", "modal-1", response)
+        service.finalize_modal_origin_receipt("slash-1", response, receipt)
 
         receipt = common.load_interaction_receipt("slash-1")
         self.assertEqual(receipt["response_kind"], "accepted")
