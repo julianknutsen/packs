@@ -16,7 +16,7 @@ visibility = "public"
 hostname = "github"
 
 [service.process]
-command = ["python3", "scripts/github_intake_service.py"]
+command = ["python3", "-u", "scripts/github_intake_service.py"]
 health_path = "/healthz"
 
 [[service]]
@@ -29,7 +29,7 @@ visibility = "tenant"
 hostname = "github-admin"
 
 [service.process]
-command = ["python3", "scripts/github_intake_service.py"]
+command = ["python3", "-u", "scripts/github_intake_service.py"]
 health_path = "/healthz"
 
 [[doctor]]
