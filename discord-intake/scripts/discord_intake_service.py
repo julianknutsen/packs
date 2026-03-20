@@ -920,9 +920,11 @@ class IntakeHandler(BaseHTTPRequestHandler):
         except ValueError:
             skew = common.REQUEST_RETENTION_SECONDS
         if skew > 10:
+            print(f"[{common.current_service_name()}] REJECT: stale_signature_timestamp skew={skew}s timestamp={timestamp}")
             json_response(self, HTTPStatus.UNAUTHORIZED, {"error": "stale_signature_timestamp"})
             return
         if not common.verify_discord_signature(public_key, timestamp, body, signature):
+            print(f"[{common.current_service_name()}] REJECT: invalid_signature pubkey={public_key[:8]}... ts={timestamp} sig={signature[:16]}...")
             json_response(self, HTTPStatus.UNAUTHORIZED, {"error": "invalid_signature"})
             return
         try:
