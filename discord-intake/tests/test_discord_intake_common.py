@@ -32,7 +32,8 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         self.assertNotIn("integration_types", payload[0])
         self.assertNotIn("default_member_permissions", payload[0])
         self.assertEqual(payload[0]["options"][0]["name"], "fix")
-        self.assertEqual(payload[0]["options"][0]["options"][0]["name"], "prompt")
+        self.assertEqual(payload[0]["options"][0]["options"][0]["name"], "rig")
+        self.assertEqual(payload[0]["options"][0]["options"][1]["name"], "prompt")
 
     def test_build_global_command_payload_adds_global_only_fields(self) -> None:
         payload = common.build_command_payload("gc", scope="global")
@@ -132,6 +133,26 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         receipt = common.load_interaction_receipt("abc")
         self.assertEqual(receipt["response_kind"], "accepted")
         self.assertEqual(receipt["request_id"], "dc-1")
+
+    def test_set_rig_mapping_persists_fix_formula(self) -> None:
+        config = common.set_rig_mapping(common.load_config(), "1", "mission-control", "mission-control/polecat", "mol-discord-fix-issue")
+
+        mapping = common.resolve_rig_mapping(config, "1", "mission-control")
+
+        self.assertIsNotNone(mapping)
+        assert mapping is not None
+        self.assertEqual(mapping["target"], "mission-control/polecat")
+        self.assertEqual(mapping["rig_name"], "mission-control")
+        self.assertEqual(mapping["commands"]["fix"]["formula"], "mol-discord-fix-issue")
+
+    def test_build_command_payload_includes_rig_option(self) -> None:
+        payload = common.build_command_payload("gc")
+
+        fix_options = payload[0]["options"][0]["options"]
+        rig_opt = next((o for o in fix_options if o["name"] == "rig"), None)
+        self.assertIsNotNone(rig_opt)
+        self.assertTrue(rig_opt["required"])
+        self.assertEqual(rig_opt["type"], 3)
 
     def test_verify_discord_signature_returns_true_when_openssl_verifies(self) -> None:
         with mock.patch.object(common.subprocess, "run", return_value=mock.Mock(returncode=0)):

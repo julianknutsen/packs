@@ -66,6 +66,12 @@ long_description = "help/map-channel.txt"
 script = "commands/map-channel.sh"
 
 [[commands]]
+name = "map-rig"
+description = "Map a Discord guild rig name to a slash-command dispatch target"
+long_description = "help/map-rig.txt"
+script = "commands/map-rig.sh"
+
+[[commands]]
 name = "sync-commands"
 description = "Register guild-scoped /gc commands with Discord"
 long_description = "help/sync-commands.txt"

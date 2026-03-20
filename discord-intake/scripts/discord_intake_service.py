@@ -72,6 +72,7 @@ def human_reason(code: str) -> str:
     mapping = {
         "command_not_supported": "this Discord intake slice only supports /gc fix",
         "channel_mapping_missing": "no channel mapping exists for this conversation",
+        "rig_mapping_missing": "no rig mapping exists for that rig in this guild",
         "command_not_configured": "this channel does not configure that /gc command",
         "guild_only": "Discord /gc fix is only accepted inside a guild",
         "guild_not_allowed": "this guild is not allowed to dispatch /gc fix",
@@ -211,6 +212,7 @@ def parse_application_command(payload: dict[str, Any], command_name_value: str) 
         return {}
     command = str(subcommand.get("name", "")).strip().lower()
     prompt = ""
+    rig = ""
     sub_options = subcommand.get("options") or []
     if isinstance(sub_options, list):
         for option in sub_options:
@@ -218,10 +220,12 @@ def parse_application_command(payload: dict[str, Any], command_name_value: str) 
                 continue
             if str(option.get("name", "")) == "prompt":
                 prompt = str(option.get("value", "")).strip()
-                break
+            if str(option.get("name", "")) == "rig":
+                rig = str(option.get("value", "")).strip()
     return {
         "command": command,
         "prompt": prompt,
+        "rig": rig,
     }
 
 
@@ -641,13 +645,15 @@ def build_request(
     summary: str,
     context_markdown: str,
     channel_context: dict[str, Any],
+    mapping: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     guild_id = str(payload.get("guild_id", "")).strip()
     conversation_id = str(payload.get("channel_id", "")).strip()
     interaction_id = str(payload.get("id", "")).strip()
     thread_id = str(channel_context.get("thread_id", "")).strip()
     channel_id = str(channel_context.get("parent_channel_id", "")).strip() or conversation_id
-    mapping = channel_context.get("mapping") or {}
+    if mapping is None:
+        mapping = channel_context.get("mapping") or {}
     request_id = common.build_request_id(interaction_id, "fix")
     return {
         "request_id": request_id,
@@ -736,27 +742,40 @@ def accept_fix_request(
     summary: str,
     context_markdown: str,
     interaction_id: str,
+    rig_name: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     config = common.load_config()
-    if not str(payload.get("guild_id", "")).strip():
+    guild_id = str(payload.get("guild_id", "")).strip()
+    if not guild_id:
         response = build_message_response(human_reason("guild_only"), ephemeral=True)
         return response, receipt_payload(response, response_kind="message")
     if not common.load_bot_token():
         response = build_message_response(human_reason("discord_app_not_configured"), ephemeral=True)
         return response, receipt_payload(response, response_kind="message")
-    channel_context = common.load_channel_context(
-        config,
-        str(payload.get("guild_id", "")),
-        str(payload.get("channel_id", "")),
-        str((payload.get("channel") or {}).get("parent_id", "")),
-    )
-    mapping = channel_context.get("mapping") or {}
-    if not mapping:
-        response = build_message_response(human_reason("channel_mapping_missing"), ephemeral=True)
-        return response, receipt_payload(response, response_kind="message")
+
+    # Resolve dispatch target: rig mapping takes priority, channel mapping as fallback.
+    mapping: dict[str, Any] | None = None
+    channel_context: dict[str, Any] = {}
+    if rig_name:
+        mapping = common.resolve_rig_mapping(config, guild_id, rig_name)
+        if not mapping:
+            response = build_message_response(human_reason("rig_mapping_missing"), ephemeral=True)
+            return response, receipt_payload(response, response_kind="message")
+    else:
+        channel_context = common.load_channel_context(
+            config,
+            guild_id,
+            str(payload.get("channel_id", "")),
+            str((payload.get("channel") or {}).get("parent_id", "")),
+        )
+        mapping = channel_context.get("mapping") or {}
+        if not mapping:
+            response = build_message_response(human_reason("channel_mapping_missing"), ephemeral=True)
+            return response, receipt_payload(response, response_kind="message")
+
     reason = common.policy_reason(
         config,
-        str(payload.get("guild_id", "")),
+        guild_id,
         str(channel_context.get("parent_channel_id", payload.get("channel_id", ""))),
         role_ids(payload),
     )
@@ -770,7 +789,7 @@ def accept_fix_request(
     if not summary:
         response = build_message_response(human_reason("summary_required"), ephemeral=True)
         return response, receipt_payload(response, response_kind="message")
-    request = build_request(payload, summary, context_markdown, channel_context)
+    request = build_request(payload, summary, context_markdown, channel_context, mapping)
     behavior = command_behavior("fix")
     if not behavior:
         response = build_message_response(human_reason("command_not_supported"), ephemeral=True)
@@ -958,10 +977,11 @@ class IntakeHandler(BaseHTTPRequestHandler):
             if command != "fix":
                 interaction_response(self, build_message_response(human_reason("command_not_supported"), ephemeral=True))
                 return
+            rig_name = str(parsed_command.get("rig", "")).strip()
             prompt = str(parsed_command.get("prompt", "")).strip()
             if prompt:
                 summary, context_markdown = prompt_to_summary_context(prompt)
-                response, _ = accept_fix_request(payload, summary, context_markdown, interaction_id)
+                response, _ = accept_fix_request(payload, summary, context_markdown, interaction_id, rig_name=rig_name)
                 interaction_response(self, response)
                 return
             nonce = secrets.token_hex(12)
@@ -973,6 +993,7 @@ class IntakeHandler(BaseHTTPRequestHandler):
                     "user_id": str(((payload.get("member") or {}).get("user") or {}).get("id", "")),
                     "interaction_id": interaction_id,
                     "command": command,
+                    "rig_name": rig_name,
                 }
             )
             common.save_interaction_receipt(
@@ -999,8 +1020,9 @@ class IntakeHandler(BaseHTTPRequestHandler):
             fields = extract_modal_fields(payload)
             summary = str(fields.get("summary", "")).strip()
             context_markdown = str(fields.get("context", "")).strip()
+            rig_name = str(pending.get("rig_name", "")).strip()
             common.remove_pending_modal(nonce)
-            response, receipt = accept_fix_request(payload, summary, context_markdown, interaction_id)
+            response, receipt = accept_fix_request(payload, summary, context_markdown, interaction_id, rig_name=rig_name)
             finalize_modal_origin_receipt(str(pending.get("interaction_id", "")), response, receipt)
             interaction_response(self, response)
             return

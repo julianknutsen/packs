@@ -20,6 +20,7 @@ def render_text(snapshot: dict[str, object]) -> str:
         f"  command_name:     {((config or {}).get('app') or {}).get('command_name', common.COMMAND_NAME_DEFAULT)}",
         f"  bot_token:        {'present' if ((config or {}).get('app') or {}).get('bot_token_present') else 'missing'}",
         f"  channel_mappings: {len(((config or {}).get('channels') or {}))}",
+        f"  rig_mappings:     {len(((config or {}).get('rigs') or {}))}",
         "",
         "Recent Requests:",
     ]

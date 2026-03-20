@@ -161,6 +161,7 @@ def default_config() -> dict[str, Any]:
             "role_allowlist": [],
         },
         "channels": {},
+        "rigs": {},
     }
 
 
@@ -218,6 +219,35 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
                 },
             }
         config["channels"] = normalized_channels
+    rigs = raw.get("rigs")
+    if isinstance(rigs, dict):
+        normalized_rigs: dict[str, Any] = {}
+        for key, value in rigs.items():
+            if not isinstance(value, dict):
+                continue
+            guild_id = str(value.get("guild_id", "")).strip()
+            rig_name = str(value.get("rig_name", "")).strip()
+            target = str(value.get("target", "")).strip()
+            if not guild_id or not rig_name or not target:
+                continue
+            commands = value.get("commands")
+            if not isinstance(commands, dict):
+                commands = {}
+            fix_cfg = commands.get("fix")
+            if not isinstance(fix_cfg, dict):
+                fix_cfg = {}
+            fix_formula = str(fix_cfg.get("formula", FIX_FORMULA_DEFAULT)).strip() or FIX_FORMULA_DEFAULT
+            normalized_rigs[str(key)] = {
+                "guild_id": guild_id,
+                "rig_name": rig_name,
+                "target": target,
+                "commands": {
+                    "fix": {
+                        "formula": fix_formula,
+                    }
+                },
+            }
+        config["rigs"] = normalized_rigs
     config["schema_version"] = SCHEMA_VERSION
     return config
 
@@ -319,6 +349,37 @@ def set_channel_mapping(
 def resolve_channel_mapping(config: dict[str, Any], guild_id: str, channel_id: str) -> dict[str, Any] | None:
     channels = normalize_config(config).get("channels", {})
     return channels.get(normalize_channel_key(guild_id, channel_id))
+
+
+def normalize_rig_key(guild_id: str, rig_name: str) -> str:
+    return f"{str(guild_id).strip()}/{str(rig_name).strip()}"
+
+
+def set_rig_mapping(
+    config: dict[str, Any],
+    guild_id: str,
+    rig_name: str,
+    target: str,
+    fix_formula: str | None,
+) -> dict[str, Any]:
+    cfg = normalize_config(config)
+    key = normalize_rig_key(guild_id, rig_name)
+    cfg["rigs"][key] = {
+        "guild_id": str(guild_id).strip(),
+        "rig_name": str(rig_name).strip(),
+        "target": str(target).strip(),
+        "commands": {
+            "fix": {
+                "formula": str(fix_formula or FIX_FORMULA_DEFAULT).strip() or FIX_FORMULA_DEFAULT,
+            }
+        },
+    }
+    return save_config(cfg)
+
+
+def resolve_rig_mapping(config: dict[str, Any], guild_id: str, rig_name: str) -> dict[str, Any] | None:
+    rigs = normalize_config(config).get("rigs", {})
+    return rigs.get(normalize_rig_key(guild_id, rig_name))
 
 
 def load_channel_context(
@@ -721,6 +782,12 @@ def build_command_payload(command_name_value: str, scope: str = "guild") -> list
                 "name": "fix",
                 "description": "Create a GC fix workflow",
                 "options": [
+                    {
+                        "type": 3,
+                        "name": "rig",
+                        "description": "Target rig for the fix workflow",
+                        "required": True,
+                    },
                     {
                         "type": 3,
                         "name": "prompt",

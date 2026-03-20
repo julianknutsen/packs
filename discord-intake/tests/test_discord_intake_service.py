@@ -288,6 +288,64 @@ class DiscordIntakeServiceTests(unittest.TestCase):
         self.assertIn("internal error occurred", post_channel_message.call_args.args[1])
         self.assertNotIn("leak this path", post_channel_message.call_args.args[1])
 
+    def test_parse_application_command_extracts_rig_option(self) -> None:
+        payload = {
+            "data": {
+                "name": "gc",
+                "options": [
+                    {
+                        "type": 1,
+                        "name": "fix",
+                        "options": [
+                            {"type": 3, "name": "rig", "value": "mission-control"},
+                            {"type": 3, "name": "prompt", "value": "crash on startup"},
+                        ],
+                    }
+                ],
+            }
+        }
+
+        parsed = service.parse_application_command(payload, "gc")
+
+        self.assertEqual(parsed["command"], "fix")
+        self.assertEqual(parsed["rig"], "mission-control")
+        self.assertEqual(parsed["prompt"], "crash on startup")
+
+    def test_accept_fix_request_routes_via_rig_mapping(self) -> None:
+        common.import_app_config(common.load_config(), {"application_id": "1", "public_key": "ab" * 32})
+        common.set_rig_mapping(common.load_config(), "1", "mission-control", "mission-control/polecat", "mol-discord-fix-issue")
+        common.save_bot_token("bot-token")
+        payload = {
+            "id": "interaction-2",
+            "guild_id": "1",
+            "channel_id": "55",
+            "member": {"user": {"id": "99", "username": "alice"}, "roles": []},
+        }
+
+        with mock.patch.object(service, "enqueue_request") as enqueue_request:
+            response, receipt = service.accept_fix_request(payload, "Crash on startup", "unset env X", "interaction-2", rig_name="mission-control")
+
+        self.assertEqual(response["type"], 4)
+        self.assertIn("Accepted /gc fix", response["data"]["content"])
+        request = common.list_recent_requests(limit=1)[0]
+        self.assertEqual(request["dispatch_target"], "mission-control/polecat")
+        enqueue_request.assert_called_once()
+
+    def test_accept_fix_request_rejects_unknown_rig(self) -> None:
+        common.import_app_config(common.load_config(), {"application_id": "1", "public_key": "ab" * 32})
+        common.save_bot_token("bot-token")
+        payload = {
+            "id": "interaction-3",
+            "guild_id": "1",
+            "channel_id": "55",
+            "member": {"user": {"id": "99", "username": "alice"}, "roles": []},
+        }
+
+        response, receipt = service.accept_fix_request(payload, "Crash", "", "interaction-3", rig_name="nonexistent")
+
+        self.assertIn("no rig mapping", response["data"]["content"])
+        self.assertEqual(response["data"]["flags"], 64)
+
     def test_finalize_modal_origin_receipt_replaces_stale_modal_replay(self) -> None:
         common.save_interaction_receipt("slash-1", {"response_kind": "modal", "modal_nonce": "nonce-1"})
         response = service.build_message_response("Accepted /gc fix for this conversation.", ephemeral=False)
