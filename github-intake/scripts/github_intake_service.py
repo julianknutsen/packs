@@ -96,6 +96,29 @@ def rig_from_target(target: str) -> str:
     return rig.strip()
 
 
+def rig_workdir(rig: str) -> str:
+    """Resolve a rig's working directory from .beads/routes.jsonl."""
+    root = common.city_root() or "."
+    routes_path = os.path.join(root, ".beads", "routes.jsonl")
+    try:
+        with open(routes_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                # Match by prefix (e.g. "mc" for mission-control) — the path
+                # field is the rig directory relative to city root.
+                path = str(entry.get("path", ""))
+                if path == rig:
+                    resolved = os.path.join(root, path) if not os.path.isabs(path) else path
+                    if os.path.isdir(resolved):
+                        return resolved
+    except (OSError, json.JSONDecodeError):
+        pass
+    return ""
+
+
 def extract_json_output(raw: str) -> dict[str, Any]:
     raw = raw.strip()
     if not raw:
@@ -175,9 +198,10 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
         return {"status": "dispatch_failed", "reason": "invalid_dispatch_target"}
     city_root = common.city_root() or "."
     bd_bin = os.environ.get("BD_BIN", "bd")
-    create_command = [bd_bin, "create", "--json", build_fix_bead_title(request), "--rig", rig, "-t", "task"]
+    bd_cwd = rig_workdir(rig) or city_root
+    create_command = [bd_bin, "create", "--json", build_fix_bead_title(request), "-t", "task"]
     try:
-        create_result = run_subprocess(create_command, city_root)
+        create_result = run_subprocess(create_command, bd_cwd)
     except FileNotFoundError:
         return {"status": "dispatch_failed", "reason": "bead_create_failed", "dispatch_stderr": "bd not available"}
     if create_result.returncode != 0:
@@ -208,12 +232,12 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
         "github_default_branch": str(request.get("repository_default_branch", "") or "main"),
         "github_comment_author": str(request.get("comment_author", "")),
     }
-    update_command = [bd_bin, "update", bead_id, "--rig", rig, "--notes", build_fix_bead_notes(request)]
+    update_command = [bd_bin, "update", bead_id, "--notes", build_fix_bead_notes(request)]
     for key, value in metadata.items():
         if value:
             update_command.extend(["--set-metadata", f"{key}={value}"])
     try:
-        update_result = run_subprocess(update_command, city_root)
+        update_result = run_subprocess(update_command, bd_cwd)
     except FileNotFoundError:
         return {
             "status": "dispatch_failed",
@@ -252,15 +276,15 @@ def close_failed_bead(bead_id: str, reason: str, rig: str = "") -> bool:
         return True
     bd_bin = os.environ.get("BD_BIN", "bd")
     city_root = common.city_root() or "."
-    rig_args = ["--rig", rig] if rig else []
+    bd_cwd = (rig_workdir(rig) or city_root) if rig else city_root
     try:
         set_reason = run_subprocess(
-            [bd_bin, "update", bead_id, *rig_args, "--set-metadata", f"close_reason=github-intake:{reason or 'dispatch_failed'}"],
-            city_root,
+            [bd_bin, "update", bead_id, "--set-metadata", f"close_reason=github-intake:{reason or 'dispatch_failed'}"],
+            bd_cwd,
         )
         if set_reason.returncode != 0:
             return False
-        result = run_subprocess([bd_bin, "close", bead_id, *rig_args], city_root)
+        result = run_subprocess([bd_bin, "close", bead_id], bd_cwd)
     except FileNotFoundError:
         return False
     return result.returncode == 0
