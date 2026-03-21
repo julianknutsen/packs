@@ -25,15 +25,26 @@ PROCESSING_LOCK = threading.Lock()
 ACCEPTANCE_LOCK = threading.Lock()
 MODAL_SUBMIT_LOCK = threading.Lock()
 REQUEST_PRUNE_LOCK = threading.Lock()
+REQUEST_RECOVERY_LOCK = threading.Lock()
 PROCESSING_REQUESTS: set[str] = set()
 MAX_REQUEST_BYTES = 64 * 1024
 DISPATCHING_RECOVERY_GRACE_SECONDS = 10 * 60
 REQUEST_PRUNE_INTERVAL_SECONDS = 60
+REQUEST_RECOVERY_INTERVAL_SECONDS = 60
+DISPATCH_SUBPROCESS_TIMEOUT_SECONDS = 5 * 60
 LAST_REQUEST_PRUNE_AT = 0.0
+LAST_REQUEST_RECOVERY_AT = 0.0
 
 
 class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
+
+
+class DispatchSubprocessTimeout(RuntimeError):
+    def __init__(self, command: list[str], timeout_seconds: float) -> None:
+        self.command = list(command)
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"command timed out after {timeout_seconds:g}s: {' '.join(self.command)}")
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -90,6 +101,7 @@ def human_reason(code: str) -> str:
         "bead_create_failed": "the workflow bead could not be created",
         "bead_update_failed": "the workflow bead could not be initialized",
         "gc_not_available": "the gc CLI is not available in this runtime",
+        "dispatch_timeout": "workflow dispatch timed out before it could finish",
         "invalid_dispatch_target": "the configured target is not a rig-scoped sling target",
         "rig_workdir_missing": "the rig is not routed to a local workspace directory",
         "discord_lookup_failed": "Discord metadata lookup failed; retry in a moment",
@@ -129,6 +141,19 @@ def maybe_prune_request_state() -> bool:
     common.prune_requests()
     common.prune_receipts()
     common.prune_pending_modals()
+    return True
+
+
+def maybe_recover_request_state() -> bool:
+    global LAST_REQUEST_RECOVERY_AT
+    if not should_run_request_recovery():
+        return False
+    now = time.monotonic()
+    with REQUEST_RECOVERY_LOCK:
+        if LAST_REQUEST_RECOVERY_AT and (now - LAST_REQUEST_RECOVERY_AT) < REQUEST_RECOVERY_INTERVAL_SECONDS:
+            return False
+        LAST_REQUEST_RECOVERY_AT = now
+    recover_incomplete_requests()
     return True
 
 
@@ -316,7 +341,17 @@ def role_ids(payload: dict[str, Any]) -> list[str]:
 
 
 def run_subprocess(command: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=DISPATCH_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DispatchSubprocessTimeout(command, DISPATCH_SUBPROCESS_TIMEOUT_SECONDS) from exc
 
 
 def rig_from_target(target: str) -> str:
@@ -393,7 +428,7 @@ def load_bead_snapshot(bead_id: str, rig: str = "") -> dict[str, Any]:
     bd_cwd = rig_workdir(rig) or (common.city_root() or ".")
     try:
         result = run_subprocess([bd_bin, "show", normalized_bead_id, "--json"], bd_cwd)
-    except FileNotFoundError:
+    except (DispatchSubprocessTimeout, FileNotFoundError):
         return {}
     if result.returncode != 0:
         return {}
@@ -473,6 +508,13 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
         create_result = run_subprocess(create_command, bd_cwd)
     except FileNotFoundError:
         return {"status": "dispatch_failed", "reason": "bead_create_failed", "dispatch_stderr": "bd not available"}
+    except DispatchSubprocessTimeout as exc:
+        return {
+            "status": "dispatch_failed",
+            "reason": "dispatch_timeout",
+            "dispatch_command": exc.command,
+            "dispatch_timeout_seconds": exc.timeout_seconds,
+        }
     if create_result.returncode != 0:
         return {
             "status": "dispatch_failed",
@@ -513,6 +555,14 @@ def create_fix_bead(request: dict[str, Any], target: str) -> dict[str, Any]:
             "reason": "bead_update_failed",
             "bead_id": bead_id,
             "dispatch_stderr": "bd not available",
+        }
+    except DispatchSubprocessTimeout as exc:
+        return {
+            "status": "dispatch_failed",
+            "reason": "dispatch_timeout",
+            "bead_id": bead_id,
+            "dispatch_command": exc.command,
+            "dispatch_timeout_seconds": exc.timeout_seconds,
         }
     if update_result.returncode != 0:
         return {
@@ -560,7 +610,7 @@ def close_failed_bead(bead_id: str, reason: str, rig: str = "") -> bool:
         )
         run_subprocess([bd_bin, "ready", bead_id], bd_cwd)
         result = run_subprocess([bd_bin, "close", bead_id], bd_cwd)
-    except FileNotFoundError:
+    except (DispatchSubprocessTimeout, FileNotFoundError):
         return False
     return result.returncode == 0
 
@@ -606,6 +656,37 @@ def run_fix_dispatch(request: dict[str, Any]) -> dict[str, Any]:
             outcome["bead_closed"] = True
         else:
             outcome["cleanup_failed"] = True
+        return outcome
+    except DispatchSubprocessTimeout as exc:
+        recovery_state = dispatch_recovery_state(
+            {
+                "bead_id": bead_id,
+                "dispatch_target": target,
+            }
+        )
+        outcome: dict[str, Any] = {
+            "bead_id": bead_id,
+            "dispatch_command": exc.command,
+            "dispatch_timeout_seconds": exc.timeout_seconds,
+        }
+        if recovery_state == "active":
+            outcome["status"] = "dispatched"
+            outcome["dispatch_completed_at"] = common.utcnow()
+            outcome["dispatch_recovery_reason"] = "dispatch_timeout_but_bead_already_routed"
+        elif recovery_state == "unknown":
+            outcome["status"] = "dispatching"
+            outcome["dispatch_recovery_reason"] = "dispatch_timeout_state_unavailable"
+            outcome["dispatch_timeout_at"] = common.utcnow()
+        else:
+            cleanup_ok = close_failed_bead(bead_id, "dispatch_timeout", rig)
+            outcome["status"] = "dispatch_failed"
+            outcome["reason"] = "dispatch_timeout"
+            if cleanup_ok:
+                outcome["bead_closed"] = True
+            else:
+                outcome["cleanup_failed"] = True
+        request.update(outcome)
+        common.save_request(request)
         return outcome
     outcome = {
         "bead_id": bead_id,
@@ -1171,6 +1252,7 @@ class IntakeHandler(BaseHTTPRequestHandler):
             return
 
         maybe_prune_request_state()
+        maybe_recover_request_state()
 
         interaction_type = int(payload.get("type", 0) or 0)
         if interaction_type == 1:
@@ -1268,12 +1350,10 @@ def main() -> int:
     if should_run_request_recovery():
         recover_incomplete_requests()
     socket_path = os.environ.get("GC_SERVICE_SOCKET")
-    if not socket_path:
-        raise SystemExit("GC_SERVICE_SOCKET is required")
     try:
-        os.remove(socket_path)
-    except FileNotFoundError:
-        pass
+        common.prepare_service_socket(socket_path or "")
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     with ThreadingUnixHTTPServer(socket_path, IntakeHandler) as server:
         print(f"[{common.current_service_name() or 'discord'}] listening on {socket_path}")
         server.serve_forever()

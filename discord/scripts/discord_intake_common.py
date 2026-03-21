@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import re
+import socket
 import subprocess
 import tempfile
 import time
@@ -31,6 +32,8 @@ ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 DEFAULT_GC_API_PORT = 9443
 LOCAL_API_BINDS = {"", "0.0.0.0", "::", "[::]", "*"}
 DISCORD_RATE_LIMIT_RETRIES = 2
+GC_API_REQUEST_TIMEOUT_SECONDS = 20.0
+SERVICE_SOCKET_PROBE_TIMEOUT_SECONDS = 0.2
 
 
 class DiscordAPIError(RuntimeError):
@@ -1248,6 +1251,7 @@ def gc_api_request(
     path: str,
     payload: Any = None,
     headers: dict[str, str] | None = None,
+    timeout: float = GC_API_REQUEST_TIMEOUT_SECONDS,
 ) -> Any:
     base_url = gc_api_base_url()
     if path.startswith("http://") or path.startswith("https://"):
@@ -1267,7 +1271,7 @@ def gc_api_request(
         request_headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=body, headers=request_headers, method=method.upper())
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
         raw = exc.read()
@@ -1293,6 +1297,33 @@ def list_city_sessions(state: str = "all") -> list[dict[str, Any]]:
     if not isinstance(items, list):
         return []
     return [item for item in items if isinstance(item, dict)]
+
+
+def service_socket_is_active(socket_path: str, timeout: float = SERVICE_SOCKET_PROBE_TIMEOUT_SECONDS) -> bool:
+    path = str(socket_path).strip()
+    if not path or not os.path.exists(path):
+        return False
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
+    try:
+        probe.connect(path)
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def prepare_service_socket(socket_path: str) -> None:
+    path = str(socket_path).strip()
+    if not path:
+        raise RuntimeError("GC_SERVICE_SOCKET is required")
+    if service_socket_is_active(path):
+        raise RuntimeError(f"refusing to replace active service socket: {path}")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 def session_index_by_name(state: str = "all") -> dict[str, dict[str, Any]]:

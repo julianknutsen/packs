@@ -37,6 +37,7 @@ RECONNECT_MAX_DELAY_SECONDS = 60
 PRUNE_INTERVAL_SECONDS = 60
 HEALTH_RECONNECT_GRACE_SECONDS = 90
 GC_API_HEALTH_TTL_SECONDS = 30
+GC_API_HEALTH_PROBE_TIMEOUT_SECONDS = 3.0
 CHANNEL_INFO_TTL_SECONDS = 5 * 60
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 STALE_PROCESSING_RECEIPT_SECONDS = 2 * 60
@@ -306,7 +307,11 @@ def probe_gc_api_health(runtime_state: "GatewayRuntimeState") -> bool:
         if checked_at and (now - checked_at) < GC_API_HEALTH_TTL_SECONDS:
             return bool(GC_API_HEALTH_CACHE.get("reachable", True))
     try:
-        common.gc_api_request("GET", "/v0/sessions?limit=1&state=all")
+        common.gc_api_request(
+            "GET",
+            "/v0/sessions?limit=1&state=all",
+            timeout=GC_API_HEALTH_PROBE_TIMEOUT_SECONDS,
+        )
     except common.GCAPIError as exc:
         with GC_API_HEALTH_LOCK:
             GC_API_HEALTH_CACHE["checked_at"] = now
@@ -424,6 +429,31 @@ def persist_ingress_receipt(payload: dict[str, Any]) -> dict[str, Any]:
     return common.save_chat_ingress(payload)
 
 
+def save_rejected_ingress_receipt(
+    message: dict[str, Any],
+    bot_user_id: str,
+    *,
+    status: str,
+    reason: str,
+) -> tuple[bool, dict[str, Any]]:
+    ingress_id = message_ingress_id(message)
+    return common.save_chat_ingress_if_absent(
+        {
+            "ingress_id": ingress_id,
+            "discord_message_id": str(message.get("id", "")).strip(),
+            "guild_id": str(message.get("guild_id", "")).strip(),
+            "conversation_id": str(message.get("channel_id", "")).strip(),
+            "binding_id": "",
+            "from_user_id": str((message.get("author") or {}).get("id", "")).strip(),
+            "from_display": display_name_from_message(message),
+            "body_preview": ingress_preview(message, bot_user_id),
+            "status": status,
+            "reason": reason,
+            "targets": [],
+        }
+    )
+
+
 def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[str, Any]:
     ingress_id = message_ingress_id(message)
     author = message.get("author") or {}
@@ -474,9 +504,13 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                 }
             )
             return {"status": "failed_claim_conflict", "ingress_id": ingress_id, "receipt": receipt}
-        if receipt_status in {"processing", "failed", "partial_failed", "failed_lookup", "failed_claim_conflict"} and (
+        if receipt_status in {"processing", "failed", "partial_failed", "failed_lookup", "failed_claim_conflict", "rejected_shutting_down"} and (
             (receipt_status == "processing" and receipt_age >= STALE_PROCESSING_RECEIPT_SECONDS)
-            or (receipt_status in {"failed", "partial_failed", "failed_lookup", "failed_claim_conflict"} and receipt_age >= FAILED_RECEIPT_RETRY_SECONDS)
+            or (
+                receipt_status in {"failed", "partial_failed", "failed_lookup", "failed_claim_conflict"}
+                and receipt_age >= FAILED_RECEIPT_RETRY_SECONDS
+            )
+            or receipt_status == "rejected_shutting_down"
         ):
             reclaim_lock = stale_reclaim_lock(ingress_id)
             if not reclaim_lock.acquire(blocking=False):
@@ -487,7 +521,11 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                 latest_age = utc_age_seconds(str(latest_receipt.get("updated_at", "")).strip())
                 if not (
                     (latest_status == "processing" and latest_age >= STALE_PROCESSING_RECEIPT_SECONDS)
-                    or (latest_status in {"failed", "partial_failed", "failed_lookup", "failed_claim_conflict"} and latest_age >= FAILED_RECEIPT_RETRY_SECONDS)
+                    or (
+                        latest_status in {"failed", "partial_failed", "failed_lookup", "failed_claim_conflict"}
+                        and latest_age >= FAILED_RECEIPT_RETRY_SECONDS
+                    )
+                    or latest_status == "rejected_shutting_down"
                 ):
                     return {"status": "duplicate", "ingress_id": ingress_id, "receipt": latest_receipt}
                 retry_reason = "stale_processing_reclaimed"
@@ -497,6 +535,8 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                     retry_reason = "retry_after_failed_lookup"
                 if latest_status == "failed_claim_conflict":
                     retry_reason = "retry_after_failed_claim_conflict"
+                if latest_status == "rejected_shutting_down":
+                    retry_reason = "retry_after_shutdown"
                 base_receipt = persist_ingress_receipt(
                     {
                         **latest_receipt,
@@ -994,6 +1034,12 @@ class GatewayWorker:
 
     def dispatch_gateway_message(self, message: dict[str, Any], bot_user_id: str) -> None:
         if self.stop_event.is_set():
+            save_rejected_ingress_receipt(
+                message,
+                bot_user_id,
+                status="rejected_shutting_down",
+                reason="service_shutting_down",
+            )
             self.runtime_state.bump(
                 "dropped_messages",
                 last_message_status="shutting_down",
@@ -1007,20 +1053,11 @@ class GatewayWorker:
             self.runtime_state.patch(message_queue_size=self.message_queue.qsize())
         except queue.Full:
             ingress_id = message_ingress_id(message)
-            common.save_chat_ingress_if_absent(
-                {
-                    "ingress_id": ingress_id,
-                    "discord_message_id": str(message.get("id", "")).strip(),
-                    "guild_id": str(message.get("guild_id", "")).strip(),
-                    "conversation_id": str(message.get("channel_id", "")).strip(),
-                    "binding_id": "",
-                    "from_user_id": str((message.get("author") or {}).get("id", "")).strip(),
-                    "from_display": display_name_from_message(message),
-                    "body_preview": ingress_preview(message, bot_user_id),
-                    "status": "rejected_overloaded",
-                    "reason": "message_queue_full",
-                    "targets": [],
-                }
+            save_rejected_ingress_receipt(
+                message,
+                bot_user_id,
+                status="rejected_overloaded",
+                reason="message_queue_full",
             )
             print(
                 f"[{common.current_service_name() or 'discord-gateway'}] dropping ingress {ingress_id}: message queue full",
@@ -1242,12 +1279,10 @@ def main() -> int:
     common.prune_chat_ingress()
     common.prune_chat_publishes()
     socket_path = os.environ.get("GC_SERVICE_SOCKET", "")
-    if not socket_path:
-        raise SystemExit("GC_SERVICE_SOCKET is required")
     try:
-        os.remove(socket_path)
-    except FileNotFoundError:
-        pass
+        common.prepare_service_socket(socket_path)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
 
     runtime_state = get_runtime_state()
     worker = GatewayWorker(runtime_state)

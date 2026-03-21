@@ -408,6 +408,37 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         assert receipt is not None
         self.assertEqual(receipt["reason"], "retry_after_failed_claim_conflict")
 
+    def test_rejected_shutting_down_receipt_retries_immediately(self) -> None:
+        common.set_chat_binding(common.load_config(), "dm", "55", ["sky"])
+        common.atomic_write_json(
+            common.chat_ingress_path("in-916"),
+            {
+                "ingress_id": "in-916",
+                "status": "rejected_shutting_down",
+                "created_at": "2000-01-01T00:00:00Z",
+                "updated_at": "2000-01-01T00:00:00Z",
+            },
+        )
+        message = {
+            "id": "916",
+            "channel_id": "55",
+            "content": "hello from discord",
+            "author": {"id": "u-16", "username": "alice"},
+        }
+
+        with mock.patch.object(common, "session_index_by_name", return_value={"sky": {"session_name": "sky", "state": "active"}}), mock.patch.object(
+            common,
+            "deliver_session_message",
+            return_value={"status": "accepted", "id": "gc-16"},
+        ) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver_session_message.assert_called_once()
+        receipt = common.load_chat_ingress("in-916")
+        assert receipt is not None
+        self.assertEqual(receipt["reason"], "retry_after_shutdown")
+
     def test_stale_reclaim_lock_allows_only_one_delivery(self) -> None:
         common.set_chat_binding(common.load_config(), "dm", "55", ["sky"])
         common.atomic_write_json(
@@ -619,6 +650,19 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertTrue(worker.stop_event.is_set())
         self.assertTrue(all(not thread.is_alive() for thread in worker.worker_threads))
 
+    def test_dispatch_gateway_message_persists_shutting_down_receipt(self) -> None:
+        runtime_state = gateway_service.GatewayRuntimeState()
+        worker = gateway_service.GatewayWorker(runtime_state)
+        self.addCleanup(worker.stop)
+        worker.request_stop()
+
+        worker.dispatch_gateway_message({"id": "1002", "channel_id": "55", "author": {"id": "u-1002"}}, "999")
+
+        receipt = common.load_chat_ingress("in-1002")
+        assert receipt is not None
+        self.assertEqual(receipt["status"], "rejected_shutting_down")
+        self.assertEqual(receipt["reason"], "service_shutting_down")
+
     def test_worker_stop_returns_when_worker_pool_is_idle(self) -> None:
         runtime_state = gateway_service.GatewayRuntimeState()
         worker = gateway_service.GatewayWorker(runtime_state)
@@ -670,6 +714,10 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             self.assertTrue(gateway_service.probe_gc_api_health(runtime_state))
 
         gc_api_request.assert_called_once()
+        self.assertEqual(
+            gc_api_request.call_args.kwargs["timeout"],
+            gateway_service.GC_API_HEALTH_PROBE_TIMEOUT_SECONDS,
+        )
 
     def test_current_bot_user_id_prefers_last_known_id_after_resume(self) -> None:
         worker = object.__new__(gateway_service.GatewayWorker)

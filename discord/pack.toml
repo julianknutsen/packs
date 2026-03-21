@@ -74,6 +74,11 @@ name = "jq"
 description = "jq is available for Discord workflow metadata extraction"
 script = "doctor/check-jq.sh"
 
+[[doctor]]
+name = "legacy-pack-conflict"
+description = "legacy discord-intake state is not present in this workspace"
+script = "doctor/check-legacy-pack-conflict.sh"
+
 [[commands]]
 name = "status"
 description = "Show Discord provider status, URLs, mappings, bindings, and recent activity"

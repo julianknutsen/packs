@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import pathlib
+import socket
 import tempfile
 import threading
 import time
@@ -210,6 +211,31 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         self.assertEqual(mapping["rig_name"], "mission-control")
         self.assertEqual(mapping["commands"]["fix"]["formula"], "mol-discord-fix-issue")
 
+    def test_normalize_config_preserves_distinct_mixed_case_rig_entries(self) -> None:
+        config = common.normalize_config(
+            {
+                "rigs": {
+                    "1/Mission-Control": {
+                        "guild_id": "1",
+                        "rig_name": "Mission-Control",
+                        "target": "mission-control/polecat",
+                        "commands": {"fix": {"formula": "mol-discord-fix-issue"}},
+                    },
+                    "1/mission-control": {
+                        "guild_id": "1",
+                        "rig_name": "mission-control",
+                        "target": "product/polecat",
+                        "commands": {"fix": {"formula": "mol-discord-fix-issue"}},
+                    }
+                }
+            }
+        )
+
+        self.assertIn("1/Mission-Control", config["rigs"])
+        self.assertIn("1/mission-control", config["rigs"])
+        self.assertEqual(config["rigs"]["1/Mission-Control"]["target"], "mission-control/polecat")
+        self.assertEqual(config["rigs"]["1/mission-control"]["target"], "product/polecat")
+
     def test_build_command_payload_includes_rig_option(self) -> None:
         payload = common.build_command_payload("gc")
 
@@ -266,6 +292,29 @@ class DiscordIntakeCommonTests(unittest.TestCase):
 
         with self.assertRaisesRegex(common.GCAPIError, "gc api is disabled"):
             common.gc_api_base_url()
+
+    def test_prepare_service_socket_rejects_active_listener(self) -> None:
+        socket_path = pathlib.Path(self.tempdir.name, "discord.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        self.addCleanup(lambda: socket_path.exists() and socket_path.unlink())
+
+        with self.assertRaisesRegex(RuntimeError, "refusing to replace active service socket"):
+            common.prepare_service_socket(str(socket_path))
+
+    def test_prepare_service_socket_removes_stale_socket_file(self) -> None:
+        socket_path = pathlib.Path(self.tempdir.name, "discord-stale.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        listener.close()
+        self.addCleanup(lambda: socket_path.exists() and socket_path.unlink())
+
+        common.prepare_service_socket(str(socket_path))
+
+        self.assertFalse(socket_path.exists())
 
     def test_save_chat_publish_lists_recent_records(self) -> None:
         common.save_chat_publish({"publish_id": "pub-1", "binding_id": "room:22"})

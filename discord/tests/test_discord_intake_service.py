@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import base64
+import json
 import pathlib
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -15,6 +19,39 @@ import discord_intake_common as common
 import discord_intake_service as service
 
 
+def unix_http_request(
+    socket_path: str,
+    method: str,
+    path: str,
+    *,
+    body: bytes = b"",
+    headers: dict[str, str] | None = None,
+) -> tuple[int, bytes]:
+    request_headers = {
+        "Host": "localhost",
+        "Connection": "close",
+        "Content-Length": str(len(body)),
+    }
+    if headers:
+        request_headers.update(headers)
+    request_lines = [f"{method} {path} HTTP/1.1", *[f"{key}: {value}" for key, value in request_headers.items()], "", ""]
+    payload = "\r\n".join(request_lines).encode("utf-8") + body
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(socket_path)
+        client.sendall(payload)
+        client.shutdown(socket.SHUT_WR)
+        chunks: list[bytes] = []
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    raw = b"".join(chunks)
+    head, _, response_body = raw.partition(b"\r\n\r\n")
+    status_line = head.splitlines()[0].decode("utf-8")
+    return int(status_line.split()[1]), response_body
+
+
 class DiscordIntakeServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -22,6 +59,7 @@ class DiscordIntakeServiceTests(unittest.TestCase):
         self._old_environ = os.environ.copy()
         os.environ["GC_CITY_ROOT"] = self.tempdir.name
         service.LAST_REQUEST_PRUNE_AT = 0.0
+        service.LAST_REQUEST_RECOVERY_AT = 0.0
 
     def tearDown(self) -> None:
         os.environ.clear()
@@ -227,6 +265,24 @@ class DiscordIntakeServiceTests(unittest.TestCase):
 
         self.assertEqual(outcome["bead_id"], "bd-1")
 
+    def test_create_fix_bead_returns_dispatch_timeout_when_bd_create_hangs(self) -> None:
+        self.write_rig_route("product")
+        request = {
+            "summary": "Crash on startup",
+            "dispatch_target": "product/polecat",
+        }
+
+        with mock.patch.object(
+            service,
+            "run_subprocess",
+            side_effect=service.DispatchSubprocessTimeout(["bd", "create"], service.DISPATCH_SUBPROCESS_TIMEOUT_SECONDS),
+        ):
+            outcome = service.create_fix_bead(request, "product/polecat")
+
+        self.assertEqual(outcome["status"], "dispatch_failed")
+        self.assertEqual(outcome["reason"], "dispatch_timeout")
+        self.assertEqual(outcome["dispatch_command"], ["bd", "create"])
+
     def test_run_fix_dispatch_returns_bead_init_failure_without_slinging(self) -> None:
         self.write_rig_route("product")
         request = {
@@ -254,6 +310,75 @@ class DiscordIntakeServiceTests(unittest.TestCase):
         self.assertEqual(commands[1], ["bd", "ready", "bd-1"])
         self.assertEqual(commands[2], ["bd", "close", "bd-1"])
         self.assertNotIn("gc", [command[0] for command in commands])
+
+    def test_run_fix_dispatch_returns_dispatch_timeout_when_gc_sling_hangs(self) -> None:
+        request = {
+            "request_id": "dc-timeout-1",
+            "summary": "Crash on startup",
+            "dispatch_target": "product/polecat",
+            "dispatch_formula": "mol-discord-fix-issue",
+        }
+
+        with mock.patch.object(service, "create_fix_bead", return_value={"bead_id": "bd-1"}), mock.patch.object(
+            service,
+            "run_subprocess",
+            side_effect=service.DispatchSubprocessTimeout(["gc", "sling", "product/polecat", "bd-1"], 300),
+        ), mock.patch.object(service, "dispatch_recovery_state", return_value="inactive"), mock.patch.object(
+            service,
+            "close_failed_bead",
+            return_value=True,
+        ) as close_failed_bead:
+            outcome = service.run_fix_dispatch(request)
+
+        self.assertEqual(outcome["status"], "dispatch_failed")
+        self.assertEqual(outcome["reason"], "dispatch_timeout")
+        self.assertTrue(outcome["bead_closed"])
+        close_failed_bead.assert_called_once_with("bd-1", "dispatch_timeout", "product")
+
+    def test_run_fix_dispatch_converges_timeout_to_dispatched_when_bead_is_active(self) -> None:
+        request = {
+            "request_id": "dc-timeout-2",
+            "summary": "Crash on startup",
+            "dispatch_target": "product/polecat",
+            "dispatch_formula": "mol-discord-fix-issue",
+        }
+
+        with mock.patch.object(service, "create_fix_bead", return_value={"bead_id": "bd-2"}), mock.patch.object(
+            service,
+            "run_subprocess",
+            side_effect=service.DispatchSubprocessTimeout(["gc", "sling", "product/polecat", "bd-2"], 300),
+        ), mock.patch.object(service, "dispatch_recovery_state", return_value="active"), mock.patch.object(
+            service,
+            "close_failed_bead",
+        ) as close_failed_bead:
+            outcome = service.run_fix_dispatch(request)
+
+        self.assertEqual(outcome["status"], "dispatched")
+        self.assertEqual(outcome["dispatch_recovery_reason"], "dispatch_timeout_but_bead_already_routed")
+        close_failed_bead.assert_not_called()
+
+    def test_run_fix_dispatch_leaves_timeout_in_dispatching_when_bead_state_is_unknown(self) -> None:
+        request = {
+            "request_id": "dc-timeout-3",
+            "summary": "Crash on startup",
+            "dispatch_target": "product/polecat",
+            "dispatch_formula": "mol-discord-fix-issue",
+        }
+
+        with mock.patch.object(service, "create_fix_bead", return_value={"bead_id": "bd-3"}), mock.patch.object(
+            service,
+            "run_subprocess",
+            side_effect=service.DispatchSubprocessTimeout(["gc", "sling", "product/polecat", "bd-3"], 300),
+        ), mock.patch.object(service, "dispatch_recovery_state", return_value="unknown"), mock.patch.object(
+            service,
+            "close_failed_bead",
+        ) as close_failed_bead:
+            outcome = service.run_fix_dispatch(request)
+
+        self.assertEqual(outcome["status"], "dispatching")
+        self.assertEqual(outcome["dispatch_recovery_reason"], "dispatch_timeout_state_unavailable")
+        self.assertIn("dispatch_timeout_at", outcome)
+        close_failed_bead.assert_not_called()
 
     def test_process_request_releases_workflow_link_after_dispatch_failure(self) -> None:
         request = {
@@ -810,6 +935,27 @@ class DiscordIntakeServiceTests(unittest.TestCase):
         self.assertEqual(prune_receipts.call_count, 2)
         self.assertEqual(prune_pending_modals.call_count, 2)
 
+    def test_maybe_recover_request_state_rate_limits_repeated_calls(self) -> None:
+        os.environ["GC_SERVICE_NAME"] = common.INTERACTIONS_SERVICE_NAME
+
+        with mock.patch.object(service, "recover_incomplete_requests", return_value=0) as recover_incomplete_requests, mock.patch(
+            "discord_intake_service.time.monotonic",
+            side_effect=[200.0, 200.5, 261.0],
+        ):
+            self.assertTrue(service.maybe_recover_request_state())
+            self.assertFalse(service.maybe_recover_request_state())
+            self.assertTrue(service.maybe_recover_request_state())
+
+        self.assertEqual(recover_incomplete_requests.call_count, 2)
+
+    def test_maybe_recover_request_state_skips_non_interactions_service(self) -> None:
+        os.environ["GC_SERVICE_NAME"] = common.ADMIN_SERVICE_NAME
+
+        with mock.patch.object(service, "recover_incomplete_requests") as recover_incomplete_requests:
+            self.assertFalse(service.maybe_recover_request_state())
+
+        recover_incomplete_requests.assert_not_called()
+
     def test_should_run_request_recovery_only_for_interactions_service(self) -> None:
         with mock.patch.object(common, "current_service_name", return_value=common.ADMIN_SERVICE_NAME):
             self.assertFalse(service.should_run_request_recovery())
@@ -847,6 +993,43 @@ class DiscordIntakeServiceTests(unittest.TestCase):
         saved = common.load_interaction_receipt("interaction-1")
         self.assertEqual(saved["response_kind"], "message")
         self.assertEqual(service.replay_response_from_receipt(saved), response)
+
+    def test_interactions_handler_accepts_signed_ping_over_http(self) -> None:
+        socket_path = pathlib.Path(self.tempdir.name, "discord-intake.sock")
+        os.environ["GC_SERVICE_NAME"] = common.INTERACTIONS_SERVICE_NAME
+        common.import_app_config(common.load_config(), {"application_id": "1", "public_key": "ab" * 32})
+        server = service.ThreadingUnixHTTPServer(str(socket_path), service.IntakeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            body = json.dumps({"id": "interaction-http-1", "type": 1}).encode("utf-8")
+            with mock.patch.object(common, "verify_discord_signature", return_value=True):
+                deadline = time.time() + 1.0
+                while True:
+                    try:
+                        status, response_body = unix_http_request(
+                            str(socket_path),
+                            "POST",
+                            "/v0/discord/interactions",
+                            body=body,
+                            headers={
+                                "Content-Type": "application/json",
+                                "X-Signature-Timestamp": str(int(time.time())),
+                                "X-Signature-Ed25519": "cd" * 64,
+                            },
+                        )
+                        break
+                    except FileNotFoundError:
+                        if time.time() >= deadline:
+                            raise
+                        time.sleep(0.01)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(response_body.decode("utf-8")), {"type": 1})
 
 
 if __name__ == "__main__":
