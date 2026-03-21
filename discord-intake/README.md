@@ -2,6 +2,11 @@
 
 Workspace-hosted Discord slash-command intake for Gas City.
 
+This pack is superseded by the newer `discord` pack. Do not include both
+`discord-intake` and `discord` in the same workspace: they declare the same
+published service identities and will collide. New work should move to the
+`discord` pack and re-import state under `.gc/services/discord/`.
+
 This pack keeps `gastown-hosted` generic. It runs the Discord-facing service
 inside the workspace and exports it through the normal published-service path:
 

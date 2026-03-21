@@ -1,0 +1,18 @@
+Import Discord app metadata and the bot token into the shared intake state.
+
+Example:
+  gc discord import-app \
+    --application-id 123456789012345678 \
+    --public-key 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+    --bot-token "$DISCORD_BOT_TOKEN"
+
+Optional fields:
+  --command-name <name>         slash command root, default: gc
+  --bot-token-file <path>       read the bot token from a file
+  --guild-allowlist <id>        allow only specific guild ids; repeatable
+  --channel-allowlist <id>      allow only specific parent channel ids; repeatable
+  --role-allowlist <id>         allow only specific Discord role ids; repeatable
+
+The public key is the Discord app's interaction verification key. The bot
+token is stored under the pack state root so the service can sync commands and
+post workflow status updates.

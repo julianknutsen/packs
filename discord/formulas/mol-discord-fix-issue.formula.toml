@@ -1,0 +1,333 @@
+description = """
+Discord-driven bugfix workflow for a GC worker session.
+
+This workflow is attached to a newly created rig bead for `/gc fix` requests
+accepted through the Discord pack. The intake service creates the bead,
+records the source Discord context, and slings it to the mapped worker target
+with this formula attached.
+
+The workflow is intentionally Discord-first:
+1. understand the bug and post a "work started" message back to Discord
+2. write or update tests first so the bug is reproduced
+3. implement the fix until the focused tests pass
+4. run a quality pass on the changed area
+5. post a completion message back to Discord with the current branch and bead
+6. release the intake workflow lock for that conversation
+"""
+formula = "mol-discord-fix-issue"
+version = 1
+
+[vars]
+[vars.issue]
+description = "The work bead id created for this Discord request"
+required = true
+
+[vars.discord_request_id]
+description = "Stable request id from the Discord pack service"
+required = true
+
+[vars.discord_guild_id]
+description = "Discord guild id"
+required = true
+
+[vars.discord_channel_id]
+description = "Discord parent channel id"
+required = true
+
+[vars.discord_thread_id]
+description = "Discord thread id if the request originated in a thread"
+default = ""
+
+[vars.discord_conversation_id]
+description = "Discord conversation id used for idempotency"
+required = true
+
+[vars.discord_jump_url_b64]
+description = "Base64-encoded Discord jump URL for safe interpolation into shell snippets"
+default = ""
+
+[vars.discord_requester_b64]
+description = "Base64-encoded Discord requester display name for safe interpolation into shell snippets"
+default = ""
+
+[vars.discord_summary_b64]
+description = "Base64-encoded Discord summary for safe interpolation into shell snippets"
+default = ""
+
+[vars.discord_context_b64]
+description = "Base64-encoded Discord context markdown for safe interpolation into shell snippets"
+default = ""
+
+[[steps]]
+id = "load-context"
+title = "Load context and announce work start"
+description = """
+Prime the session, understand the assignment, and post the first Discord
+message when work begins.
+
+**1. Prime the session:**
+```bash
+gc prime
+bd prime
+```
+
+**2. Inspect the bead and source context:**
+```bash
+bd show {{issue}}
+bd show {{issue}} --json | jq '.metadata'
+```
+
+Read the bead notes carefully. They contain:
+- the source Discord requester and conversation ids
+- the summary from the `/gc fix` modal
+- the additional freeform context supplied by the operator
+
+**3. Post the "work started" Discord message exactly once:**
+```bash
+STARTED=$(bd show {{issue}} --json | jq -r '.metadata.discord_fix_started_message_id // empty')
+if [ -z "$STARTED" ]; then
+  REQUESTER=$(python3 - <<'PY'
+import base64
+print(base64.b64decode("{{discord_requester_b64}}").decode("utf-8"))
+PY
+)
+  JUMP_URL=$(python3 - <<'PY'
+import base64
+print(base64.b64decode("{{discord_jump_url_b64}}").decode("utf-8"))
+PY
+)
+  BODY=$(mktemp)
+  cat >"$BODY" <<EOF
+Started work from Discord.
+
+- Bead: `{{issue}}`
+- Requested by: ${REQUESTER:-unknown}
+- Source: ${JUMP_URL:-}
+
+I will follow up here again when the workflow is complete.
+EOF
+  MESSAGE_JSON=$(gc discord post-message --request-id {{discord_request_id}} --body-file "$BODY")
+  MESSAGE_ID=$(printf '%s' "$MESSAGE_JSON" | jq -r '.id // empty')
+  if [ -n "$MESSAGE_ID" ]; then
+    bd update {{issue}} --set-metadata discord_fix_started_message_id="$MESSAGE_ID"
+  fi
+  rm -f "$BODY"
+fi
+```
+
+**Exit criteria:** You understand the bug and the start message is posted or
+already recorded on the bead metadata."""
+
+[[steps]]
+id = "workspace-setup"
+title = "Set up worktree and fix branch"
+needs = ["load-context"]
+description = """
+Create or resume an isolated git worktree and a deterministic fix branch.
+
+**1. Fetch latest refs:**
+```bash
+git fetch --prune origin
+```
+
+**2. Reuse or create the bead-scoped worktree:**
+```bash
+WORKTREE=$(bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
+if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
+  cd "$WORKTREE"
+else
+  WORKTREE_PATH=$(pwd)/worktrees/{{issue}}
+  git worktree add "$WORKTREE_PATH" --detach origin/$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
+  cd "$WORKTREE_PATH"
+  bd update {{issue}} --set-metadata work_dir="$WORKTREE_PATH"
+fi
+```
+
+**3. Reuse or create the branch:**
+```bash
+BRANCH=$(bd show {{issue}} --json | jq -r '.metadata.branch // empty')
+if [ -n "$BRANCH" ]; then
+  git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH"
+else
+  BRANCH="fix-discord-{{issue}}"
+  git checkout -b "$BRANCH"
+  bd update {{issue}} --set-metadata branch="$BRANCH"
+fi
+```
+
+**4. Verify a clean starting point:**
+```bash
+git status
+```
+
+**Exit criteria:** You are in a clean worktree on the recorded fix branch and
+the bead metadata reflects the active worktree and branch."""
+
+[[steps]]
+id = "understand-bug"
+title = "Understand the bug before writing code"
+needs = ["workspace-setup"]
+description = """
+Take a read-first pass so you understand the problem before changing code.
+
+**1. Re-read the bead notes and identify the likely files:**
+- inspect implementation files
+- inspect existing test coverage around the bug
+- identify the smallest reproducible failing behavior
+
+**2. Record the working theory in bead notes:**
+```bash
+CURRENT_NOTES=$(bd show {{issue}} --json | jq -r '.notes // empty')
+NOTES_FILE=$(mktemp)
+cat >"$NOTES_FILE" <<EOF
+$CURRENT_NOTES
+
+## Bug Understanding
+
+### Hypothesis
+- <what is broken and why>
+
+### Relevant files
+- <file>: <reason>
+
+### Test plan
+- <the failing test you will write first>
+EOF
+bd update {{issue}} --notes "$(cat "$NOTES_FILE")"
+rm -f "$NOTES_FILE"
+```
+
+**Exit criteria:** You can explain the bug clearly and you know which failing
+test will prove the fix."""
+
+[[steps]]
+id = "write-tests-first"
+title = "Write or update tests first"
+needs = ["understand-bug"]
+description = """
+Follow TDD. Capture the bug in tests before you change implementation logic.
+
+**1. Add or update the smallest regression test that proves the bug.**
+
+**2. Run the focused test target and confirm it fails for the right reason.**
+
+**3. If the code change is behavioral, do not proceed until you have a failing
+test or a clear explanation in bead notes for why a test is not appropriate.**
+
+**Exit criteria:** You have a failing test or an explicit, defensible reason
+recorded on the bead for why the change is non-behavioral."""
+
+[[steps]]
+id = "implement-fix"
+title = "Implement until the tests pass"
+needs = ["write-tests-first"]
+description = """
+Make the minimum implementation change that turns the failing test green.
+
+**1. Edit only the files needed for the bugfix.**
+
+**2. Re-run the focused test target until it passes.**
+
+**3. Run any nearby fast validation needed to ensure the fix did not regress
+the changed area.**
+
+**4. Update bead notes with the actual fix and validation command.**
+
+**Exit criteria:** The new regression test passes and you can explain the
+implementation change clearly."""
+
+[[steps]]
+id = "wrap-up"
+title = "Post completion update and release the workflow lock"
+needs = ["implement-fix"]
+description = """
+Summarize the work back to Discord, then release the conversation lock so the
+same thread can be used again later.
+
+**1. Capture the branch and validation summary:**
+```bash
+BRANCH=$(bd show {{issue}} --json | jq -r '.metadata.branch // empty')
+WORKTREE=$(bd show {{issue}} --json | jq -r '.metadata.work_dir // empty')
+```
+
+**2. Attempt the completion message:**
+```bash
+BODY=$(mktemp)
+cat >"$BODY" <<EOF
+Discord `/gc fix` workflow finished.
+
+- Bead: `{{issue}}`
+- Branch: `${BRANCH:-unknown}`
+- Worktree: `${WORKTREE:-unknown}`
+
+Please inspect the bead notes and local branch for the resulting patch.
+EOF
+POST_STATUS=0
+gc discord post-message --request-id {{discord_request_id}} --body-file "$BODY" || POST_STATUS=$?
+rm -f "$BODY"
+```
+
+**3. Release the intake workflow lock and finish cleanup even if the final
+Discord callback failed:**
+```bash
+if [ "$POST_STATUS" -ne 0 ]; then
+  echo "warning: failed to post Discord completion update" >&2
+fi
+RELEASE_WORKFLOW=1
+gc_discord_fix_cleanup() {
+  if [ "${RELEASE_WORKFLOW:-1}" -eq 1 ]; then
+    gc discord release-workflow --request-id {{discord_request_id}} >/dev/null 2>&1 || true
+  fi
+}
+trap gc_discord_fix_cleanup EXIT
+if command -v gt >/dev/null 2>&1; then
+  if ! bd ready {{issue}}; then
+    echo "error: failed to ready bead {{issue}} before gt done" >&2
+    RELEASE_WORKFLOW=0
+    exit 1
+  fi
+  if ! gt done; then
+    echo "error: gt done failed" >&2
+    RELEASE_WORKFLOW=0
+    exit 1
+  fi
+else
+  if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
+    WORKTREE_PARENT=$(dirname "$WORKTREE")
+    CLEANUP_CWD=$(dirname "$WORKTREE_PARENT")
+    if [ ! -d "$CLEANUP_CWD/.git" ]; then
+      CLEANUP_CWD="$WORKTREE_PARENT"
+    fi
+    if ! cd "$CLEANUP_CWD"; then
+      echo "error: failed to enter cleanup directory $CLEANUP_CWD" >&2
+      RELEASE_WORKFLOW=0
+      exit 1
+    fi
+    if ! git worktree remove "$WORKTREE" --force; then
+      echo "error: failed to remove worktree $WORKTREE" >&2
+      RELEASE_WORKFLOW=0
+      exit 1
+    fi
+    if ! bd update {{issue}} --unset-metadata work_dir; then
+      echo "error: failed to clear work_dir metadata for {{issue}}" >&2
+      RELEASE_WORKFLOW=0
+      exit 1
+    fi
+  fi
+  if ! bd ready {{issue}}; then
+    echo "error: failed to ready bead {{issue}}" >&2
+    RELEASE_WORKFLOW=0
+    exit 1
+  fi
+  if ! bd close {{issue}}; then
+    echo "error: failed to close bead {{issue}}" >&2
+    RELEASE_WORKFLOW=0
+    exit 1
+  fi
+fi
+```
+
+**Exit criteria:** Discord has the completion update, the workflow lock is
+released, and the session or bead has been finished through the local runtime's
+normal completion path. If the callback fails, the workflow still unlocks the
+conversation and surfaces the warning in the formula output."""

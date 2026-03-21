@@ -1,0 +1,135 @@
+[pack]
+name = "discord"
+version = "0.1.0"
+schema = 1
+
+[formulas]
+dir = "formulas"
+
+[[service]]
+name = "discord-interactions"
+kind = "proxy_process"
+state_root = ".gc/services/discord"
+
+[service.publication]
+visibility = "public"
+hostname = "discord"
+
+[service.process]
+command = ["python3", "-u", "scripts/discord_intake_service.py"]
+health_path = "/healthz"
+
+[[service]]
+name = "discord-admin"
+kind = "proxy_process"
+state_root = ".gc/services/discord"
+
+[service.publication]
+visibility = "tenant"
+hostname = "discord-admin"
+
+[service.process]
+command = ["python3", "-u", "scripts/discord_intake_service.py"]
+health_path = "/healthz"
+
+[[service]]
+name = "discord-gateway"
+kind = "proxy_process"
+state_root = ".gc/services/discord"
+
+[service.publication]
+visibility = "private"
+
+[service.process]
+command = ["python3", "-u", "scripts/discord_gateway_service.py"]
+health_path = "/healthz"
+
+[[doctor]]
+name = "python"
+description = "python3 3.11+ is available for the Discord services"
+script = "doctor/check-python.sh"
+
+[[doctor]]
+name = "openssl"
+description = "openssl is available for Discord Ed25519 signature verification"
+script = "doctor/check-openssl.sh"
+
+[[doctor]]
+name = "gc"
+description = "gc CLI is available for Discord workflow dispatch"
+script = "doctor/check-gc.sh"
+
+[[doctor]]
+name = "bd"
+description = "bd CLI is available for Discord bead lifecycle commands"
+script = "doctor/check-bd.sh"
+
+[[doctor]]
+name = "git"
+description = "git is available for Discord workflow worktree management"
+script = "doctor/check-git.sh"
+
+[[doctor]]
+name = "jq"
+description = "jq is available for Discord workflow metadata extraction"
+script = "doctor/check-jq.sh"
+
+[[commands]]
+name = "status"
+description = "Show Discord provider status, URLs, mappings, bindings, and recent activity"
+long_description = "help/status.txt"
+script = "commands/status.sh"
+
+[[commands]]
+name = "import-app"
+description = "Import Discord app metadata and bot credentials into the pack state"
+long_description = "help/import-app.txt"
+script = "commands/import-app.sh"
+
+[[commands]]
+name = "map-channel"
+description = "Map a Discord guild channel to a slash-command dispatch target"
+long_description = "help/map-channel.txt"
+script = "commands/map-channel.sh"
+
+[[commands]]
+name = "map-rig"
+description = "Map a Discord guild rig name to a slash-command dispatch target"
+long_description = "help/map-rig.txt"
+script = "commands/map-rig.sh"
+
+[[commands]]
+name = "sync-commands"
+description = "Register guild-scoped /gc commands with Discord"
+long_description = "help/sync-commands.txt"
+script = "commands/sync-commands.sh"
+
+[[commands]]
+name = "post-message"
+description = "Post a Discord status update for a request or channel"
+long_description = "help/post-message.txt"
+script = "commands/post-message.sh"
+
+[[commands]]
+name = "release-workflow"
+description = "Release a stuck workflow lock so the same Discord conversation can be retried"
+long_description = "help/release-workflow.txt"
+script = "commands/release-workflow.sh"
+
+[[commands]]
+name = "bind-dm"
+description = "Bind a Discord DM channel to one named session"
+long_description = "help/bind-dm.txt"
+script = "commands/bind-dm.sh"
+
+[[commands]]
+name = "bind-room"
+description = "Bind a Discord room channel or thread to named sessions"
+long_description = "help/bind-room.txt"
+script = "commands/bind-room.sh"
+
+[[commands]]
+name = "publish"
+description = "Publish a Discord-visible message through a saved chat binding"
+long_description = "help/publish.txt"
+script = "commands/publish.sh"

@@ -1,0 +1,8 @@
+Bind a Discord channel or thread to one or more named sessions.
+
+Examples:
+  gc discord bind-room 123456789012345678 sky lawrence
+  gc discord bind-room --guild-id 223456789012345678 123456789012345678 sky lawrence
+
+This stores the binding under `.gc/services/discord/data/config.json`.
+Use exact permanent session names.

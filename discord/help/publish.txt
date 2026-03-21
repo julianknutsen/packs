@@ -1,0 +1,13 @@
+Publish a human-visible Discord message through a saved chat binding.
+
+Examples:
+  gc discord publish --binding room:123456789012345678 --body "hello humans"
+  gc discord publish --binding room:123456789012345678 --trigger 223456789012345678 --body-file ./reply.txt
+  gc discord publish --binding room:123456789012345678 --conversation-id 323456789012345678 --trigger 223456789012345678 --body "Reply in thread"
+
+`--conversation-id` overrides the destination channel or thread for this send.
+Use it when the saved room binding is the parent channel but the inbound message
+arrived from a thread.
+
+`--reply-to` overrides the message id used for Discord reply threading. If
+omitted, `--trigger` is used as the reply target when present.
