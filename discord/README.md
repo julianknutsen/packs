@@ -21,6 +21,7 @@ Current slices:
 - DM/room chat bindings stored in pack state
 - normalized `<discord-event>` delivery into exact named sessions
 - explicit `gc discord publish` for human-visible replies through saved bindings
+- safer `gc discord reply-current` for replying to the latest Discord turn in-session
 - shared prompt fragment at `prompts/shared/discord-v0.md.tmpl`
 
 Not shipped yet in this pack:
@@ -129,6 +130,9 @@ Publish a human-visible reply through a saved binding:
 gc discord publish --binding room:323456789012345678 --body-file ./reply.txt
 gc discord publish --binding room:323456789012345678 --trigger 423456789012345678 --body "On it."
 gc discord publish --binding room:323456789012345678 --conversation-id 523456789012345678 --trigger 423456789012345678 --body "Reply in the thread"
+
+# Preferred agent reply path for the current Discord turn
+gc discord reply-current --body-file ./reply.txt
 ```
 
 Inbound behavior in v0:
@@ -138,7 +142,8 @@ Inbound behavior in v0:
 - thread messages inherit the parent room binding when the thread itself is not bound
 - `@sky` inside the message targets that session name exactly
 - untargeted room messages fan out to every bound participant session
-- agent normal output remains private; only `gc discord publish` speaks back to humans
+- agent normal output remains private; only explicit publish commands speak back to humans
+- agents should prefer `gc discord reply-current --body-file ...` when answering the latest Discord turn
 
 ## Inspect Status
 

@@ -138,3 +138,9 @@ name = "publish"
 description = "Publish a Discord-visible message through a saved chat binding"
 long_description = "help/publish.txt"
 script = "commands/publish.sh"
+
+[[commands]]
+name = "reply-current"
+description = "Reply to the latest Discord event seen by the current session"
+long_description = "help/reply-current.txt"
+script = "commands/reply-current.sh"

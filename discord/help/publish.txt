@@ -1,5 +1,8 @@
 Publish a human-visible Discord message through a saved chat binding.
 
+For agent replies to the current Discord turn, prefer:
+  gc discord reply-current --body-file ./reply.txt
+
 Examples:
   gc discord publish --binding room:123456789012345678 --body "hello humans"
   gc discord publish --binding room:123456789012345678 --trigger 223456789012345678 --body-file ./reply.txt
@@ -11,3 +14,7 @@ arrived from a thread.
 
 `--reply-to` overrides the message id used for Discord reply threading. If
 omitted, `--trigger` is used as the reply target when present.
+
+For multi-line or generated content, prefer `--body-file` over inline `--body`.
+Do not pipe publish output through filters that can hide failures. Treat a
+publish as successful only when the returned JSON contains `record.remote_message_id`.

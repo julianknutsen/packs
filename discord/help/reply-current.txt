@@ -1,0 +1,13 @@
+Reply to the latest Discord event seen by the current session.
+
+This is the safest agent-facing Discord reply path. It resolves the latest
+`<discord-event>` from the current session transcript, reuses its
+`publish_binding_id`, `publish_conversation_id`, and reply threading metadata,
+then publishes the provided body back to Discord.
+
+Examples:
+  gc discord reply-current --body-file ./reply.txt
+  gc discord reply-current --session corp--sky --body-file ./reply.txt
+
+Prefer `--body-file` for agent replies. It avoids fragile shell quoting and
+makes multi-line responses safe.

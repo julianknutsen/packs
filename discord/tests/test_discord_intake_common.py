@@ -287,6 +287,56 @@ class DiscordIntakeCommonTests(unittest.TestCase):
 
         self.assertEqual(common.gc_api_base_url(), "http://override.test:1234")
 
+    def test_gc_api_base_url_prefers_supervisor_api_when_available(self) -> None:
+        pathlib.Path(self.tempdir.name, "city.toml").write_text(
+            '[workspace]\nname = "gc"\n[api]\nbind = "0.0.0.0"\nport = 9555\n',
+            encoding="utf-8",
+        )
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(
+            return_value=mock.Mock(read=mock.Mock(return_value=b'{"items":[{"name":"gc","running":true}]}'))
+        )
+        response.__exit__ = mock.Mock(return_value=False)
+
+        with mock.patch.object(common.urllib.request, "urlopen", return_value=response) as urlopen:
+            self.assertEqual(common.gc_api_base_url(), "http://127.0.0.1:8372")
+
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_gc_api_base_url_falls_back_when_supervisor_city_missing(self) -> None:
+        pathlib.Path(self.tempdir.name, "city.toml").write_text(
+            '[workspace]\nname = "gc"\n[api]\nbind = "0.0.0.0"\nport = 9555\n',
+            encoding="utf-8",
+        )
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(
+            return_value=mock.Mock(read=mock.Mock(return_value=b'{"items":[{"name":"other-city","running":true}]}'))
+        )
+        response.__exit__ = mock.Mock(return_value=False)
+
+        with mock.patch.object(common.urllib.request, "urlopen", return_value=response):
+            self.assertEqual(common.gc_api_base_url(), "http://127.0.0.1:9555")
+
+    def test_gc_api_request_routes_through_supervisor_city_scope(self) -> None:
+        pathlib.Path(self.tempdir.name, "city.toml").write_text(
+            '[workspace]\nname = "gc"\n[api]\nbind = "0.0.0.0"\nport = 9555\n',
+            encoding="utf-8",
+        )
+        cities = mock.Mock()
+        cities.__enter__ = mock.Mock(
+            return_value=mock.Mock(read=mock.Mock(return_value=b'{"items":[{"name":"gc","running":true}]}'))
+        )
+        cities.__exit__ = mock.Mock(return_value=False)
+        sessions = mock.Mock()
+        sessions.__enter__ = mock.Mock(return_value=mock.Mock(read=mock.Mock(return_value=b'{"items": []}')))
+        sessions.__exit__ = mock.Mock(return_value=False)
+
+        with mock.patch.object(common.urllib.request, "urlopen", side_effect=[cities, cities, sessions]) as urlopen:
+            payload = common.gc_api_request("GET", "/v0/sessions")
+
+        self.assertEqual(payload, {"items": []})
+        self.assertEqual(urlopen.call_args_list[-1].args[0].full_url, "http://127.0.0.1:8372/v0/city/gc/sessions")
+
     def test_gc_api_base_url_rejects_disabled_port(self) -> None:
         pathlib.Path(self.tempdir.name, "city.toml").write_text('[api]\nport = 0\n', encoding="utf-8")
 
@@ -334,6 +384,71 @@ class DiscordIntakeCommonTests(unittest.TestCase):
 
         recent = common.list_recent_chat_publishes(limit=5)
         self.assertEqual(recent, [])
+
+    def test_session_index_by_name_prefers_routable_duplicate(self) -> None:
+        with mock.patch.object(
+            common,
+            "list_city_sessions",
+            return_value=[
+                {"session_name": "corp--sky", "state": "awake", "running": False, "created_at": "2026-03-18T07:55:10Z"},
+                {"session_name": "corp--sky", "state": "", "running": False, "created_at": "2026-03-17T05:10:53Z"},
+            ],
+        ):
+            index = common.session_index_by_name()
+
+        self.assertEqual(index["corp--sky"]["state"], "awake")
+        self.assertEqual(index["corp--sky"]["created_at"], "2026-03-18T07:55:10Z")
+
+    def test_session_index_by_name_prefers_running_duplicate(self) -> None:
+        with mock.patch.object(
+            common,
+            "list_city_sessions",
+            return_value=[
+                {"session_name": "corp--sky", "state": "awake", "running": False, "created_at": "2026-03-18T07:55:10Z"},
+                {"session_name": "corp--sky", "state": "active", "running": True, "created_at": "2026-03-18T07:55:10Z"},
+            ],
+        ):
+            index = common.session_index_by_name()
+
+        self.assertEqual(index["corp--sky"]["state"], "active")
+        self.assertTrue(index["corp--sky"]["running"])
+
+    def test_find_latest_discord_reply_context_uses_latest_event(self) -> None:
+        with mock.patch.object(
+            common,
+            "gc_api_request",
+            return_value={
+                "messages": [
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": "<discord-event>\npublish_binding_id: dm:1\npublish_trigger_id: older\n</discord-event>"
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": "<discord-event>\npublish_binding_id: dm:2\npublish_conversation_id: 22\npublish_trigger_id: newer\npublish_reply_to_discord_message_id: newer\n</discord-event>"
+                        },
+                    },
+                ]
+            },
+        ) as gc_api_request:
+            fields = common.find_latest_discord_reply_context("corp--sky", tail=5)
+
+        gc_api_request.assert_called_once()
+        self.assertEqual(fields["publish_binding_id"], "dm:2")
+        self.assertEqual(fields["publish_conversation_id"], "22")
+        self.assertEqual(fields["publish_trigger_id"], "newer")
+
+    def test_publish_binding_message_requires_remote_message_id(self) -> None:
+        common.set_chat_binding(common.load_config(), "dm", "22", ["sky"])
+        binding = common.resolve_chat_binding(common.load_config(), "dm:22")
+        assert binding is not None
+
+        with mock.patch.object(common, "post_channel_message", return_value={}):
+            with self.assertRaisesRegex(common.DiscordAPIError, "returned no message id"):
+                common.publish_binding_message(binding, "hello humans", trigger_id="orig-9")
 
     def test_save_chat_ingress_if_absent_only_claims_once(self) -> None:
         payload = {"ingress_id": "in-claim", "status": "processing"}

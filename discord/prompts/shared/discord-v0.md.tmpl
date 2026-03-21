@@ -10,10 +10,16 @@ The event may also tell you whether the message was `delivery: targeted` or
 reasoning, and include `reply_contract: explicit_publish_required`. Follow that
 contract literally: plain assistant output does not go back to Discord.
 
-If you want a human-visible reply in Discord, write the reply body to a file
-and run `gc discord publish --binding ... --body-file ...` with the
-`publish_binding_id` from the event. If the event also includes
-`publish_conversation_id`, `publish_trigger_id`, or
-`publish_reply_to_discord_message_id`, pass them through so the reply lands in
-the same Discord channel or thread and can reply to the source message.
+If you want a human-visible reply to the current Discord turn, write the reply
+body to a file and run `gc discord reply-current --body-file ...`.
+
+Use `gc discord publish` directly only when you intentionally need to publish to
+some binding other than the latest Discord turn in this session.
+
+Do not put long or multi-line replies inline in `--body`. Use `--body-file`.
+Do not pipe the publish command through `grep`, `sed`, or other filters that
+can hide failures.
+
+Only claim success after the command returns JSON containing a non-empty
+`record.remote_message_id`.
 {{- end }}

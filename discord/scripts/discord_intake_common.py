@@ -30,10 +30,12 @@ COMMAND_NAME_DEFAULT = "gc"
 FIX_FORMULA_DEFAULT = "mol-discord-fix-issue"
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 DEFAULT_GC_API_PORT = 9443
+DEFAULT_SUPERVISOR_API_BASE = "http://127.0.0.1:8372"
 LOCAL_API_BINDS = {"", "0.0.0.0", "::", "[::]", "*"}
 DISCORD_RATE_LIMIT_RETRIES = 2
 GC_API_REQUEST_TIMEOUT_SECONDS = 20.0
 SERVICE_SOCKET_PROBE_TIMEOUT_SECONDS = 0.2
+NON_ROUTABLE_SESSION_STATES = {"", "closed", "stopped", "orphaned", "quarantined"}
 
 
 class DiscordAPIError(RuntimeError):
@@ -1228,11 +1230,51 @@ def normalize_gc_api_bind(value: Any) -> str:
     return bind or "127.0.0.1"
 
 
+def discover_supervisor_gc_api_scope(city_cfg: dict[str, Any]) -> str:
+    workspace_cfg = city_cfg.get("workspace") or {}
+    workspace_name = ""
+    if isinstance(workspace_cfg, dict):
+        workspace_name = str(workspace_cfg.get("name", "")).strip()
+    request = urllib.request.Request(
+        DEFAULT_SUPERVISOR_API_BASE + "/v0/cities",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "gas-city-discord/0.1",
+            "X-GC-Request": "true",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=1.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
+        return ""
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return ""
+    if workspace_name:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name", "")).strip() != workspace_name:
+                continue
+            if item.get("running") is False:
+                return ""
+            return f"/v0/city/{urllib.parse.quote(workspace_name)}"
+    if not workspace_name and len(items) == 1 and isinstance(items[0], dict):
+        inferred_name = str(items[0].get("name", "")).strip()
+        if inferred_name and items[0].get("running") is not False:
+            return f"/v0/city/{urllib.parse.quote(inferred_name)}"
+    return ""
+
+
 def gc_api_base_url() -> str:
     override = str(os.environ.get("GC_API_BASE_URL", "")).strip()
     if override:
         return override.rstrip("/")
     city_cfg = load_city_toml()
+    if discover_supervisor_gc_api_scope(city_cfg):
+        return DEFAULT_SUPERVISOR_API_BASE
     api_cfg = city_cfg.get("api") or {}
     if not isinstance(api_cfg, dict):
         api_cfg = {}
@@ -1257,7 +1299,12 @@ def gc_api_request(
     if path.startswith("http://") or path.startswith("https://"):
         url = path
     else:
-        url = urllib.parse.urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+        city_cfg = load_city_toml()
+        scope_prefix = discover_supervisor_gc_api_scope(city_cfg)
+        normalized_path = path
+        if scope_prefix and path.startswith("/v0/"):
+            normalized_path = scope_prefix + "/" + path[len("/v0/") :]
+        url = urllib.parse.urljoin(base_url.rstrip("/") + "/", normalized_path.lstrip("/"))
     body = None
     request_headers = {
         "Accept": "application/json",
@@ -1285,6 +1332,79 @@ def gc_api_request(
         return json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise GCAPIError(f"{method.upper()} {url} returned invalid JSON") from exc
+
+
+def load_session_transcript_raw(session_selector: str, tail: int = 20) -> list[dict[str, Any]]:
+    selector = str(session_selector).strip()
+    if not selector:
+        raise GCAPIError("session selector is required")
+    payload = gc_api_request(
+        "GET",
+        f"/v0/session/{urllib.parse.quote(selector, safe='')}/transcript?format=raw&tail={max(0, int(tail))}",
+    )
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    if not isinstance(messages, list):
+        return []
+    return [item for item in messages if isinstance(item, dict)]
+
+
+def current_session_selector() -> str:
+    for key in ("GC_SESSION_ID", "GC_SESSION_NAME"):
+        value = str(os.environ.get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def _raw_user_message_text(entry: dict[str, Any]) -> str:
+    if str(entry.get("type", "")).strip() != "user":
+        return ""
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type", "")).strip() == "text":
+            parts.append(str(item.get("text", "")))
+    return "".join(parts)
+
+
+def _extract_discord_event_fields(text: str) -> dict[str, str]:
+    body = str(text)
+    start = body.find("<discord-event>")
+    end = body.find("</discord-event>")
+    if start < 0 or end < 0 or end <= start:
+        return {}
+    inner = body[start + len("<discord-event>") : end]
+    fields: dict[str, str] = {}
+    for raw_line in inner.splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def find_latest_discord_reply_context(session_selector: str = "", tail: int = 40) -> dict[str, str]:
+    selector = str(session_selector).strip() or current_session_selector()
+    if not selector:
+        raise GCAPIError("GC_SESSION_ID or GC_SESSION_NAME is required")
+    for entry in reversed(load_session_transcript_raw(selector, tail=tail)):
+        fields = _extract_discord_event_fields(_raw_user_message_text(entry))
+        if fields.get("publish_binding_id"):
+            return fields
+    raise GCAPIError(f"no recent discord event with publish metadata found for {selector}")
 
 
 def list_city_sessions(state: str = "all") -> list[dict[str, Any]]:
@@ -1331,8 +1451,75 @@ def session_index_by_name(state: str = "all") -> dict[str, dict[str, Any]]:
     for item in list_city_sessions(state=state):
         session_name = str(item.get("session_name", "")).strip()
         if session_name:
-            index[session_name] = item
+            existing = index.get(session_name)
+            if existing is None or _session_record_preference(item) > _session_record_preference(existing):
+                index[session_name] = item
     return index
+
+
+def _session_record_preference(item: dict[str, Any]) -> tuple[int, int, int, str]:
+    state = str(item.get("state", "")).strip()
+    return (
+        0 if state in NON_ROUTABLE_SESSION_STATES else 1,
+        1 if item.get("running") is True else 0,
+        1 if item.get("attached") is True else 0,
+        str(item.get("created_at", "")).strip(),
+    )
+
+
+def resolve_publish_conversation_id(binding: dict[str, Any], requested_conversation_id: str) -> str:
+    binding_conversation_id = str(binding.get("conversation_id", "")).strip()
+    requested = str(requested_conversation_id).strip()
+    if not requested or requested == binding_conversation_id:
+        return binding_conversation_id
+    if str(binding.get("kind", "")).strip() == "dm":
+        raise ValueError("--conversation-id cannot override a DM binding")
+    try:
+        channel_info = discord_api_request("GET", f"/channels/{urllib.parse.quote(requested)}")
+    except DiscordAPIError as exc:
+        raise ValueError(f"failed to validate --conversation-id: {exc}") from exc
+    parent_id = str((channel_info or {}).get("parent_id", "")).strip()
+    if parent_id != binding_conversation_id:
+        raise ValueError("--conversation-id must be the bound room or a thread within it")
+    return requested
+
+
+def publish_binding_message(
+    binding: dict[str, Any],
+    body: str,
+    *,
+    requested_conversation_id: str = "",
+    trigger_id: str = "",
+    reply_to_message_id: str = "",
+) -> dict[str, Any]:
+    conversation_id = resolve_publish_conversation_id(binding, requested_conversation_id)
+    if not conversation_id:
+        raise ValueError("binding is missing a destination conversation_id")
+    reply_target = str(reply_to_message_id).strip() or str(trigger_id).strip()
+    response = post_channel_message(
+        conversation_id,
+        body,
+        reply_to_message_id=reply_target,
+    )
+    remote_message_id = str((response or {}).get("id", "")).strip()
+    if not remote_message_id:
+        raise DiscordAPIError("discord publish returned no message id")
+    record = save_chat_publish(
+        {
+            "binding_id": str(binding.get("id", "")).strip(),
+            "binding_kind": str(binding.get("kind", "")).strip(),
+            "binding_conversation_id": str(binding.get("conversation_id", "")).strip(),
+            "conversation_id": conversation_id,
+            "guild_id": str(binding.get("guild_id", "")).strip(),
+            "trigger_id": str(trigger_id).strip(),
+            "reply_to_message_id": reply_target,
+            "source_session_id": str(os.environ.get("GC_SESSION_ID", "")).strip(),
+            "source_session_name": str(os.environ.get("GC_SESSION_NAME", "")).strip(),
+            "body": body,
+            "remote_message_id": remote_message_id,
+        }
+    )
+    return {"binding": binding, "record": record, "response": response}
 
 
 def deliver_session_message(session_name: str, message: str, idempotency_key: str = "") -> dict[str, Any]:

@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import pathlib
 import sys
-import urllib.parse
 
 import discord_intake_common as common
 
@@ -18,24 +16,6 @@ def _load_body(args: argparse.Namespace) -> str:
     if args.body_file:
         return pathlib.Path(args.body_file).read_text(encoding="utf-8")
     raise SystemExit("either --body or --body-file is required")
-
-
-def _resolve_conversation_id(binding: dict[str, object], requested_conversation_id: str) -> str:
-    binding_conversation_id = str(binding.get("conversation_id", "")).strip()
-    requested = requested_conversation_id.strip()
-    if not requested or requested == binding_conversation_id:
-        return binding_conversation_id
-    if str(binding.get("kind", "")).strip() == "dm":
-        raise SystemExit("--conversation-id cannot override a DM binding")
-    try:
-        channel_info = common.discord_api_request("GET", f"/channels/{urllib.parse.quote(requested)}")
-    except common.DiscordAPIError as exc:
-        raise SystemExit(f"failed to validate --conversation-id: {exc}") from exc
-    parent_id = str((channel_info or {}).get("parent_id", "")).strip()
-    if parent_id != binding_conversation_id:
-        raise SystemExit("--conversation-id must be the bound room or a thread within it")
-    return requested
-
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Publish a Discord-visible message through a saved chat binding")
@@ -52,32 +32,17 @@ def main(argv: list[str]) -> int:
     binding = common.resolve_chat_binding(config, args.binding)
     if not binding:
         raise SystemExit(f"binding not found: {args.binding}")
-
-    conversation_id = _resolve_conversation_id(binding, args.conversation_id)
-    if not conversation_id:
-        raise SystemExit("binding is missing a destination conversation_id")
-    reply_to_message_id = args.reply_to.strip() or args.trigger.strip()
-    response = common.post_channel_message(
-        conversation_id,
-        body,
-        reply_to_message_id=reply_to_message_id,
-    )
-    record = common.save_chat_publish(
-        {
-            "binding_id": str(binding.get("id", "")).strip(),
-            "binding_kind": str(binding.get("kind", "")).strip(),
-            "binding_conversation_id": str(binding.get("conversation_id", "")).strip(),
-            "conversation_id": conversation_id,
-            "guild_id": str(binding.get("guild_id", "")).strip(),
-            "trigger_id": args.trigger.strip(),
-            "reply_to_message_id": reply_to_message_id,
-            "source_session_id": str(os.environ.get("GC_SESSION_ID", "")).strip(),
-            "source_session_name": str(os.environ.get("GC_SESSION_NAME", "")).strip(),
-            "body": body,
-            "remote_message_id": str((response or {}).get("id", "")).strip(),
-        }
-    )
-    print(json.dumps({"binding": binding, "record": record, "response": response}, indent=2, sort_keys=True))
+    try:
+        payload = common.publish_binding_message(
+            binding,
+            body,
+            requested_conversation_id=args.conversation_id,
+            trigger_id=args.trigger,
+            reply_to_message_id=args.reply_to,
+        )
+    except (ValueError, common.DiscordAPIError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
 
