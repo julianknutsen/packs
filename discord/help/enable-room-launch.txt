@@ -1,0 +1,16 @@
+Enable launcher mode for a Discord root room.
+
+Usage:
+  gc discord enable-room-launch --guild-id 223456789012345678 323456789012345678
+  gc discord enable-room-launch --guild-id 223456789012345678 --response-mode respond_all --default-handle corp/sky 323456789012345678
+
+Launcher-mode rooms are different from direct `bind-room` rooms:
+
+- `@@handle` in the root room launches a thread-scoped session for that agent
+- the first agent reply creates the visible Discord thread
+- follow-up messages in that managed thread continue to the same session
+- direct `bind-room` and launcher mode are mutually exclusive for one room
+
+`mention_only` is the safe default. `respond_all` requires `--default-handle`
+and routes top-level unmentioned messages to that one handle, except top-level
+replies, which still require an explicit `@@handle`.

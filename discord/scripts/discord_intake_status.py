@@ -14,8 +14,10 @@ def render_text(snapshot: dict[str, object]) -> str:
     gateway = snapshot.get("gateway_status", {})
     requests = snapshot.get("recent_requests", [])
     bindings = snapshot.get("chat_bindings", [])
+    launchers = snapshot.get("chat_launchers", [])
     ingress = snapshot.get("recent_chat_ingress", [])
     publishes = snapshot.get("recent_chat_publishes", [])
+    launches = snapshot.get("recent_room_launches", [])
     lines = [
         "Discord",
         f"  interactions_url: {snapshot.get('interactions_url') or '(not published yet)'}",
@@ -27,6 +29,7 @@ def render_text(snapshot: dict[str, object]) -> str:
         f"  channel_mappings: {len(((config or {}).get('channels') or {}))}",
         f"  rig_mappings:     {len(((config or {}).get('rigs') or {}))}",
         f"  chat_bindings:    {len(bindings)}",
+        f"  chat_launchers:   {len(launchers)}",
         f"  chat_ingress:     {len(ingress)}",
         f"  chat_publishes:   {len(publishes)}",
         "",
@@ -60,6 +63,20 @@ def render_text(snapshot: dict[str, object]) -> str:
                 )
             )
     lines.append("")
+    lines.append("Chat Launchers:")
+    if not launchers:
+        lines.append("  (none)")
+    else:
+        for item in launchers:
+            lines.append(
+                "  - {launcher_id} room={conversation_id} mode={mode} default={default}".format(
+                    launcher_id=item.get("id", ""),
+                    conversation_id=item.get("conversation_id", ""),
+                    mode=item.get("response_mode", ""),
+                    default=item.get("default_qualified_handle", "") or "-",
+                )
+            )
+    lines.append("")
     lines.append("Recent Chat Ingress:")
     if not ingress:
         lines.append("  (none)")
@@ -86,6 +103,20 @@ def render_text(snapshot: dict[str, object]) -> str:
                     binding_id=item.get("binding_id", ""),
                     session_name=item.get("source_session_name", ""),
                     remote_message_id=item.get("remote_message_id", ""),
+                )
+            )
+    lines.append("")
+    lines.append("Recent Room Launches:")
+    if not launches:
+        lines.append("  (none)")
+    else:
+        for item in launches:
+            lines.append(
+                "  - {launch_id} room={conversation_id} handle={qualified_handle} thread={thread_id}".format(
+                    launch_id=item.get("launch_id", ""),
+                    conversation_id=item.get("conversation_id", ""),
+                    qualified_handle=item.get("qualified_handle", ""),
+                    thread_id=item.get("thread_id", "") or "(pending)",
                 )
             )
     return "\n".join(lines)

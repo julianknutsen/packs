@@ -9,6 +9,8 @@ Examples:
 
 This stores the binding under `.gc/services/discord/data/config.json`.
 Use exact permanent session names.
+Direct `bind-room` routing is mutually exclusive with `gc discord enable-room-launch`
+for the same room.
 
 Ambient read is disabled by default. When enabled, messages in this bound room
 or bound thread no longer need to mention the bot, but they still must

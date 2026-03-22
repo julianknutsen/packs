@@ -134,6 +134,12 @@ long_description = "help/bind-room.txt"
 script = "commands/bind-room.sh"
 
 [[commands]]
+name = "enable-room-launch"
+description = "Enable launcher mode for a Discord root room"
+long_description = "help/enable-room-launch.txt"
+script = "commands/enable-room-launch.sh"
+
+[[commands]]
 name = "publish"
 description = "Publish a Discord-visible message through a saved chat binding"
 long_description = "help/publish.txt"

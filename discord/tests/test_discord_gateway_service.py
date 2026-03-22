@@ -111,6 +111,184 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         deliver_session_message.assert_called_once()
         self.assertEqual(deliver_session_message.call_args.args[0], "Sky")
 
+    def test_process_inbound_room_launch_routes_handle_without_bot_mention(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        message = {
+            "id": "208",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "@@sky please help",
+            "author": {"id": "u-208", "username": "alice"},
+        }
+
+        with mock.patch.object(common, "resolve_agent_handle", return_value=("corp/sky", "")), mock.patch.object(
+            common,
+            "ensure_room_launch_session",
+            return_value={
+                "launch_id": "room-launch:208",
+                "qualified_handle": "corp/sky",
+                "session_alias": "dc-123-sky",
+            },
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver_session_message.assert_called_once()
+        self.assertEqual(deliver_session_message.call_args.args[0], "dc-123-sky")
+        envelope = deliver_session_message.call_args.args[1]
+        self.assertIn("binding_id: launch-room:22", envelope)
+        self.assertIn("launch_id: room-launch:208", envelope)
+        self.assertIn("launch_session_alias: dc-123-sky", envelope)
+        receipt = common.load_chat_ingress("in-208")
+        assert receipt is not None
+        self.assertEqual(receipt["launch_id"], "room-launch:208")
+
+    def test_process_inbound_room_launch_thread_routes_follow_up_without_bot_mention(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        common.save_room_launch(
+            {
+                "launch_id": "room-launch:222",
+                "launcher_id": "launch-room:22",
+                "guild_id": "1",
+                "conversation_id": "22",
+                "root_message_id": "222",
+                "qualified_handle": "corp/sky",
+                "session_alias": "dc-123-sky",
+                "thread_id": "222",
+                "state": "active",
+            }
+        )
+        message = {
+            "id": "209",
+            "guild_id": "1",
+            "channel_id": "222",
+            "content": "follow up",
+            "author": {"id": "u-209", "username": "alice"},
+        }
+
+        with mock.patch.object(
+            common,
+            "session_index_by_alias",
+            return_value={"dc-123-sky": {"alias": "dc-123-sky", "session_name": "dc-123-sky", "state": "active"}},
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver_session_message.assert_called_once()
+        self.assertEqual(deliver_session_message.call_args.args[0], "dc-123-sky")
+        envelope = deliver_session_message.call_args.args[1]
+        self.assertIn("conversation: guild:1 channel:22 thread:222", envelope)
+        self.assertIn("publish_conversation_id: 222", envelope)
+        self.assertTrue(str(common.load_room_launch("room-launch:222").get("last_activity_at", "")).strip())
+
+    def test_process_inbound_room_launch_rejects_ambiguous_handle(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        message = {
+            "id": "210",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "@@sky please help",
+            "author": {"id": "u-210", "username": "alice"},
+        }
+
+        with mock.patch.object(common, "resolve_agent_handle", return_value=("", "ambiguous_handle")), mock.patch.object(
+            common, "deliver_session_message"
+        ) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "rejected_targeting")
+        deliver_session_message.assert_not_called()
+        receipt = common.load_chat_ingress("in-210")
+        assert receipt is not None
+        self.assertEqual(receipt["reason"], "ambiguous_handle")
+
+    def test_process_inbound_room_launch_respond_all_uses_default_handle(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22", response_mode="respond_all", default_qualified_handle="corp/sky")
+        message = {
+            "id": "210b",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "please help",
+            "author": {"id": "u-210b", "username": "alice"},
+        }
+
+        with mock.patch.object(
+            common,
+            "ensure_room_launch_session",
+            return_value={
+                "launch_id": "room-launch:210b",
+                "qualified_handle": "corp/sky",
+                "session_alias": "dc-123-sky",
+            },
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver_session_message.assert_called_once()
+        envelope = deliver_session_message.call_args.args[1]
+        self.assertIn("launch_qualified_handle: corp/sky", envelope)
+
+    def test_process_inbound_room_launch_respond_all_honors_mixed_case_explicit_handle(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22", response_mode="respond_all", default_qualified_handle="corp/default")
+        message = {
+            "id": "210c",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "@@Sky please help",
+            "author": {"id": "u-210c", "username": "alice"},
+        }
+
+        with mock.patch.object(common, "resolve_agent_handle", return_value=("corp/sky", "")), mock.patch.object(
+            common,
+            "ensure_room_launch_session",
+            return_value={
+                "launch_id": "room-launch:210c",
+                "qualified_handle": "corp/sky",
+                "session_alias": "dc-123-sky",
+            },
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver_session_message.assert_called_once()
+        envelope = deliver_session_message.call_args.args[1]
+        self.assertIn("launch_qualified_handle: corp/sky", envelope)
+        self.assertNotIn("launch_qualified_handle: corp/default", envelope)
+
+    def test_process_inbound_room_launch_thread_rejects_retarget(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        common.save_room_launch(
+            {
+                "launch_id": "room-launch:222",
+                "launcher_id": "launch-room:22",
+                "guild_id": "1",
+                "conversation_id": "22",
+                "root_message_id": "222",
+                "qualified_handle": "corp/sky",
+                "session_alias": "dc-123-sky",
+                "thread_id": "222",
+                "state": "active",
+            }
+        )
+        message = {
+            "id": "211",
+            "guild_id": "1",
+            "channel_id": "222",
+            "content": "@@alex please join",
+            "author": {"id": "u-211", "username": "alice"},
+        }
+
+        with mock.patch.object(common, "resolve_agent_handle", return_value=("corp/alex", "")), mock.patch.object(
+            common, "deliver_session_message"
+        ) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "rejected_targeting")
+        deliver_session_message.assert_not_called()
+        receipt = common.load_chat_ingress("in-211")
+        assert receipt is not None
+        self.assertEqual(receipt["reason"], "thread_retarget_not_supported")
+
     def test_process_inbound_thread_message_inherits_parent_room_binding(self) -> None:
         common.set_chat_binding(common.load_config(), "room", "22", ["sky"], guild_id="1")
         common.save_bot_token("bot-token")

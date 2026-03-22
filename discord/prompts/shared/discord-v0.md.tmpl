@@ -13,6 +13,11 @@ contract literally: plain assistant output does not go back to Discord.
 If you want a human-visible reply to the current Discord turn, write the reply
 body to a file and run `gc discord reply-current --body-file ...`.
 
+Some Discord turns come from launcher-backed rooms. In those turns, fields like
+`publish_binding_id: launch-room:...` or `publish_launch_id: ...` mean the
+bridge will create the managed Discord thread for you on the first successful
+reply. Do not try to create the thread yourself.
+
 Use `gc discord publish` directly only when you intentionally need to publish to
 some binding other than the latest Discord turn in this session. Direct
 `publish` only participates in peer fanout if explicit source metadata is
@@ -22,6 +27,10 @@ Some room inputs may be `kind: discord_peer_publication`. In a peer-fanout-
 enabled room, if you want another bound session to receive your room message as
 peer input, include its exact lowercase `@session_name` in the published body.
 Untargeted replies to peer publications do not fan out.
+
+When a human uses `@@handle` in Discord, that is routing syntax for the bridge,
+not an instruction for you to echo the same token back. Just answer normally
+with `reply-current`.
 
 Do not put long or multi-line replies inline in `--body`. Use `--body-file`.
 Do not pipe the publish command through `grep`, `sed`, or other filters that

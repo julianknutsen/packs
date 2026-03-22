@@ -219,6 +219,25 @@ class DiscordIntakeServiceTests(unittest.TestCase):
         self.assertEqual(request["dispatch_target"], "product/polecat")
         enqueue_request.assert_called_once()
 
+    def test_render_admin_home_includes_launcher_sections(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        common.save_room_launch(
+            {
+                "launch_id": "room-launch:22",
+                "launcher_id": "launch-room:22",
+                "guild_id": "1",
+                "conversation_id": "22",
+                "root_message_id": "22",
+                "qualified_handle": "corp/sky",
+                "session_alias": "dc-123-sky",
+            }
+        )
+
+        html = service.render_admin_home()
+
+        self.assertIn("Chat Launchers", html)
+        self.assertIn("Recent Room Launches", html)
+
     def test_accept_fix_request_rejects_when_bot_token_missing(self) -> None:
         common.import_app_config(common.load_config(), {"application_id": "1", "public_key": "ab" * 32})
         common.set_channel_mapping(common.load_config(), "1", "22", "product/polecat", "mol-discord-fix-issue")

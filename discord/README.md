@@ -20,6 +20,7 @@ Current slices:
 - workflow status projection back to Discord
 - DM/room chat bindings stored in pack state
 - normalized `<discord-event>` delivery into exact named sessions
+- root-room launcher mode with `@@handle` and thread-scoped sessions
 - explicit `gc discord publish` for human-visible replies through saved bindings
 - safer `gc discord reply-current` for replying to the latest Discord turn in-session
 - bridge-local room peer fanout after a successful publish
@@ -115,7 +116,7 @@ gc discord sync-commands 123456789012345678
 
 ## Session Chat Control Plane
 
-Bind Discord conversations to exact permanent session names:
+Direct bindings still exist for exact session routing:
 
 ```bash
 gc discord bind-dm 123456789012345678 sky
@@ -123,6 +124,18 @@ gc discord bind-room --guild-id 223456789012345678 323456789012345678 sky lawren
 gc discord bind-room --guild-id 223456789012345678 --enable-ambient-read 323456789012345678 sky lawrence
 gc discord bind-room --guild-id 223456789012345678 --enable-peer-fanout 323456789012345678 corp--sky corp--priya
 ```
+
+Launcher mode is the new room-first UX:
+
+```bash
+gc discord enable-room-launch --guild-id 223456789012345678 323456789012345678
+gc discord enable-room-launch --guild-id 223456789012345678 --response-mode respond_all --default-handle corp/sky 323456789012345678
+```
+
+In a launcher room, `@@handle` launches a thread-scoped session for that agent.
+The session receives the root-room message immediately, but the visible Discord
+thread is only created when the agent explicitly replies with
+`gc discord reply-current`.
 
 Publish a human-visible reply through a saved binding:
 
@@ -142,6 +155,12 @@ gc discord retry-peer-fanout discord-publish-123
 Inbound behavior in v0:
 
 - DMs to the bot route through the matching `bind-dm` binding
+- configured launcher rooms accept `@@handle` without a bot mention
+- launcher rooms may also use `respond_all` with a default qualified handle
+- in `respond_all` launcher rooms, top-level replies still require an explicit `@@handle`
+- the first launcher-backed agent reply creates the Discord thread automatically
+- follow-up messages inside that managed thread continue to the same agent session without requiring a bot mention
+- thread retargeting to a second agent is not shipped in this slice yet
 - guild and thread messages route only when the bot is explicitly mentioned
 - ambient-read room bindings are the exception: the bound room or bound thread accepts unmentioned messages, but only when one or more exact `@session_name` targets are present
 - thread messages inherit the parent room binding when the thread itself is not bound

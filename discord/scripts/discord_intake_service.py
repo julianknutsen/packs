@@ -898,12 +898,16 @@ def render_admin_home() -> str:
   <pre>{html.escape(json.dumps(snapshot.get('recent_requests', []), indent=2, sort_keys=True))}</pre>
   <h2>Chat Bindings</h2>
   <pre>{html.escape(json.dumps(snapshot.get('chat_bindings', []), indent=2, sort_keys=True))}</pre>
+  <h2>Chat Launchers</h2>
+  <pre>{html.escape(json.dumps(snapshot.get('chat_launchers', []), indent=2, sort_keys=True))}</pre>
   <h2>Gateway Status</h2>
   <pre>{html.escape(json.dumps(snapshot.get('gateway_status', {}), indent=2, sort_keys=True))}</pre>
   <h2>Recent Chat Ingress</h2>
   <pre>{html.escape(json.dumps(snapshot.get('recent_chat_ingress', []), indent=2, sort_keys=True))}</pre>
   <h2>Recent Chat Publishes</h2>
   <pre>{html.escape(json.dumps(snapshot.get('recent_chat_publishes', []), indent=2, sort_keys=True))}</pre>
+  <h2>Recent Room Launches</h2>
+  <pre>{html.escape(json.dumps(snapshot.get('recent_room_launches', []), indent=2, sort_keys=True))}</pre>
 </body>
 </html>
 """

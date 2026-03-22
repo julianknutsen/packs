@@ -17,6 +17,26 @@ def _load_body(args: argparse.Namespace) -> str:
         return pathlib.Path(args.body_file).read_text(encoding="utf-8")
     raise SystemExit("either --body or --body-file is required")
 
+
+def _hydrate_launch_source_context(binding: dict[str, object], source_context: dict[str, str]) -> dict[str, str]:
+    if str(binding.get("publish_route_kind", "")).strip() != "room_launch":
+        return source_context
+    if str(source_context.get("launch_id", "")).strip():
+        return source_context
+    ingress_id = str(source_context.get("ingress_receipt_id", "")).strip()
+    if not ingress_id:
+        raise SystemExit("launch-room publish requires --source-ingress-receipt-id")
+    receipt = common.load_chat_ingress(ingress_id)
+    if not receipt:
+        raise SystemExit(f"source ingress receipt not found: {ingress_id}")
+    launch_id = str(receipt.get("launch_id", "")).strip()
+    if not launch_id:
+        raise SystemExit(f"source ingress receipt has no launch_id: {ingress_id}")
+    hydrated = dict(source_context)
+    hydrated["launch_id"] = launch_id
+    hydrated.setdefault("root_ingress_receipt_id", ingress_id)
+    return hydrated
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Publish a Discord-visible message through a saved chat binding")
     parser.add_argument("--binding", required=True, help="Binding id such as room:1234567890")
@@ -50,7 +70,7 @@ def main(argv: list[str]) -> int:
 
     body = _load_body(args)
     config = common.load_config()
-    binding = common.resolve_chat_binding(config, args.binding)
+    binding = common.resolve_publish_route(config, args.binding)
     if not binding:
         raise SystemExit(f"binding not found: {args.binding}")
     source_context = {}
@@ -60,6 +80,7 @@ def main(argv: list[str]) -> int:
         source_context["ingress_receipt_id"] = args.source_ingress_receipt_id
     if args.root_ingress_receipt_id:
         source_context["root_ingress_receipt_id"] = args.root_ingress_receipt_id
+    source_context = _hydrate_launch_source_context(binding, source_context)
     source_identity = {}
     try:
         if args.source_session:

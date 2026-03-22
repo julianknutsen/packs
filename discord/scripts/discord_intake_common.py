@@ -29,6 +29,7 @@ REQUEST_RETENTION_SECONDS = 24 * 60 * 60
 PENDING_MODAL_RETENTION_SECONDS = 15 * 60
 CHAT_INGRESS_RETENTION_SECONDS = 7 * 24 * 60 * 60
 CHAT_PUBLISH_RETENTION_SECONDS = 7 * 24 * 60 * 60
+ROOM_LAUNCH_RETENTION_SECONDS = 90 * 24 * 60 * 60
 COMMAND_NAME_DEFAULT = "gc"
 FIX_FORMULA_DEFAULT = "mol-discord-fix-issue"
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
@@ -46,6 +47,9 @@ CANONICAL_PEER_SESSION_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 URL_PATTERN = re.compile(r"https?://\S+")
 DISCORD_RESERVED_MENTIONS = {"everyone", "here"}
 THREAD_CHANNEL_TYPES = {10, 11, 12}
+ROOM_LAUNCH_RESPONSE_MODES = {"mention_only", "respond_all"}
+ROOM_LAUNCH_ALIAS_SLUG_MAX = 24
+AGENT_HANDLE_SEGMENT = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 class DiscordAPIError(RuntimeError):
@@ -122,6 +126,10 @@ def chat_ingress_dir() -> str:
     return os.path.join(data_dir(), "chat-ingress")
 
 
+def room_launches_dir() -> str:
+    return os.path.join(data_dir(), "chat-launches")
+
+
 def channel_metadata_cache_dir() -> str:
     return os.path.join(data_dir(), "channel-metadata")
 
@@ -165,6 +173,7 @@ def ensure_layout() -> None:
         pending_modals_dir(),
         chat_publishes_dir(),
         chat_ingress_dir(),
+        room_launches_dir(),
         channel_metadata_cache_dir(),
         peer_root_budget_dir(),
         locks_dir(),
@@ -233,6 +242,7 @@ def default_config() -> dict[str, Any]:
         "rigs": {},
         "chat": {
             "bindings": {},
+            "launchers": {},
         },
     }
 
@@ -256,6 +266,17 @@ def dedupe_session_names(values: list[str]) -> list[str]:
         seen.add(key)
         session_names.append(normalized)
     return session_names
+
+
+def room_launch_surface_id(conversation_id: str) -> str:
+    return f"launch-room:{str(conversation_id).strip()}"
+
+
+def normalize_room_launch_response_mode(value: Any) -> str:
+    normalized = str(value).strip().lower() or "mention_only"
+    if normalized not in ROOM_LAUNCH_RESPONSE_MODES:
+        return "mention_only"
+    return normalized
 
 
 def normalize_binding_channel_metadata(value: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -298,6 +319,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     chat = raw.get("chat")
     if isinstance(chat, dict):
         normalized_bindings: dict[str, Any] = {}
+        normalized_launchers: dict[str, Any] = {}
         bindings = chat.get("bindings")
         if isinstance(bindings, dict):
             for key, value in bindings.items():
@@ -326,8 +348,34 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
                     normalized_bindings[binding_id].update(channel_metadata)
                 if kind == "room":
                     normalized_bindings[binding_id]["policy"] = normalize_room_peer_policy(value.get("policy"))
+        launchers = chat.get("launchers")
+        if isinstance(launchers, dict):
+            for key, value in launchers.items():
+                if not isinstance(value, dict):
+                    continue
+                kind = str(value.get("kind", "")).strip().lower()
+                conversation_id = str(value.get("conversation_id", "")).strip()
+                guild_id = str(value.get("guild_id", "")).strip()
+                if kind != "room" or not conversation_id or not guild_id:
+                    continue
+                launcher_id = room_launch_surface_id(conversation_id)
+                response_mode = normalize_room_launch_response_mode(value.get("response_mode"))
+                default_handle = _normalize_agent_handle(value.get("default_qualified_handle", ""))
+                if default_handle and "/" not in default_handle:
+                    default_handle = ""
+                if response_mode == "respond_all" and not default_handle:
+                    response_mode = "mention_only"
+                normalized_launchers[launcher_id] = {
+                    "id": launcher_id,
+                    "kind": "room",
+                    "conversation_id": conversation_id,
+                    "guild_id": guild_id,
+                    "response_mode": response_mode,
+                    "default_qualified_handle": default_handle,
+                }
         config["chat"] = {
             "bindings": normalized_bindings,
+            "launchers": normalized_launchers,
         }
     channels = raw.get("channels")
     if isinstance(channels, dict):
@@ -556,6 +604,8 @@ def set_chat_binding(
 
     cfg = normalize_config(config)
     binding_id = chat_binding_id(normalized_kind, normalized_conversation)
+    if normalized_kind == "room" and resolve_room_launcher(cfg, normalized_conversation):
+        raise ValueError("room launch is already enabled for that conversation")
     existing = resolve_chat_binding(cfg, binding_id) or {}
     raw_room_policy = copy.deepcopy(existing.get("policy")) if isinstance(existing.get("policy"), dict) else {}
     raw_channel_metadata = normalize_binding_channel_metadata(existing)
@@ -583,6 +633,56 @@ def set_chat_binding(
         binding["policy"] = room_policy
     cfg["chat"]["bindings"][binding_id] = binding
     return save_config(cfg)
+
+
+def set_room_launcher(
+    config: dict[str, Any],
+    guild_id: str,
+    conversation_id: str,
+    *,
+    response_mode: str = "mention_only",
+    default_qualified_handle: str = "",
+) -> dict[str, Any]:
+    normalized_conversation = str(conversation_id).strip()
+    normalized_guild_id = str(guild_id).strip()
+    if not normalized_guild_id:
+        raise ValueError("guild_id is required")
+    if not normalized_conversation:
+        raise ValueError("conversation_id is required")
+    normalized_response_mode = normalize_room_launch_response_mode(response_mode)
+    normalized_default_handle = _normalize_agent_handle(default_qualified_handle)
+    if str(default_qualified_handle).strip() and (not normalized_default_handle or "/" not in normalized_default_handle):
+        raise ValueError("default_qualified_handle must use qualified rig/alias syntax")
+    if normalized_response_mode == "respond_all" and not normalized_default_handle:
+        raise ValueError("respond_all room launchers require --default-handle")
+
+    cfg = normalize_config(config)
+    binding_id = chat_binding_id("room", normalized_conversation)
+    existing_binding = resolve_chat_binding(cfg, binding_id)
+    if existing_binding:
+        raise ValueError("room launch cannot be enabled on a directly bound room")
+    cfg.setdefault("chat", {})
+    cfg["chat"].setdefault("launchers", {})
+    launcher_id = room_launch_surface_id(normalized_conversation)
+    cfg["chat"]["launchers"][launcher_id] = {
+        "id": launcher_id,
+        "kind": "room",
+        "guild_id": normalized_guild_id,
+        "conversation_id": normalized_conversation,
+        "response_mode": normalized_response_mode,
+        "default_qualified_handle": normalized_default_handle,
+    }
+    return save_config(cfg)
+
+
+def resolve_room_launcher(config: dict[str, Any], conversation_id: str) -> dict[str, Any] | None:
+    launchers = normalize_config(config).get("chat", {}).get("launchers", {})
+    return launchers.get(room_launch_surface_id(conversation_id))
+
+
+def list_room_launchers(config: dict[str, Any]) -> list[dict[str, Any]]:
+    launchers = normalize_config(config).get("chat", {}).get("launchers", {})
+    return sorted(launchers.values(), key=lambda item: (str(item.get("kind", "")), str(item.get("conversation_id", ""))))
 
 
 def describe_room_channel_metadata(conversation_id: str, *, bot_token: str = "") -> dict[str, Any]:
@@ -624,6 +724,22 @@ def resolve_chat_binding(config: dict[str, Any], binding_id: str) -> dict[str, A
 def list_chat_bindings(config: dict[str, Any]) -> list[dict[str, Any]]:
     bindings = normalize_config(config).get("chat", {}).get("bindings", {})
     return sorted(bindings.values(), key=lambda item: (str(item.get("kind", "")), str(item.get("conversation_id", ""))))
+
+
+def resolve_publish_route(config: dict[str, Any], route_id: str) -> dict[str, Any] | None:
+    binding = resolve_chat_binding(config, route_id)
+    if binding:
+        return binding
+    route = str(route_id).strip()
+    if route.startswith("launch-room:"):
+        launcher = resolve_room_launcher(config, route.removeprefix("launch-room:"))
+        if launcher:
+            payload = dict(launcher)
+            payload["publish_route_kind"] = "room_launch"
+            payload["kind"] = "room"
+            payload.setdefault("session_names", [])
+            return payload
+    return None
 
 
 def set_channel_mapping(
@@ -805,6 +921,18 @@ def chat_publish_path(publish_id: str) -> str:
 
 def chat_ingress_path(ingress_id: str) -> str:
     return os.path.join(chat_ingress_dir(), f"{safe_storage_id(ingress_id, 'chat-ingress')}.json")
+
+
+def room_launch_path(launch_id: str) -> str:
+    return os.path.join(room_launches_dir(), f"{safe_storage_id(launch_id, 'room-launch')}.json")
+
+
+def room_launch_record_id(root_message_id: str) -> str:
+    return f"room-launch:{str(root_message_id).strip()}"
+
+
+def room_launch_lock_path(launch_id: str) -> str:
+    return _safe_lock_name("room-launch", str(launch_id).strip())
 
 
 def load_request(request_id: str) -> dict[str, Any] | None:
@@ -1025,6 +1153,54 @@ def save_chat_publish(payload: dict[str, Any]) -> dict[str, Any]:
     atomic_write_json(chat_publish_path(publish_id), body)
     _update_peer_root_budget_index(body)
     return body
+
+
+def load_room_launch(launch_id: str) -> dict[str, Any] | None:
+    data = read_json(room_launch_path(launch_id), allow_invalid=True)
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def save_room_launch(payload: dict[str, Any]) -> dict[str, Any]:
+    ensure_layout()
+    body = copy.deepcopy(payload)
+    launch_id = str(body.get("launch_id", "")).strip()
+    if not launch_id:
+        raise ValueError("launch_id is required")
+    body.setdefault("created_at", utcnow())
+    body["updated_at"] = utcnow()
+    atomic_write_json(room_launch_path(launch_id), body)
+    return body
+
+
+def touch_room_launch(launch_id: str, *, activity_at: str = "") -> dict[str, Any] | None:
+    normalized_launch_id = str(launch_id).strip()
+    if not normalized_launch_id:
+        return None
+    with advisory_lock(room_launch_lock_path(normalized_launch_id)):
+        current = load_room_launch(normalized_launch_id)
+        if not isinstance(current, dict):
+            return None
+        body = copy.deepcopy(current)
+        body["last_activity_at"] = str(activity_at).strip() or utcnow()
+        return save_room_launch(body)
+
+
+def list_room_launches(limit: int = 50) -> list[dict[str, Any]]:
+    ensure_layout()
+    entries: list[dict[str, Any]] = []
+    paths = sorted(
+        pathlib.Path(room_launches_dir()).glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:limit]
+    for path in paths:
+        data = read_json(str(path), allow_invalid=True)
+        if isinstance(data, dict):
+            entries.append(data)
+    entries.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return entries[:limit]
 
 
 def load_chat_publish(publish_id: str) -> dict[str, Any] | None:
@@ -1293,6 +1469,11 @@ def prune_chat_publishes() -> None:
     _prune_dir(chat_publishes_dir(), CHAT_PUBLISH_RETENTION_SECONDS)
 
 
+def prune_room_launches() -> None:
+    ensure_layout()
+    _prune_dir(room_launches_dir(), ROOM_LAUNCH_RETENTION_SECONDS)
+
+
 def redact_chat_ingress_record(payload: dict[str, Any]) -> dict[str, Any]:
     body = copy.deepcopy(payload)
     if body.get("from_display"):
@@ -1308,6 +1489,17 @@ def redact_chat_publish_record(payload: dict[str, Any]) -> dict[str, Any]:
     body = copy.deepcopy(payload)
     if body.get("body"):
         body["body"] = "[redacted]"
+    return body
+
+
+def redact_room_launch_record(payload: dict[str, Any]) -> dict[str, Any]:
+    body = copy.deepcopy(payload)
+    if body.get("from_display"):
+        body["from_display"] = "[redacted]"
+    if body.get("from_user_id"):
+        body["from_user_id"] = "[redacted]"
+    if body.get("body_preview"):
+        body["body_preview"] = "[redacted]"
     return body
 
 
@@ -1378,8 +1570,10 @@ def build_status_snapshot(limit: int = 20) -> dict[str, Any]:
         "gateway_status": redact_gateway_status(load_gateway_status()),
         "recent_requests": [redact_request_record(item) for item in list_recent_requests(limit=limit)],
         "chat_bindings": list_chat_bindings(config),
+        "chat_launchers": list_room_launchers(config),
         "recent_chat_ingress": [redact_chat_ingress_record(item) for item in list_recent_chat_ingress(limit=limit)],
         "recent_chat_publishes": [redact_chat_publish_record(item) for item in list_recent_chat_publishes(limit=limit)],
+        "recent_room_launches": [redact_room_launch_record(item) for item in list_room_launches(limit=limit)],
     }
 
 
@@ -1664,7 +1858,7 @@ def load_session_transcript_raw(session_selector: str, tail: int = 20) -> list[d
 
 
 def current_session_selector() -> str:
-    for key in ("GC_SESSION_ID", "GC_SESSION_NAME"):
+    for key in ("GC_SESSION_ID", "GC_SESSION_NAME", "GC_ALIAS"):
         value = str(os.environ.get(key, "")).strip()
         if value:
             return value
@@ -1734,6 +1928,58 @@ def list_city_sessions(state: str = "all") -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)]
 
 
+def list_city_agents() -> list[dict[str, Any]]:
+    payload = gc_api_request("GET", "/v0/agents")
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _agent_base_handle(qualified_handle: str) -> str:
+    normalized = str(qualified_handle).strip().lower()
+    if not normalized:
+        return ""
+    return normalized.rsplit("/", 1)[-1]
+
+
+def _normalize_agent_handle(handle: str) -> str:
+    normalized = str(handle).strip().lower()
+    if not normalized:
+        return ""
+    parts = normalized.split("/")
+    if len(parts) > 2:
+        return ""
+    if any(not AGENT_HANDLE_SEGMENT.fullmatch(part) for part in parts):
+        return ""
+    return normalized
+
+
+def resolve_agent_handle(handle: str) -> tuple[str, str]:
+    normalized = _normalize_agent_handle(handle)
+    if not normalized:
+        return "", "malformed_handle"
+    qualified_lookup: dict[str, dict[str, Any]] = {}
+    bare_lookup: dict[str, list[str]] = {}
+    for item in list_city_agents():
+        qualified_name = _normalize_agent_handle(item.get("name", ""))
+        if not qualified_name:
+            continue
+        qualified_lookup[qualified_name] = item
+        base_handle = _agent_base_handle(qualified_name)
+        bare_lookup.setdefault(base_handle, []).append(qualified_name)
+    if "/" in normalized:
+        if normalized in qualified_lookup:
+            return normalized, ""
+        return "", "unknown_handle"
+    matches = bare_lookup.get(normalized, [])
+    if len(matches) == 1:
+        return matches[0], ""
+    if len(matches) > 1:
+        return "", "ambiguous_handle"
+    return "", "unknown_handle"
+
+
 def service_socket_is_active(socket_path: str, timeout: float = SERVICE_SOCKET_PROBE_TIMEOUT_SECONDS) -> bool:
     path = str(socket_path).strip()
     if not path or not os.path.exists(path):
@@ -1772,15 +2018,34 @@ def session_index_by_name(state: str = "all") -> dict[str, dict[str, Any]]:
     return index
 
 
+def session_index_by_alias(state: str = "all") -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    for item in list_city_sessions(state=state):
+        alias = str(item.get("alias", "")).strip()
+        if alias:
+            existing = index.get(alias)
+            if existing is None or _session_record_preference(item) > _session_record_preference(existing):
+                index[alias] = item
+    return index
+
+
 def resolve_session_identity(session_selector: str) -> dict[str, str]:
     selector = str(session_selector).strip()
     if not selector:
         return {}
+    session_by_alias = session_index_by_alias(state="all").get(selector)
+    if session_by_alias:
+        return {
+            "session_name": str(session_by_alias.get("session_name", "")).strip(),
+            "session_id": str(session_by_alias.get("id", "")).strip(),
+            "alias": str(session_by_alias.get("alias", "")).strip(),
+        }
     session_by_name = session_index_by_name(state="all").get(selector)
     if session_by_name:
         return {
             "session_name": str(session_by_name.get("session_name", "")).strip(),
             "session_id": str(session_by_name.get("id", "")).strip(),
+            "alias": str(session_by_name.get("alias", "")).strip(),
         }
     for item in list_city_sessions(state="all"):
         session_id = str(item.get("id", "")).strip()
@@ -1789,6 +2054,7 @@ def resolve_session_identity(session_selector: str) -> dict[str, str]:
         return {
             "session_name": str(item.get("session_name", "")).strip(),
             "session_id": session_id,
+            "alias": str(item.get("alias", "")).strip(),
         }
     raise GCAPIError(f"session not found: {selector}")
 
@@ -1800,6 +2066,110 @@ def _session_record_preference(item: dict[str, Any]) -> tuple[int, int, int, str
         1 if item.get("running") is True else 0,
         1 if item.get("attached") is True else 0,
         str(item.get("created_at", "")).strip(),
+    )
+
+
+def session_record_routable(item: dict[str, Any] | None) -> bool:
+    if not isinstance(item, dict):
+        return False
+    return str(item.get("state", "")).strip() not in NON_ROUTABLE_SESSION_STATES
+
+
+def _room_launch_alias_slug(qualified_handle: str) -> str:
+    normalized = str(qualified_handle).strip().lower().replace("/", "-")
+    filtered = "".join(ch for ch in normalized if ch.isalnum() or ch in {"-", "_"})
+    filtered = filtered.strip("-_")
+    if not filtered:
+        filtered = "agent"
+    return filtered[:ROOM_LAUNCH_ALIAS_SLUG_MAX]
+
+
+def room_launch_session_alias(guild_id: str, conversation_id: str, root_message_id: str, qualified_handle: str) -> str:
+    digest_input = f"{str(guild_id).strip()}:{str(conversation_id).strip()}:{str(root_message_id).strip()}:{str(qualified_handle).strip().lower()}"
+    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:12]
+    slug = _room_launch_alias_slug(qualified_handle)
+    alias = f"dc-{digest}-{slug}" if slug else f"dc-{digest}"
+    return alias[:63].rstrip("-_")
+
+
+def room_launch_thread_name(qualified_handle: str, source_display: str = "") -> str:
+    handle_label = str(qualified_handle).strip().rsplit("/", 1)[-1] or "agent"
+    display = " ".join(str(source_display).strip().split())
+    if display:
+        value = f"{handle_label} - {display}"
+    else:
+        value = handle_label
+    return value[:100].strip() or handle_label
+
+
+def create_agent_session(
+    qualified_handle: str,
+    *,
+    alias: str,
+    title: str,
+    initial_message: str = "",
+    idempotency_key: str = "",
+) -> dict[str, Any]:
+    headers: dict[str, str] = {}
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    payload = gc_api_request(
+        "POST",
+        "/v0/sessions",
+        payload={
+            "kind": "agent",
+            "name": str(qualified_handle).strip(),
+            "alias": str(alias).strip(),
+            "title": str(title).strip(),
+            "message": str(initial_message),
+        },
+        headers=headers,
+    )
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def ensure_room_launch_session(
+    launch: dict[str, Any],
+    *,
+    title: str = "",
+    initial_message: str = "",
+) -> dict[str, Any]:
+    launch_id = str(launch.get("launch_id", "")).strip()
+    qualified_handle = str(launch.get("qualified_handle", "")).strip()
+    session_alias = str(launch.get("session_alias", "")).strip()
+    if not launch_id or not qualified_handle or not session_alias:
+        raise ValueError("launch is missing required session fields")
+    with advisory_lock(room_launch_lock_path(launch_id)):
+        current = load_room_launch(launch_id) or dict(launch)
+        current_alias = str(current.get("session_alias", "")).strip() or session_alias
+        existing = session_index_by_alias(state="all").get(current_alias)
+        if session_record_routable(existing):
+            current["session_alias"] = str(existing.get("alias", "")).strip() or current_alias
+            current["session_id"] = str(existing.get("id", "")).strip()
+            current["session_name"] = str(existing.get("session_name", "")).strip()
+            save_room_launch(current)
+            return current
+        created = create_agent_session(
+            qualified_handle,
+            alias=current_alias,
+            title=title or room_launch_thread_name(qualified_handle, str(current.get("from_display", "")).strip()),
+            initial_message=initial_message,
+            idempotency_key=f"{launch_id}:create-session",
+        )
+        current["session_alias"] = str(created.get("alias", "")).strip() or current_alias
+        current["session_id"] = str(created.get("id", "")).strip()
+        current["session_name"] = str(created.get("session_name", "")).strip()
+        save_room_launch(current)
+        return current
+
+
+def create_thread_from_message(parent_channel_id: str, source_message_id: str, name: str) -> dict[str, Any]:
+    return discord_api_request(
+        "POST",
+        f"/channels/{urllib.parse.quote(str(parent_channel_id).strip())}/messages/{urllib.parse.quote(str(source_message_id).strip())}/threads",
+        payload={"name": str(name).strip()[:100] or "agent"},
     )
 
 
@@ -1817,6 +2187,7 @@ def derive_publish_source_metadata(source_context: dict[str, str] | None = None)
         "publish_binding_id": str(fields.get("publish_binding_id", "")).strip(),
         "publish_trigger_id": str(fields.get("publish_trigger_id", "")).strip(),
         "publish_reply_to_discord_message_id": str(fields.get("publish_reply_to_discord_message_id", "")).strip(),
+        "launch_id": str(fields.get("launch_id", "")).strip() or str(fields.get("publish_launch_id", "")).strip(),
     }
 
 
@@ -1905,6 +2276,46 @@ def extract_peer_session_mentions(body: str) -> list[str]:
             mentions.append(token)
         i = j
     return mentions
+
+
+def extract_agent_handles(body: str) -> list[str]:
+    text = _peer_routing_visible_text(body)
+    handles: list[str] = []
+    seen: set[str] = set()
+    i = 0
+    while i < len(text):
+        if text[i : i + 2] != "@@":
+            i += 1
+            continue
+        prev = text[i - 1] if i > 0 else ""
+        if prev and (prev.isalnum() or prev in {"_", "@"}):
+            i += 1
+            continue
+        j = i + 2
+        parts: list[str] = []
+        while len(parts) < 2:
+            start = j
+            while j < len(text):
+                lower = text[j].lower()
+                if ("a" <= lower <= "z") or text[j].isdigit() or text[j] in {"_", "-"}:
+                    j += 1
+                    continue
+                break
+            part = text[start:j]
+            if not part:
+                break
+            parts.append(part)
+            if j < len(text) and text[j] == "/" and len(parts) == 1:
+                j += 1
+                continue
+            break
+        candidate = "/".join(parts)
+        normalized = _normalize_agent_handle(candidate)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            handles.append(normalized)
+        i = max(i + 2, j)
+    return handles
 
 
 def _binding_session_lookup(binding: dict[str, Any]) -> dict[str, str]:
@@ -2129,6 +2540,41 @@ def _promote_stale_in_progress_targets(record: dict[str, Any]) -> tuple[dict[str
         body["peer_delivery"] = peer_delivery
     return body, changed
 
+
+def ensure_room_launch_thread(binding: dict[str, Any], launch_id: str) -> tuple[dict[str, Any], bool]:
+    normalized_launch_id = str(launch_id).strip()
+    if not normalized_launch_id:
+        raise ValueError("launch_id is required")
+    with advisory_lock(room_launch_lock_path(normalized_launch_id)):
+        current = load_room_launch(normalized_launch_id)
+        if not current:
+            raise ValueError(f"launch not found: {normalized_launch_id}")
+        thread_id = str(current.get("thread_id", "")).strip()
+        if thread_id:
+            return current, False
+        parent_channel_id = str(binding.get("conversation_id", "")).strip()
+        root_message_id = str(current.get("root_message_id", "")).strip()
+        if not parent_channel_id or not root_message_id:
+            raise ValueError("launch is missing thread creation metadata")
+        thread = create_thread_from_message(
+            parent_channel_id,
+            root_message_id,
+            room_launch_thread_name(
+                str(current.get("qualified_handle", "")).strip(),
+                str(current.get("from_display", "")).strip(),
+            ),
+        )
+        # Discord message-started threads currently reuse the originating
+        # message snowflake as the thread channel id. Keep the root message id
+        # as a fallback so launch routing still has a stable key if the API
+        # omits the new thread id in a degraded response.
+        thread_id = str((thread or {}).get("id", "")).strip() or root_message_id
+        current["thread_id"] = thread_id
+        current["state"] = "active"
+        current = save_room_launch(current)
+        return current, True
+
+
 def resolve_publish_conversation_id(binding: dict[str, Any], requested_conversation_id: str) -> str:
     binding_conversation_id = str(binding.get("conversation_id", "")).strip()
     requested = str(requested_conversation_id).strip()
@@ -2144,6 +2590,41 @@ def resolve_publish_conversation_id(binding: dict[str, Any], requested_conversat
     if parent_id != binding_conversation_id:
         raise ValueError("--conversation-id must be the bound room or a thread within it")
     return requested
+
+
+def resolve_publish_destination(
+    binding: dict[str, Any],
+    *,
+    requested_conversation_id: str = "",
+    trigger_id: str = "",
+    reply_to_message_id: str = "",
+    source_context: dict[str, str] | None = None,
+) -> tuple[str, str, dict[str, Any] | None]:
+    reply_target = str(reply_to_message_id).strip() or str(trigger_id).strip()
+    source_meta = derive_publish_source_metadata(source_context)
+    launch_id = str(source_meta.get("launch_id", "")).strip()
+    if str(binding.get("publish_route_kind", "")).strip() != "room_launch" or not launch_id:
+        conversation_id = resolve_publish_conversation_id(binding, requested_conversation_id)
+        return conversation_id, reply_target, None
+    current = load_room_launch(launch_id)
+    if not current:
+        raise ValueError(f"launch not found: {launch_id}")
+    thread_id = str(current.get("thread_id", "")).strip()
+    requested = str(requested_conversation_id).strip()
+    binding_conversation_id = str(binding.get("conversation_id", "")).strip()
+    if thread_id:
+        if requested and requested not in {binding_conversation_id, thread_id}:
+            raise ValueError("--conversation-id must match the launch thread for this room launch")
+        return thread_id, reply_target, current
+    if requested and requested != binding_conversation_id:
+        raise ValueError("--conversation-id cannot override a pending room launch before the thread exists")
+    current, created_thread = ensure_room_launch_thread(binding, launch_id)
+    conversation_id = str(current.get("thread_id", "")).strip()
+    if not conversation_id:
+        raise ValueError("room launch did not produce a thread id")
+    if created_thread:
+        reply_target = ""
+    return conversation_id, reply_target, current
 
 
 def _peer_delivery_needs_attention(record: dict[str, Any]) -> bool:
@@ -2518,7 +2999,7 @@ def retry_peer_fanout(
     if not record:
         raise ValueError(f"publish not found: {publish_id}")
     binding_id = str(record.get("binding_id", "")).strip()
-    binding = resolve_chat_binding(load_config(), binding_id)
+    binding = resolve_publish_route(load_config(), binding_id)
     if not binding:
         raise ValueError(f"binding not found: {binding_id}")
     retry_targets: list[tuple[str, str, str, list[str], str, str, str]] = []
@@ -2628,10 +3109,15 @@ def publish_binding_message(
     source_session_name: str = "",
     source_session_id: str = "",
 ) -> dict[str, Any]:
-    conversation_id = resolve_publish_conversation_id(binding, requested_conversation_id)
+    conversation_id, reply_target, launch = resolve_publish_destination(
+        binding,
+        requested_conversation_id=requested_conversation_id,
+        trigger_id=trigger_id,
+        reply_to_message_id=reply_to_message_id,
+        source_context=source_context,
+    )
     if not conversation_id:
         raise ValueError("binding is missing a destination conversation_id")
-    reply_target = str(reply_to_message_id).strip() or str(trigger_id).strip()
     response = post_channel_message(
         conversation_id,
         body,
@@ -2671,6 +3157,8 @@ def publish_binding_message(
             "source_session_name": effective_source_session_name,
             "source_event_kind": source_meta.get("source_event_kind", ""),
             "root_ingress_receipt_id": source_meta.get("root_ingress_receipt_id", ""),
+            "launch_id": source_meta.get("launch_id", ""),
+            "launch_thread_id": str((launch or {}).get("thread_id", "")).strip(),
             "body": body,
             "remote_message_id": remote_message_id,
         }

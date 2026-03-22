@@ -37,7 +37,7 @@ def main(argv: list[str]) -> int:
     if not binding_id:
         raise SystemExit("latest discord event is missing publish_binding_id")
     config = common.load_config()
-    binding = common.resolve_chat_binding(config, binding_id)
+    binding = common.resolve_publish_route(config, binding_id)
     if not binding:
         raise SystemExit(f"binding not found: {binding_id}")
     source_identity = {}

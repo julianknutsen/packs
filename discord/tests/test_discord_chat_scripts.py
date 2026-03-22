@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import pathlib
 import tempfile
+import tomllib
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -16,6 +17,7 @@ import discord_chat_bind as bind_script
 import discord_chat_publish as publish_script
 import discord_chat_reply_current as reply_current_script
 import discord_chat_retry_peer_fanout as retry_peer_fanout_script
+import discord_room_launch as room_launch_script
 import discord_intake_common as common
 
 
@@ -29,6 +31,16 @@ class DiscordChatScriptTests(unittest.TestCase):
     def tearDown(self) -> None:
         os.environ.clear()
         os.environ.update(self._old_environ)
+
+    def test_pack_commands_reference_existing_files(self) -> None:
+        pack_dir = pathlib.Path(__file__).resolve().parents[1]
+        manifest = tomllib.loads((pack_dir / "pack.toml").read_text(encoding="utf-8"))
+
+        for command in manifest.get("commands", []):
+            script_path = pack_dir / str(command.get("script", "")).strip()
+            help_path = pack_dir / str(command.get("long_description", "")).strip()
+            self.assertTrue(script_path.is_file(), f"missing command script for {command.get('name')}: {script_path}")
+            self.assertTrue(help_path.is_file(), f"missing help text for {command.get('name')}: {help_path}")
 
     def test_publish_uses_binding_target_and_saves_record(self) -> None:
         common.set_chat_binding(common.load_config(), "room", "22", ["sky"], guild_id="1")
@@ -331,6 +343,96 @@ class DiscordChatScriptTests(unittest.TestCase):
         self.assertEqual(payload["reply_context"]["source_session_name"], "sky")
         self.assertEqual(payload["reply_context"]["source_session_id"], "gc-sky")
 
+    def test_reply_current_uses_launch_route_and_creates_thread(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        common.save_room_launch(
+            {
+                "launch_id": "room-launch:orig-22",
+                "launcher_id": "launch-room:22",
+                "guild_id": "1",
+                "conversation_id": "22",
+                "root_message_id": "orig-22",
+                "qualified_handle": "corp/sky",
+                "session_alias": "dc-123-sky",
+            }
+        )
+        os.environ["GC_SESSION_NAME"] = "dc-runtime"
+        body_file = pathlib.Path(self.tempdir.name) / "reply-launch.txt"
+        body_file.write_text("safe reply", encoding="utf-8")
+
+        with mock.patch.object(
+            common,
+            "find_latest_discord_reply_context",
+            return_value={
+                "kind": "discord_human_message",
+                "ingress_receipt_id": "in-22",
+                "publish_binding_id": "launch-room:22",
+                "publish_conversation_id": "22",
+                "publish_trigger_id": "orig-22",
+                "publish_launch_id": "room-launch:orig-22",
+            },
+        ), mock.patch.object(common, "create_thread_from_message", return_value={"id": "333"}) as create_thread_from_message, mock.patch.object(
+            common, "post_channel_message", return_value={"id": "msg-22"}
+        ) as post_channel_message:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = reply_current_script.main(["--body-file", str(body_file)])
+
+        self.assertEqual(code, 0)
+        create_thread_from_message.assert_called_once_with("22", "orig-22", "sky")
+        post_channel_message.assert_called_once_with("333", "safe reply", reply_to_message_id="")
+        payload = common.json.loads(stdout.getvalue())
+        self.assertEqual(payload["record"]["conversation_id"], "333")
+        self.assertEqual(payload["record"]["launch_id"], "room-launch:orig-22")
+
+    def test_publish_launch_route_hydrates_launch_id_from_source_ingress(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        common.save_room_launch(
+            {
+                "launch_id": "room-launch:orig-29",
+                "launcher_id": "launch-room:22",
+                "guild_id": "1",
+                "conversation_id": "22",
+                "root_message_id": "orig-29",
+                "qualified_handle": "corp/sky",
+                "session_alias": "dc-123-sky",
+            }
+        )
+        common.save_chat_ingress({"ingress_id": "in-29", "launch_id": "room-launch:orig-29", "status": "delivered"})
+
+        with mock.patch.object(common, "create_thread_from_message", return_value={"id": "444"}) as create_thread_from_message, mock.patch.object(
+            common, "post_channel_message", return_value={"id": "msg-29"}
+        ) as post_channel_message:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = publish_script.main(
+                    [
+                        "--binding",
+                        "launch-room:22",
+                        "--source-event-kind",
+                        "discord_human_message",
+                        "--source-ingress-receipt-id",
+                        "in-29",
+                        "--body",
+                        "hello launcher",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        create_thread_from_message.assert_called_once_with("22", "orig-29", "sky")
+        post_channel_message.assert_called_once_with("444", "hello launcher", reply_to_message_id="")
+        payload = common.json.loads(stdout.getvalue())
+        self.assertEqual(payload["record"]["launch_id"], "room-launch:orig-29")
+        self.assertEqual(payload["record"]["conversation_id"], "444")
+
+    def test_publish_launch_route_requires_source_ingress_receipt(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+
+        with self.assertRaises(SystemExit) as exc:
+            publish_script.main(["--binding", "launch-room:22", "--body", "hello launcher"])
+
+        self.assertEqual(str(exc.exception), "launch-room publish requires --source-ingress-receipt-id")
+
     def test_bind_script_creates_room_binding(self) -> None:
         stdout = io.StringIO()
         with mock.patch.object(common, "describe_room_channel_metadata") as describe_room_channel_metadata, redirect_stdout(stdout):
@@ -396,6 +498,17 @@ class DiscordChatScriptTests(unittest.TestCase):
         assert binding is not None
         self.assertFalse(binding["policy"]["ambient_read_enabled"])
 
+    def test_enable_room_launch_script_creates_launcher(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = room_launch_script.main(["--guild-id", "1", "22"])
+
+        self.assertEqual(code, 0)
+        launcher = common.resolve_room_launcher(common.load_config(), "22")
+        self.assertIsNotNone(launcher)
+        assert launcher is not None
+        self.assertEqual(launcher["response_mode"], "mention_only")
+
     def test_bind_script_rejects_conflicting_ambient_read_flags(self) -> None:
         with self.assertRaises(SystemExit) as exc:
             bind_script.main(["--kind", "room", "--enable-ambient-read", "--disable-ambient-read", "22", "sky"])
@@ -455,6 +568,51 @@ class DiscordChatScriptTests(unittest.TestCase):
             stdout = io.StringIO()
             with redirect_stdout(stdout):
                 code = retry_peer_fanout_script.main(["discord-publish-1"])
+
+        self.assertEqual(code, 0)
+        payload = common.json.loads(stdout.getvalue())
+        self.assertEqual(payload["peer_delivery"]["status"], "delivered")
+
+    def test_retry_peer_fanout_script_accepts_launch_room_binding(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        common.save_chat_publish(
+            {
+                "publish_id": "discord-publish-launch",
+                "binding_id": "launch-room:22",
+                "binding_kind": "room",
+                "binding_conversation_id": "22",
+                "conversation_id": "22",
+                "guild_id": "1",
+                "source_session_name": "dc-123-sky",
+                "source_session_id": "gc-1",
+                "source_event_kind": "discord_human_message",
+                "root_ingress_receipt_id": "in-1",
+                "body": "hello",
+                "remote_message_id": "msg-1",
+                "peer_delivery": {
+                    "phase": "peer_fanout_partial_failure",
+                    "status": "partial_failure",
+                    "delivery": "targeted",
+                    "mentioned_session_names": ["corp--priya"],
+                    "frozen_targets": ["corp--priya"],
+                    "targets": [
+                        {
+                            "session_name": "corp--priya",
+                            "status": "failed_retryable",
+                            "attempt_count": 1,
+                            "idempotency_key": "peer_publish:discord-publish-launch:binding:launch-room:22:target:corp--priya",
+                            "attempts": [],
+                        }
+                    ],
+                    "budget_snapshot": {},
+                },
+            }
+        )
+
+        with mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted", "id": "gc-1"}):
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = retry_peer_fanout_script.main(["discord-publish-launch"])
 
         self.assertEqual(code, 0)
         payload = common.json.loads(stdout.getvalue())

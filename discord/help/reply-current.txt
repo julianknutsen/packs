@@ -5,6 +5,10 @@ This is the safest agent-facing Discord reply path. It resolves the latest
 `publish_binding_id`, `publish_conversation_id`, and reply threading metadata,
 then publishes the provided body back to Discord.
 
+For launcher-backed root-room turns, the first successful `reply-current`
+automatically creates the Discord thread before posting the message. The agent
+does not need to create or target that thread manually.
+
 Examples:
   gc discord reply-current --body-file ./reply.txt
   gc discord reply-current --session corp--sky --body-file ./reply.txt
