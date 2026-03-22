@@ -73,6 +73,14 @@ GC_API_HEALTH_CACHE = {"checked_at": 0.0, "reachable": True}
 WORKER_QUEUE_SENTINEL: tuple[dict[str, Any], str] | None = None
 
 
+def participant_delivery_selector(participant: dict[str, Any]) -> str:
+    for key in ("delivery_selector", "session_alias", "session_name", "session_id"):
+        value = str((participant or {}).get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
     body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     handler.send_response(status)
@@ -101,17 +109,33 @@ def summarize_body(value: str, limit: int = MAX_STATUS_PREVIEW) -> str:
 def display_name_from_message(message: dict[str, Any]) -> str:
     member = message.get("member") or {}
     user = message.get("author") or {}
-    for value in (
-        str(member.get("nick", "")).strip(),
-        str(user.get("global_name", "")).strip(),
-        str(user.get("username", "")).strip(),
+    candidates: list[str] = []
+    for raw in (
+        member.get("nick"),
+        user.get("global_name"),
+        user.get("username"),
     ):
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if value:
+            candidates.append(value)
+    for value in candidates:
         normalized = " ".join(
             value.replace("\r", " ").replace("\n", " ").replace("<", " ").replace(">", " ").split()
         )
         if normalized:
             return normalized
     return "discord-user"
+
+
+def raw_message_content(message: dict[str, Any]) -> str:
+    value = message.get("content", "")
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return str(value)
 
 
 def bot_was_mentioned(message: dict[str, Any], bot_user_id: str) -> bool:
@@ -217,6 +241,95 @@ def conversation_fields(message: dict[str, Any], channel_info: dict[str, Any]) -
 
 def ingress_preview(message: dict[str, Any], bot_user_id: str) -> str:
     return summarize_body(strip_bot_mentions(str(message.get("content", "")), bot_user_id))
+
+
+def fetch_message_via_rest(channel_id: str, message_id: str) -> dict[str, Any]:
+    normalized_channel_id = str(channel_id).strip()
+    normalized_message_id = str(message_id).strip()
+    if not normalized_channel_id or not normalized_message_id:
+        return {}
+    quoted_channel = urllib.parse.quote(normalized_channel_id)
+    quoted_message = urllib.parse.quote(normalized_message_id)
+    try:
+        payload = common.discord_api_request("GET", f"/channels/{quoted_channel}/messages/{quoted_message}")
+        if isinstance(payload, dict) and str(payload.get("id", "")).strip() == normalized_message_id:
+            return payload
+    except common.DiscordAPIError as exc:
+        if int(getattr(exc, "status_code", 0) or 0) != 404:
+            return {}
+    except Exception:
+        return {}
+    try:
+        payload = common.discord_api_request(
+            "GET",
+            f"/channels/{quoted_channel}/messages?around={quoted_message}&limit=3",
+        )
+    except common.DiscordAPIError:
+        return {}
+    except Exception:
+        return {}
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict) and str(item.get("id", "")).strip() == normalized_message_id:
+                return item
+    return {}
+
+
+def recover_message_for_routing(message: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    recovered = dict(message)
+    gateway_content = raw_message_content(message)
+    debug = {
+        "gateway_content_length": len(gateway_content),
+        "rest_content_length": 0,
+        "content_source": "gateway",
+        "rest_fetch_attempted": False,
+        "rest_fetch_succeeded": False,
+    }
+    guild_id = str(message.get("guild_id", "")).strip()
+    channel_id = str(message.get("channel_id", "")).strip()
+    message_id = str(message.get("id", "")).strip()
+    needs_rest = bool(guild_id and channel_id and message_id and not gateway_content.strip())
+    if not needs_rest:
+        return recovered, debug
+    debug["rest_fetch_attempted"] = True
+    fetched = fetch_message_via_rest(channel_id, message_id)
+    if not isinstance(fetched, dict) or not fetched:
+        debug["content_source"] = "gateway_empty_rest_unavailable"
+        return recovered, debug
+    fetched_content = raw_message_content(fetched)
+    debug["rest_content_length"] = len(fetched_content)
+    debug["rest_fetch_succeeded"] = True
+    if fetched_content:
+        recovered["content"] = fetched_content
+        debug["content_source"] = "rest_fallback"
+    else:
+        debug["content_source"] = "gateway_empty_rest_empty"
+    for key in ("mentions", "message_reference", "member"):
+        current = recovered.get(key)
+        if current in (None, "", [], {}):
+            fetched_value = fetched.get(key)
+            if fetched_value not in (None, "", [], {}):
+                recovered[key] = fetched_value
+    if display_name_from_message(recovered) == "discord-user":
+        fetched_author = fetched.get("author")
+        if fetched_author not in (None, "", [], {}):
+            recovered["author"] = fetched_author
+        fetched_member = fetched.get("member")
+        if fetched_member not in (None, "", [], {}):
+            recovered["member"] = fetched_member
+    return recovered, debug
+
+
+def empty_body_reason(message: dict[str, Any], message_debug: dict[str, Any] | None = None) -> str:
+    raw_content = raw_message_content(message)
+    if raw_content.strip():
+        return "empty_after_bot_mention_strip"
+    if str(message.get("guild_id", "")).strip():
+        debug = message_debug or {}
+        source = str(debug.get("content_source", "")).strip()
+        if source in {"gateway_empty_rest_unavailable", "gateway_empty_rest_empty", "gateway"}:
+            return "message_content_unavailable"
+    return "empty_message_content"
 
 
 def utc_age_seconds(value: str) -> float:
@@ -705,6 +818,7 @@ def save_rejected_ingress_receipt(
     *,
     status: str,
     reason: str,
+    message_debug: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     ingress_id = message_ingress_id(message)
     return common.save_chat_ingress_if_absent(
@@ -719,6 +833,7 @@ def save_rejected_ingress_receipt(
             "body_preview": ingress_preview(message, bot_user_id),
             "status": status,
             "reason": reason,
+            "message_debug": dict(message_debug or {}),
             "targets": [],
         }
     )
@@ -730,6 +845,7 @@ def reject_ingress_before_processing(
     *,
     status: str,
     reason: str,
+    message_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ingress_id = message_ingress_id(message)
     claimed, receipt = save_rejected_ingress_receipt(
@@ -737,6 +853,7 @@ def reject_ingress_before_processing(
         bot_user_id,
         status=status,
         reason=reason,
+        message_debug=message_debug,
     )
     if claimed:
         return {"status": status, "reason": reason, "ingress_id": ingress_id, "receipt": receipt}
@@ -754,6 +871,7 @@ def reject_ingress_before_processing(
                 "body_preview": ingress_preview(message, bot_user_id),
                 "status": "failed_claim_conflict",
                 "reason": str(receipt.get("reason", "")).strip() or "ingress_claim_unreadable",
+                "message_debug": dict(message_debug or {}),
                 "targets": [],
             }
         )
@@ -768,6 +886,7 @@ def process_room_launch_message(
     message: dict[str, Any],
     bot_user_id: str,
     ingress_id: str,
+    message_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     body = strip_bot_mentions(str(message.get("content", "")), bot_user_id)
     if not body:
@@ -776,7 +895,8 @@ def process_room_launch_message(
                 **base_receipt,
                 "binding_id": str(launcher.get("id", "")).strip(),
                 "status": "ignored_empty",
-                "reason": "empty_after_bot_mention_strip",
+                "reason": empty_body_reason(message, message_debug),
+                "message_debug": dict(message_debug or {}),
                 "targets": [],
             }
         )
@@ -905,7 +1025,7 @@ def process_room_launch_message(
         )
         return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
 
-    target_selector = str(launch.get("session_alias", "")).strip() or str(launch.get("session_name", "")).strip()
+    target_selector = participant_delivery_selector(launch)
     receipt = persist_ingress_receipt(
         {
             **base_receipt,
@@ -952,6 +1072,7 @@ def process_room_launch_thread_message(
     message: dict[str, Any],
     bot_user_id: str,
     ingress_id: str,
+    message_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     refreshed_launch = common.touch_room_launch(str(launch.get("launch_id", "")).strip())
     if isinstance(refreshed_launch, dict):
@@ -963,7 +1084,8 @@ def process_room_launch_thread_message(
                 **base_receipt,
                 "binding_id": str(launcher.get("id", "")).strip(),
                 "status": "ignored_empty",
-                "reason": "empty_after_bot_mention_strip",
+                "reason": empty_body_reason(message, message_debug),
+                "message_debug": dict(message_debug or {}),
                 "targets": [],
             }
         )
@@ -1048,7 +1170,7 @@ def process_room_launch_thread_message(
             }
         )
         return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
-    target_selector = str(target_participant.get("session_alias", "")).strip() or str(target_participant.get("session_name", "")).strip()
+    target_selector = participant_delivery_selector(target_participant)
 
     receipt = persist_ingress_receipt(
         {
@@ -1106,6 +1228,9 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
     if not channel_id:
         return {"status": "ignored", "reason": "missing_channel", "ingress_id": ingress_id}
 
+    message, message_debug = recover_message_for_routing(message)
+    author = message.get("author") or {}
+
     config = common.load_config()
     room_launchers_configured = bool(common.list_room_launchers(config)) if guild_id else False
     mentioned_bot = bot_was_mentioned(message, bot_user_id) if guild_id else False
@@ -1142,6 +1267,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                     bot_user_id,
                     status="ignored_untargeted",
                     reason="ambient_target_required",
+                    message_debug=message_debug,
                 )
             participant_names = [str(item).strip() for item in preloaded_binding.get("session_names", []) if str(item).strip()]
             participant_lookup, participant_collisions = casefold_lookup(participant_names)
@@ -1159,6 +1285,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                     bot_user_id,
                     status="ignored_untargeted",
                     reason="ambient_target_required",
+                    message_debug=message_debug,
                 )
             preloaded_channel_type_raw = preloaded_binding.get("channel_type", 0)
             try:
@@ -1181,6 +1308,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
             "from_user_id": str(author.get("id", "")).strip(),
             "from_display": display_name_from_message(message),
             "body_preview": preview,
+            "message_debug": dict(message_debug or {}),
             "status": "processing",
             "targets": [],
         }
@@ -1200,6 +1328,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                     "from_user_id": str(author.get("id", "")).strip(),
                     "from_display": display_name_from_message(message),
                     "body_preview": preview,
+                    "message_debug": dict(message_debug or {}),
                     "status": "failed_claim_conflict",
                     "reason": str(base_receipt.get("reason", "")).strip() or "ingress_claim_unreadable",
                     "targets": [],
@@ -1250,6 +1379,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                         "from_user_id": str(author.get("id", "")).strip(),
                         "from_display": display_name_from_message(message),
                         "body_preview": preview,
+                        "message_debug": dict(message_debug or {}),
                         "status": "processing",
                         "reason": retry_reason,
                         "targets": [],
@@ -1303,6 +1433,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                 message=message,
                 bot_user_id=bot_user_id,
                 ingress_id=ingress_id,
+                message_debug=message_debug,
             )
         if launcher:
             return process_room_launch_message(
@@ -1311,6 +1442,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                 message=message,
                 bot_user_id=bot_user_id,
                 ingress_id=ingress_id,
+                message_debug=message_debug,
             )
         if not binding:
             receipt = persist_ingress_receipt(
@@ -1330,7 +1462,8 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                     **base_receipt,
                     "binding_id": str(binding.get("id", "")).strip(),
                     "status": "ignored_empty",
-                    "reason": "empty_after_bot_mention_strip",
+                    "reason": empty_body_reason(message, message_debug),
+                    "message_debug": dict(message_debug or {}),
                     "targets": [],
                 }
             )

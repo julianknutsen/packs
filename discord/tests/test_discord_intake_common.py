@@ -780,29 +780,235 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             "from_display": "alice",
         }
 
+        sessions_first = [
+            {
+                "id": "gc-old",
+                "alias": "dc-123-sky",
+                "session_name": "dc-old-sky",
+                "state": "closed",
+                "running": False,
+                "created_at": "2026-03-20T00:00:00Z",
+            }
+        ]
+        sessions_second = [
+            {
+                "id": "gc-new",
+                "alias": "dc-123-sky",
+                "session_name": "dc-new-sky",
+                "state": "active",
+                "running": True,
+                "created_at": "2026-03-22T00:00:00Z",
+            }
+        ]
+        calls = {"count": 0}
+
+        def list_sessions(*, state: str = "all") -> list[dict[str, object]]:
+            self.assertEqual(state, "all")
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return sessions_first
+            return sessions_second
+
         with mock.patch.object(
             common,
             "list_city_sessions",
-            return_value=[
-                {
-                    "id": "gc-old",
-                    "alias": "dc-123-sky",
-                    "session_name": "dc-old-sky",
-                    "state": "closed",
-                    "running": False,
-                    "created_at": "2026-03-20T00:00:00Z",
-                }
-            ],
+            side_effect=list_sessions,
         ), mock.patch.object(
             common,
             "create_agent_session",
             return_value={"id": "gc-new", "session_name": "dc-new-sky", "alias": "dc-123-sky"},
-        ) as create_agent_session:
+        ) as create_agent_session, mock.patch.object(common.time, "sleep"):
             current = common.ensure_room_launch_session(launch)
 
         create_agent_session.assert_called_once()
+        self.assertEqual(calls["count"], 2)
         self.assertEqual(current["session_id"], "gc-new")
         self.assertEqual(current["session_name"], "dc-new-sky")
+
+    def test_ensure_room_launch_session_hydrates_routable_identity_after_create(self) -> None:
+        launch = {
+            "launch_id": "room-launch:hydrate",
+            "qualified_handle": "corp/sky",
+            "session_alias": "dc-123-sky",
+            "from_display": "alice",
+        }
+
+        sessions_first = [
+            {
+                "id": "gc-old",
+                "alias": "dc-123-sky",
+                "session_name": "dc-old-sky",
+                "state": "closed",
+                "running": False,
+                "created_at": "2026-03-20T00:00:00Z",
+            }
+        ]
+        sessions_second = [
+            {
+                "id": "gc-new",
+                "alias": "dc-123-sky",
+                "session_name": "dc-new-sky",
+                "state": "active",
+                "running": True,
+                "created_at": "2026-03-22T00:00:00Z",
+            }
+        ]
+        calls = {"count": 0}
+
+        def list_sessions(*, state: str = "all") -> list[dict[str, object]]:
+            self.assertEqual(state, "all")
+            calls["count"] += 1
+            if calls["count"] < 4:
+                return sessions_first
+            return sessions_second
+
+        with mock.patch.object(
+            common,
+            "list_city_sessions",
+            side_effect=list_sessions,
+        ), mock.patch.object(
+            common,
+            "create_agent_session",
+            return_value={"alias": "dc-123-sky"},
+        ) as create_agent_session, mock.patch.object(common.time, "sleep"):
+            current = common.ensure_room_launch_session(launch)
+
+        create_agent_session.assert_called_once()
+        self.assertEqual(calls["count"], 4)
+        self.assertEqual(current["session_id"], "gc-new")
+        self.assertEqual(current["session_name"], "dc-new-sky")
+
+    def test_ensure_room_launch_session_hydrates_routable_identity_when_create_omits_alias(self) -> None:
+        launch = {
+            "launch_id": "room-launch:hydrate-no-alias",
+            "qualified_handle": "corp/sky",
+            "session_alias": "dc-123-sky",
+            "from_display": "alice",
+        }
+
+        sessions_first: list[dict[str, object]] = []
+        sessions_second = [
+            {
+                "id": "gc-new",
+                "alias": "dc-123-sky",
+                "session_name": "dc-new-sky",
+                "state": "active",
+                "running": True,
+                "created_at": "2026-03-22T00:00:00Z",
+            }
+        ]
+        calls = {"count": 0}
+
+        def list_sessions(*, state: str = "all") -> list[dict[str, object]]:
+            self.assertEqual(state, "all")
+            calls["count"] += 1
+            if calls["count"] < 5:
+                return sessions_first
+            return sessions_second
+
+        with mock.patch.object(
+            common,
+            "list_city_sessions",
+            side_effect=list_sessions,
+        ), mock.patch.object(
+            common,
+            "create_agent_session",
+            return_value={},
+        ) as create_agent_session, mock.patch.object(common.time, "sleep"):
+            current = common.ensure_room_launch_session(launch)
+
+        create_agent_session.assert_called_once()
+        self.assertEqual(calls["count"], 5)
+        self.assertEqual(current["session_alias"], "dc-123-sky")
+        self.assertEqual(current["session_id"], "gc-new")
+        self.assertEqual(current["session_name"], "dc-new-sky")
+        self.assertEqual(current["delivery_selector"], "dc-123-sky")
+
+    def test_ensure_room_launch_session_waits_for_routable_identity_when_create_returns_name(self) -> None:
+        launch = {
+            "launch_id": "room-launch:hydrate-name-only",
+            "qualified_handle": "corp/sky",
+            "session_alias": "dc-123-sky",
+            "from_display": "alice",
+        }
+
+        sessions_first: list[dict[str, object]] = []
+        sessions_second = [
+            {
+                "id": "gc-new",
+                "alias": "dc-123-sky",
+                "session_name": "dc-new-sky",
+                "state": "active",
+                "running": True,
+                "created_at": "2026-03-22T00:00:00Z",
+            }
+        ]
+        calls = {"count": 0}
+
+        def list_sessions(*, state: str = "all") -> list[dict[str, object]]:
+            self.assertEqual(state, "all")
+            calls["count"] += 1
+            if calls["count"] < 5:
+                return sessions_first
+            return sessions_second
+
+        with mock.patch.object(
+            common,
+            "list_city_sessions",
+            side_effect=list_sessions,
+        ), mock.patch.object(
+            common,
+            "create_agent_session",
+            return_value={"id": "gc-new", "session_name": "dc-new-sky"},
+        ) as create_agent_session, mock.patch.object(common.time, "sleep"):
+            current = common.ensure_room_launch_session(launch)
+
+        create_agent_session.assert_called_once()
+        self.assertEqual(calls["count"], 5)
+        self.assertEqual(current["session_alias"], "dc-123-sky")
+        self.assertEqual(current["session_id"], "gc-new")
+        self.assertEqual(current["session_name"], "dc-new-sky")
+        self.assertEqual(current["delivery_selector"], "dc-123-sky")
+
+    def test_ensure_room_launch_session_raises_when_created_identity_never_becomes_routable(self) -> None:
+        launch = {
+            "launch_id": "room-launch:stuck",
+            "qualified_handle": "corp/sky",
+            "session_alias": "dc-123-sky",
+            "from_display": "alice",
+        }
+
+        with mock.patch.object(
+            common,
+            "list_city_sessions",
+            return_value=[],
+        ), mock.patch.object(
+            common,
+            "create_agent_session",
+            return_value={"alias": "dc-123-sky"},
+        ), mock.patch.object(common.time, "sleep"):
+            with self.assertRaisesRegex(common.GCAPIError, "created launch session is not routable yet"):
+                common.ensure_room_launch_session(launch)
+
+    def test_ensure_room_launch_session_raises_when_create_returns_name_but_never_becomes_routable(self) -> None:
+        launch = {
+            "launch_id": "room-launch:stuck-name-only",
+            "qualified_handle": "corp/sky",
+            "session_alias": "dc-123-sky",
+            "from_display": "alice",
+        }
+
+        with mock.patch.object(
+            common,
+            "list_city_sessions",
+            return_value=[],
+        ), mock.patch.object(
+            common,
+            "create_agent_session",
+            return_value={"id": "gc-new", "session_name": "dc-new-sky"},
+        ), mock.patch.object(common.time, "sleep"):
+            with self.assertRaisesRegex(common.GCAPIError, "created launch session is not routable yet"):
+                common.ensure_room_launch_session(launch)
 
     def test_ensure_room_launch_session_for_handle_creates_secondary_participant(self) -> None:
         common.save_room_launch(
@@ -818,21 +1024,42 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             }
         )
 
+        sessions_first: list[dict[str, object]] = []
+        sessions_second = [
+            {
+                "id": "gc-alex",
+                "alias": "dc-456-alex",
+                "session_name": "dc-alex",
+                "state": "active",
+                "running": True,
+                "created_at": "2026-03-22T00:00:00Z",
+            }
+        ]
+        calls = {"count": 0}
+
+        def list_sessions(*, state: str = "all") -> list[dict[str, object]]:
+            self.assertEqual(state, "all")
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return sessions_first
+            return sessions_second
+
         with mock.patch.object(
             common,
             "list_city_sessions",
-            return_value=[],
+            side_effect=list_sessions,
         ), mock.patch.object(
             common,
             "create_agent_session",
             return_value={"id": "gc-alex", "session_name": "dc-alex", "alias": "dc-456-alex"},
-        ) as create_agent_session:
+        ) as create_agent_session, mock.patch.object(common.time, "sleep"):
             current, participant = common.ensure_room_launch_session_for_handle(
                 common.load_room_launch("room-launch:thread-join") or {},
                 "corp/alex",
             )
 
         create_agent_session.assert_called_once()
+        self.assertEqual(calls["count"], 2)
         self.assertEqual(participant["session_name"], "dc-alex")
         self.assertEqual(current["participants"]["corp/alex"]["session_alias"], "dc-456-alex")
 

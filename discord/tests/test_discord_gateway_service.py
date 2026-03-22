@@ -36,6 +36,16 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self._old_environ)
 
+    def test_gateway_does_not_require_message_content_intent(self) -> None:
+        self.assertFalse(gateway_service.GATEWAY_INTENTS & (1 << 15))
+
+    def test_display_name_from_message_skips_none_strings(self) -> None:
+        message = {
+            "author": {"username": None, "global_name": None},
+            "member": {"nick": None},
+        }
+        self.assertEqual(gateway_service.display_name_from_message(message), "discord-user")
+
     def test_process_inbound_dm_routes_to_bound_session(self) -> None:
         common.set_chat_binding(common.load_config(), "dm", "55", ["sky"])
         message = {
@@ -127,14 +137,17 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             return_value={
                 "launch_id": "room-launch:208",
                 "qualified_handle": "corp/sky",
+                "delivery_selector": "s-gc-123",
                 "session_alias": "dc-123-sky",
+                "session_name": "s-gc-123",
+                "session_id": "gc-123",
             },
         ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
             outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
 
         self.assertEqual(outcome["status"], "delivered")
         deliver_session_message.assert_called_once()
-        self.assertEqual(deliver_session_message.call_args.args[0], "dc-123-sky")
+        self.assertEqual(deliver_session_message.call_args.args[0], "s-gc-123")
         envelope = deliver_session_message.call_args.args[1]
         self.assertIn("binding_id: launch-room:22", envelope)
         self.assertIn("launch_id: room-launch:208", envelope)
@@ -142,6 +155,95 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         receipt = common.load_chat_ingress("in-208")
         assert receipt is not None
         self.assertEqual(receipt["launch_id"], "room-launch:208")
+
+    def test_process_inbound_room_launch_recovers_empty_guild_content_via_rest(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        message = {
+            "id": "208b",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "",
+            "author": {"id": "u-208b", "username": None},
+        }
+
+        with mock.patch.object(
+            common,
+            "discord_api_request",
+            return_value={
+                "id": "208b",
+                "channel_id": "22",
+                "content": "@@corp/sky please help",
+                "author": {"id": "u-208b", "username": "alice"},
+                "mentions": [],
+            },
+        ), mock.patch.object(common, "resolve_agent_handle", return_value=("corp/sky", "")), mock.patch.object(
+            common,
+            "ensure_room_launch_session",
+            return_value={
+                "launch_id": "room-launch:208b",
+                "qualified_handle": "corp/sky",
+                "delivery_selector": "s-gc-123",
+                "session_alias": "dc-123-sky",
+                "session_name": "s-gc-123",
+                "session_id": "gc-123",
+            },
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver_session_message.assert_called_once()
+        self.assertEqual(deliver_session_message.call_args.args[0], "s-gc-123")
+        envelope = deliver_session_message.call_args.args[1]
+        self.assertIn('untrusted_body_json: "@@corp/sky please help"', envelope)
+        receipt = common.load_chat_ingress("in-208b")
+        assert receipt is not None
+        self.assertEqual(receipt["body_preview"], "@@corp/sky please help")
+        self.assertEqual(receipt["from_display"], "alice")
+        self.assertEqual((receipt.get("message_debug") or {}).get("content_source"), "rest_fallback")
+
+    def test_process_inbound_room_launch_marks_guild_empty_content_unavailable(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        message = {
+            "id": "208c",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "",
+            "author": {"id": "u-208c", "username": "alice"},
+        }
+
+        with mock.patch.object(common, "discord_api_request", return_value=[]), mock.patch.object(
+            common, "deliver_session_message"
+        ) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "ignored_empty")
+        deliver_session_message.assert_not_called()
+        receipt = common.load_chat_ingress("in-208c")
+        assert receipt is not None
+        self.assertEqual(receipt["reason"], "message_content_unavailable")
+        self.assertEqual((receipt.get("message_debug") or {}).get("content_source"), "gateway_empty_rest_unavailable")
+
+    def test_process_inbound_room_launch_ignores_unexpected_rest_recovery_failure(self) -> None:
+        common.set_room_launcher(common.load_config(), "1", "22")
+        message = {
+            "id": "208d",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "",
+            "author": {"id": "u-208d", "username": "alice"},
+        }
+
+        with mock.patch.object(common, "discord_api_request", side_effect=RuntimeError("boom")), mock.patch.object(
+            common, "deliver_session_message"
+        ) as deliver_session_message:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "ignored_empty")
+        deliver_session_message.assert_not_called()
+        receipt = common.load_chat_ingress("in-208d")
+        assert receipt is not None
+        self.assertEqual(receipt["reason"], "message_content_unavailable")
+        self.assertEqual((receipt.get("message_debug") or {}).get("content_source"), "gateway_empty_rest_unavailable")
 
     def test_process_inbound_room_launch_thread_routes_follow_up_without_bot_mention(self) -> None:
         common.set_room_launcher(common.load_config(), "1", "22")
@@ -168,8 +270,17 @@ class DiscordGatewayServiceTests(unittest.TestCase):
 
         with mock.patch.object(
             common,
-            "session_index_by_alias",
-            return_value={"dc-123-sky": {"alias": "dc-123-sky", "session_name": "dc-123-sky", "state": "active"}},
+            "list_city_sessions",
+            return_value=[
+                {
+                    "id": "gc-123",
+                    "alias": "dc-123-sky",
+                    "session_name": "dc-123-sky",
+                    "state": "active",
+                    "running": True,
+                    "created_at": "2026-03-22T00:00:00Z",
+                }
+            ],
         ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted"}) as deliver_session_message:
             outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
 
@@ -301,6 +412,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
                             "session_id": "gc-sky",
                         },
                         "corp/alex": {
+                            "delivery_selector": "dc-alex",
                             "qualified_handle": "corp/alex",
                             "session_alias": "dc-456-alex",
                             "session_name": "dc-alex",
@@ -309,6 +421,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
                     },
                 },
                 {
+                    "delivery_selector": "dc-alex",
                     "qualified_handle": "corp/alex",
                     "session_alias": "dc-456-alex",
                     "session_name": "dc-alex",
@@ -324,7 +437,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
 
         self.assertEqual(outcome["status"], "delivered")
         deliver_session_message.assert_called_once()
-        self.assertEqual(deliver_session_message.call_args.args[0], "dc-456-alex")
+        self.assertEqual(deliver_session_message.call_args.args[0], "dc-alex")
         envelope = deliver_session_message.call_args.args[1]
         self.assertIn("launch_qualified_handle: corp/alex", envelope)
         self.assertIn('thread_participants_json: [{"qualified_handle": "corp/alex"', envelope)
@@ -379,6 +492,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             return_value=(
                 common.load_room_launch("room-launch:222") or {},
                 {
+                    "delivery_selector": "dc-alex",
                     "qualified_handle": "corp/alex",
                     "session_alias": "dc-456-alex",
                     "session_name": "dc-alex",
@@ -393,7 +507,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
 
         self.assertEqual(outcome["status"], "delivered")
-        self.assertEqual(deliver_session_message.call_args.args[0], "dc-456-alex")
+        self.assertEqual(deliver_session_message.call_args.args[0], "dc-alex")
         receipt = common.load_chat_ingress("in-212a")
         assert receipt is not None
         self.assertEqual(receipt["routing_mode"], "reply_to")
@@ -443,6 +557,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             return_value=(
                 common.load_room_launch("room-launch:222") or {},
                 {
+                    "delivery_selector": "dc-alex",
                     "qualified_handle": "corp/alex",
                     "session_alias": "dc-456-alex",
                     "session_name": "dc-alex",
@@ -457,7 +572,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
 
         self.assertEqual(outcome["status"], "delivered")
-        self.assertEqual(deliver_session_message.call_args.args[0], "dc-456-alex")
+        self.assertEqual(deliver_session_message.call_args.args[0], "dc-alex")
         receipt = common.load_chat_ingress("in-212b")
         assert receipt is not None
         self.assertEqual(receipt["routing_mode"], "last_addressed")
