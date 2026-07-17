@@ -149,10 +149,16 @@ gh pr list --repo gastownhall/gascity --author sjarmak --state open \\
 ```
 
 **3. All open PRs — for competing-PR detection:**
+
+`baseRefName` is not optional here: GitHub honours a closing keyword only when
+the PR targets the default branch, so the coverage decision in `classify` cannot
+be made without it.
 ```bash
 gh pr list --repo gastownhall/gascity --state open \\
-    --json number,title,body,author \\
+    --json number,title,body,author,baseRefName \\
     > /tmp/triage-all-prs.json
+DEFAULT_BRANCH=$(gh repo view gastownhall/gascity --json defaultBranchRef \\
+    -q .defaultBranchRef.name)
 ```
 
 Record counts:
@@ -185,14 +191,74 @@ The four tiers:
 - **Tier 3 (INVESTIGATE FIRST)** — Scope unclear, OR a maintainer-decision
   gate fires (design conflict, author uncertainty, maintainer ambivalence,
   product question disguised as bug).
-- **Tier 4 (SKIP)** — Assigned to a non-self maintainer, OR an open PR
-  already covers it, OR labelled won't-fix / on-hold / post-release.
+- **Tier 4 (SKIP)** — Assigned to a non-self maintainer, OR an open PR is shown
+  to cover it by the two-phase decision below (a mention alone is never
+  coverage), OR labelled won't-fix / on-hold / post-release.
 
-**Competing-PR detection (CRITICAL — three methods, ANY hit demotes to Tier 4):**
+**Competing-PR detection (CRITICAL — discover candidates, THEN decide coverage):**
+
+These two phases are separate and must stay separate. The searches below prove
+only that a PR *mentions* an issue. A mention is not coverage: a bare `#N` in a
+References/Related footer is itself what creates the timeline cross-reference
+event, so that event is never independent evidence. Collapsing the two phases
+suppresses genuinely uncovered work — confirmed on PR #3880, which references
+#2713/#3005 while explicitly disclaiming them, and PR #3954, which lists #3849
+as merely "adjacent".
+
+**Phase 1 — candidate discovery (a hit nominates the pair; it does NOT demote):**
 1. Search by issue number: `gh pr list --repo gastownhall/gascity --search '<num>' --state open`
 2. Search by issue title keywords: `gh pr list ... --search '<key phrases>' --state open`
 3. Issue timeline: `gh api repos/gastownhall/gascity/issues/<num>/timeline --paginate` and
    look for `cross-referenced` events with `pull_request` source.
+
+**Phase 2 — coverage decision (demote to Tier 4 on exactly one of these):**
+
+- **Closing keyword — mechanical and sufficient.** The candidate PR's body binds
+  a GitHub closing keyword to the issue on one line: `Closes|Fixes|Resolves
+  #<num>` (also the singular/past forms `close/closed`, `fix/fixed`,
+  `resolve/resolved`; and the reference may be `#<num>`, `GH-<num>`,
+  `owner/repo#<num>`, or a full issue URL). Two restrictions carry real weight:
+  a qualified reference counts only when it names THIS repo — `Fixes
+  octo/other#42` is about someone else's #42 — and GitHub honours closing
+  keywords only on PRs targeting the default branch, so check `baseRefName`.
+  Keywords inside code spans or fences do not count. No judgment needed. Record
+  `coverage_basis: closing-keyword`.
+
+- **Structured coverage verdict — for keywordless coverage.** A PR may genuinely
+  supersede an issue without any keyword. Read the candidate PR body in full and
+  emit one verdict per pair:
+  ```json
+  { "issue": <N>, "covers": true|false,
+    "evidence": ["<span quoted verbatim from the PR body>", ...],
+    "reasoning": "<why the change does or does not resolve the issue>" }
+  ```
+  Every `evidence` span MUST be copied verbatim from the PR body. A covering
+  verdict that cites nothing, or cites a span absent from the body, is invalid —
+  discard it and leave the issue authorable. Record `coverage_basis:
+  model-verdict`.
+
+Within the verdict branch, an explicit scope disclaimer is evidence AGAINST
+coverage — the PR author has already answered the question. Treat "intentionally
+does not cover", "not a fix for", "directionally aligned with ... not a fix",
+"adjacent", and "groundwork for" as `covers: false` unless the diff plainly
+contradicts the author.
+
+A disclaimer does NOT override a closing keyword, and that is deliberate. GitHub
+parses `Fixes #N` without reading the surrounding sentence, so even "this does
+not fix #42" closes #42 on merge. The keyword branch reports what GitHub will
+actually do; the verdict branch is where authorial intent is weighed.
+
+If neither branch fires, the issue is NOT covered. Record `coverage_basis:
+no-coverage-evidence` and leave it in its earned tier. When in doubt, leave it
+authorable: a false Tier 4 silently buries real work, while a false Tier 1 costs
+one wasted read.
+
+YOU apply the two phases above — nothing in this formula shells out to a
+validator, so the discipline is yours to keep. `pr-pipeline/tests/coverage_contract.py`
+is the reference implementation of exactly these rules, regression-tested against
+the real #3880/#3954 bodies (fixtures in `pr-pipeline/tests/fixtures/`). Read it
+when a case is ambiguous; it is the tiebreaker. Keep the prose and the harness in
+step when either changes — they are coupled by convention, not by execution.
 
 **Maintainer-decision gates (any fire demotes to Tier 3):**
 - **DD (design-doc conflict):** grep `engdocs/design/*.md` for issue symbols; if an
@@ -211,8 +277,10 @@ to Tier 3 with the gate name in the demotion note.
 The classification produces an in-memory list (or a temp JSON file) of:
 ```
 { "number": <N>, "title": "...", "tier": 1-4, "gates": "....",
-  "rationale": "...", "competing_pr": <N or null>, "labels": [...],
-  "assignee": "..." }
+  "rationale": "...", "competing_pr": <N or null>,
+  "coverage_basis": "closing-keyword" | "model-verdict" | "no-coverage-evidence",
+  "coverage_evidence": ["<verbatim PR-body span>", ...],
+  "labels": [...], "assignee": "..." }
 ```
 
 Cap the report at LIMIT issues per tier, sorted within each tier by:
@@ -285,6 +353,15 @@ For each issue:
 For each issue:
 ### #<N> <title>
 - Skip reason: assigned to <user> | covered by PR #<M> | label:wontfix | etc.
+- Coverage basis: closing-keyword | model-verdict   (only when skipped as covered)
+- Coverage evidence: <the verbatim PR-body span the verdict cited>
+
+The basis and evidence lines are not optional on a covered skip. This report is
+the only durable artifact — `/tmp/triage-classified.json` dies with the polecat
+worktree — so a reader who cannot see the basis cannot tell a safe
+`closing-keyword` skip from a `model-verdict` judgment call without re-running
+the whole triage. A false Tier 4 silently buries real work; showing the evidence
+is what makes that reviewable.
 
 ## Recommended next pick
 
