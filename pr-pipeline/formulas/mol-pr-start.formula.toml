@@ -106,6 +106,7 @@ DEFAULT_BRANCH=$(gh repo view "$REPO" --json defaultBranchRef \\
     -q .defaultBranchRef.name)
 
 CANDIDATE_PRS=$(gh pr list --repo "$REPO" --state open --search "{{issue}}" \\
+    --limit 1000 \\
     --json number,title,body,author,createdAt,baseRefName)
 
 ISSUE_STATE=$(gh issue view {{issue}} --repo "$REPO" --json state -q .state)
@@ -116,6 +117,12 @@ anywhere in any open PR — a References/Related footer, a diff snippet, a line
 number, a byte count. It proves a PR's text CONTAINS the number, nothing more.
 `body` and `baseRefName` are not optional; Phase 2 cannot be decided without
 them.
+
+`--limit 1000` is not padding. `gh pr list` silently caps at 30, and this
+search is untyped, so a common number can easily return more than 30 incidental
+hits — a byte count here, a line number there. The genuinely covering PR is
+then truncated away, Phase 2 never sees it, and the gate passes an issue that
+IS being fixed. Fetch the whole practical result set and let Phase 2 decide.
 
 **Phase 2 — coverage decision (run per candidate PR; a candidate covers
 {{issue}} on exactly one of these two branches):**
@@ -139,9 +146,12 @@ them.
     "evidence": ["<span quoted verbatim from the PR body>", ...],
     "reasoning": "<why the change does or does not resolve the issue>" }
   ```
-  Every `evidence` span MUST be copied verbatim from the PR body. A covering
-  verdict that cites nothing, or cites a span absent from the body, is invalid —
-  discard it and treat that candidate as non-covering. Record
+  Every `evidence` span MUST be copied verbatim from the PR body, and must be
+  substantial enough to be evidence: at least 12 characters and at least 2
+  words after trimming. Without that floor a single "." is quoted from every
+  body and the provenance check is vacuous. A covering verdict that cites
+  nothing, cites a span absent from the body, or cites a span below the floor
+  is invalid — discard it and treat that candidate as non-covering. Record
   `coverage_basis: model-verdict`.
 
 Within the verdict branch, an explicit scope disclaimer is evidence AGAINST
@@ -163,7 +173,19 @@ is ambiguous; it is the tiebreaker. Keep the prose and the harness in step when
 either changes — they are coupled by convention, not by execution.
 
 Phase 2 produces one entry per candidate you decided COVERS {{issue}} — an
-empty array when none does. Write it to `/tmp/pr-start-covering.json`:
+empty array when none does. Write it to a run-scoped artifact:
+
+```bash
+COVERING_JSON="/tmp/pr-start-covering-$ROOT_ID.json"
+```
+
+The `$ROOT_ID` in that name is load-bearing. Several polecats share this
+machine and run this formula concurrently, so a fixed `/tmp` path is one
+run reading another run's verdicts: a stale covering entry from a neighbour
+blocks an issue nobody is fixing, and a neighbour's empty array passes one
+somebody is. Scope the path, and never hardcode the unscoped name.
+
+Write this shape to `$COVERING_JSON`:
 
 ```
 [ { "number": <N>,
@@ -172,11 +194,16 @@ empty array when none does. Write it to `/tmp/pr-start-covering.json`:
 ```
 
 `coverage_evidence` is empty on the `closing-keyword` basis (the keyword IS the
-evidence) and required on `model-verdict`. Then:
+evidence) and required on `model-verdict`. Write it atomically — a partial read
+of a half-written array is a miscount, and this count decides whether the run
+lives:
 
 ```bash
-COVERING_PRS=$(jq -c '.' /tmp/pr-start-covering.json)
-COVERING_COUNT=$(jq 'length' /tmp/pr-start-covering.json)
+# ...write your Phase 2 result to "$COVERING_JSON.tmp" first...
+mv -f "$COVERING_JSON.tmp" "$COVERING_JSON"
+
+COVERING_PRS=$(jq -c '.' "$COVERING_JSON")
+COVERING_COUNT=$(jq 'length' "$COVERING_JSON")
 ```
 
 Count the entries; do not test the string. `[]` is a non-empty *string*, so a

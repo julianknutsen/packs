@@ -13,6 +13,7 @@ import pathlib
 import unittest
 from typing import ClassVar
 
+import coverage_contract
 from coverage_contract import (
     CandidateSignals,
     CompetingPrGate,
@@ -265,9 +266,6 @@ class FormulaContractTests(unittest.TestCase):
         # string: `[]` is non-empty as a string, which would block every run.
         self.assertIn("If `COVERING_COUNT` is greater than 0", self.text)
         self.assertNotIn("If `COVERING_PRS` is non-empty", self.text)
-        # ...and the count must come from the Phase 2 artifact, not be
-        # pre-seeded, or an agent that skipped Phase 2 would never block.
-        self.assertIn("/tmp/pr-start-covering.json", self.text)
 
     def test_discovery_is_stated_not_to_block(self) -> None:
         self.assertIn("it does NOT block", self.text)
@@ -308,6 +306,56 @@ class FormulaContractTests(unittest.TestCase):
 
     def test_prose_points_at_the_shared_harness(self) -> None:
         self.assertIn("pr-pipeline/tests/coverage_contract.py", self.text)
+
+    def test_discovery_overrides_ghs_default_result_cap(self) -> None:
+        # `gh pr list` silently caps at 30. The search is untyped, so a common
+        # number can return more incidental hits than that and truncate the one
+        # PR that actually covers the issue — Phase 2 would never see it and the
+        # gate would pass an issue that IS being fixed.
+        #
+        # Asserted against the whole discovery invocation, not a bare
+        # "--limit 1000" substring: the paragraph below the command explains the
+        # flag by name, so a loose check stays green even after the flag is
+        # dropped from the command itself. Verified by deleting the flag.
+        self.assertIn(
+            'CANDIDATE_PRS=$(gh pr list --repo "$REPO" --state open '
+            '--search "{{issue}}" \\\\ --limit 1000 \\\\ '
+            "--json number,title,body,author,createdAt,baseRefName)",
+            self.text,
+        )
+        self.assertIn("silently caps at 30", self.text)
+
+    def test_the_phase_two_artifact_path_is_run_scoped(self) -> None:
+        # Concurrent polecats share /tmp on this machine. An unscoped path lets
+        # one run read another's verdicts, which fabricates both a false block
+        # and a false pass depending on whose file wins.
+        self.assertIn('COVERING_JSON="/tmp/pr-start-covering-$ROOT_ID.json"', self.text)
+        # Every read must go through the scoped variable, so no bare unscoped
+        # filename may survive anywhere in the prose.
+        self.assertNotIn("/tmp/pr-start-covering.json", self.text)
+
+    def test_the_phase_two_artifact_is_written_atomically(self) -> None:
+        self.assertIn('mv -f "$COVERING_JSON.tmp" "$COVERING_JSON"', self.text)
+
+    def test_the_stop_condition_reads_the_scoped_artifact(self) -> None:
+        for command in (
+            "COVERING_PRS=$(jq -c '.' \"$COVERING_JSON\")",
+            "COVERING_COUNT=$(jq 'length' \"$COVERING_JSON\")",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, self.text)
+
+    def test_prose_mirrors_the_validators_evidence_floor(self) -> None:
+        # The prose claims to state exactly the rules coverage_contract.py
+        # enforces. That claim is only true while these numbers agree, and an
+        # agent following prose that omits the floor would emit citations the
+        # validator rejects. Read from the module so a change to either side
+        # fails here rather than drifting silently.
+        self.assertIn(
+            f"at least {coverage_contract._MIN_EVIDENCE_CHARS} characters and at least "
+            f"{coverage_contract._MIN_EVIDENCE_WORDS} words",
+            self.text,
+        )
 
 
 class ChainedFormulaContractTests(unittest.TestCase):
