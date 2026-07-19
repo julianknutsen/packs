@@ -130,8 +130,15 @@ Follow mol-pr-start's six step bodies in order (copy-with-prune from
 
   b. **gates** — Two BLOCKING gates. Either fires → halt the chain:
 
-     - **Gate 1 (Competing PR)**: any open PR already addresses this
-       issue, OR `gh issue view {{issue_number}} --json state` is `CLOSED`.
+     - **Gate 1 (Competing PR)**: an open PR is shown to COVER this issue
+       by mol-pr-start's two-phase decision, OR `gh issue view
+       {{issue_number}} --json state` is `CLOSED`. Run both phases as
+       written there — `gh pr list --search` only nominates candidates, and
+       a bare mention is never coverage. A candidate covers the issue only
+       on a closing keyword bound to it (on a default-branch PR) or a
+       schema-valid model verdict citing the PR body verbatim. Candidates
+       that merely mention the issue are recorded as context and the chain
+       CONTINUES: a false block here kills the whole authoring run.
      - **Gate 2 (Architectural refactor)**: active design docs marked
        Accepted/Implementing, open consolidation PRs from maintainers,
        or recent supersedes-pattern PRs in the area.

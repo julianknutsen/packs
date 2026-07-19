@@ -1,6 +1,11 @@
-"""Executable model of mol-pr-triage's PR-coverage decision procedure.
+"""Executable model of the pr-pipeline PR-coverage decision procedure.
 
-The formula prose is the contract a triage agent follows. This module makes the
+Two formulas ask the same question of the same evidence and must not answer it
+differently: `mol-pr-triage` demotes an issue to Tier 4 when an open PR covers
+it, and `mol-pr-start`'s Gate 1 blocks an authoring run for the same reason
+(`mol-pr-from-issue` chains that gate). One procedure, modelled once here.
+
+The formula prose is the contract those agents follow. This module makes the
 mechanical half of that contract executable, so the decision can be regression-
 tested against real PR bodies instead of grepped for in formula prose.
 
@@ -24,6 +29,7 @@ model, not here.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -274,3 +280,66 @@ def decide_coverage(
         return CoverageDecision(False, CoverageBasis.INVALID_VERDICT, signals, ())
 
     return CoverageDecision(checked.covers, CoverageBasis.MODEL_VERDICT, signals, checked.evidence)
+
+
+@dataclass(frozen=True)
+class GateCandidate:
+    """One open PR nominated by discovery, with what the decision needs.
+
+    Nomination is `gh pr list --search "<num>"`, an untyped full-text query. A
+    candidate is a PR whose text contains the digits somewhere — that and no
+    more, which is precisely why it is a separate type from a decision.
+    """
+
+    number: int
+    body: str
+    targets_default_branch: bool = True
+    # A shared instance, safe only because CandidateSignals is frozen with bool
+    # fields. Give it a mutable field, or drop frozen=True, and this silently
+    # becomes the classic shared-default bug with no static warning.
+    signals: CandidateSignals = CandidateSignals()
+    verdict: Any | None = None
+
+
+@dataclass(frozen=True)
+class CompetingPrGate:
+    """The competing-PR gate's outcome over a whole candidate set.
+
+    `mentions` is not noise to drop. A gate that passes silently is
+    indistinguishable from one that never ran, so the candidates that were
+    checked and found non-covering are carried out for the caller to report.
+    """
+
+    blocking: tuple[tuple[int, CoverageDecision], ...] = ()
+    mentions: tuple[tuple[int, CoverageDecision], ...] = ()
+
+    @property
+    def blocked(self) -> bool:
+        return bool(self.blocking)
+
+
+def decide_competing_pr_gate(
+    issue: int, candidates: Sequence[GateCandidate], repo: str | None = None
+) -> CompetingPrGate:
+    """Decide whether any candidate PR covers `issue`, and so blocks authoring.
+
+    Only a covering PR may block; every other candidate is context. Each
+    candidate is judged by `decide_coverage`, so this adds an aggregation rule
+    and no second decision procedure — the drift the design forbids.
+    """
+    blocking: list[tuple[int, CoverageDecision]] = []
+    mentions: list[tuple[int, CoverageDecision]] = []
+    for candidate in candidates:
+        decision = decide_coverage(
+            issue,
+            candidate.body,
+            candidate.signals,
+            verdict=candidate.verdict,
+            repo=repo,
+            targets_default_branch=candidate.targets_default_branch,
+        )
+        if decision.covered:
+            blocking.append((candidate.number, decision))
+        else:
+            mentions.append((candidate.number, decision))
+    return CompetingPrGate(tuple(blocking), tuple(mentions))
