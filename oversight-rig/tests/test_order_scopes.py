@@ -115,8 +115,15 @@ def write_order_scope_city(root: Path) -> Path:
     return city
 
 
-def scoped_names(orders: list[dict[str, object]], name: str) -> set[str]:
-    return {str(order["scoped_name"]) for order in orders if order.get("name") == name}
+def order_identities(
+    orders: list[dict[str, object]],
+    name: str,
+) -> list[tuple[str, object, str]]:
+    return [
+        (str(order["name"]), order.get("rig"), str(order["scoped_name"]))
+        for order in orders
+        if order.get("name") == name
+    ]
 
 
 def test_oversight_orders_preserve_declared_scope_across_rig_imports(
@@ -136,15 +143,17 @@ def test_oversight_orders_preserve_declared_scope_across_rig_imports(
 
     assert result.returncode == 0, result.stderr
     orders = json.loads(result.stdout)["orders"]
-    assert scoped_names(orders, "patrol-project-leads") == {
-        "patrol-project-leads",
-    }
-    assert scoped_names(orders, "escalate-rollups") == {
-        "escalate-rollups",
-        "escalate-rollups:rig:alpha",
-        "escalate-rollups:rig:beta",
-    }
-    assert scoped_names(orders, "rig-health") == {
-        "rig-health:rig:alpha",
-        "rig-health:rig:beta",
-    }
+    patrol = order_identities(orders, "patrol-project-leads")
+    assert len(patrol) == 1
+    assert patrol == [
+        ("patrol-project-leads", None, "patrol-project-leads"),
+    ]
+    assert order_identities(orders, "escalate-rollups") == [
+        ("escalate-rollups", None, "escalate-rollups"),
+        ("escalate-rollups", "alpha", "escalate-rollups:rig:alpha"),
+        ("escalate-rollups", "beta", "escalate-rollups:rig:beta"),
+    ]
+    assert order_identities(orders, "rig-health") == [
+        ("rig-health", "alpha", "rig-health:rig:alpha"),
+        ("rig-health", "beta", "rig-health:rig:beta"),
+    ]
