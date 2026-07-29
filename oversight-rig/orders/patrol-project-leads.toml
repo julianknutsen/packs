@@ -1,5 +1,6 @@
 [order]
 description = "Nudge every project-lead to run a triage tick. Cooldown sets the cadence."
+scope = "city"
 trigger = "cooldown"
 interval = "15m"
 exec = "bash $GC_PACK_DIR/assets/scripts/nudge-project-leads.sh"
