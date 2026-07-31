@@ -44,8 +44,9 @@ if [ -z "$BEAD_ID" ]; then
 fi
 
 GC_ERR="$(mktemp)"
+trap 'rm -f "$GC_ERR"' EXIT
 BEAD_JSON=$(gc bd show "$BEAD_ID" --json 2>"$GC_ERR") || {
-    echo "ERROR: gc bd show $BEAD_ID failed: $(head -c 400 "$GC_ERR" | tr '\n' ' ')" >&2
+    echo "ERROR: gc bd show $BEAD_ID failed: $(tail -c 400 "$GC_ERR" | tr '\n' ' ')" >&2
     exit 1
 }
 ROOT_ID=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.root_bead_id"] // "") else (.metadata["gc.root_bead_id"] // "") end')

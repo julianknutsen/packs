@@ -50,8 +50,9 @@ print(value if isinstance(value, str) else "")
 }
 
 GC_ERR="$(mktemp)"
+trap 'rm -f "$GC_ERR"' EXIT
 SHOW_JSON="$(gc bd show "$BEAD_ID" --json 2>"$GC_ERR")" \
-  || fail "gc bd show $BEAD_ID failed: $(head -c 400 "$GC_ERR" | tr '\n' ' ')"
+  || fail "gc bd show $BEAD_ID failed: $(tail -c 400 "$GC_ERR" | tr '\n' ' ')"
 
 SCHEMA="$(metadata_value "$SHOW_JSON" "gc.build.artifact_schema")"
 PATH_KEYS="$(metadata_value "$SHOW_JSON" "gc.build.artifact_path_keys")"
@@ -62,7 +63,7 @@ ROOT_ID="$(metadata_value "$SHOW_JSON" "gc.root_bead_id")"
 ROOT_JSON="$SHOW_JSON"
 if [ -n "$ROOT_ID" ] && [ "$ROOT_ID" != "$BEAD_ID" ]; then
   ROOT_JSON="$(gc bd show "$ROOT_ID" --json 2>"$GC_ERR")" \
-    || fail "gc bd show $ROOT_ID failed: $(head -c 400 "$GC_ERR" | tr '\n' ' ')"
+    || fail "gc bd show $ROOT_ID failed: $(tail -c 400 "$GC_ERR" | tr '\n' ' ')"
 fi
 
 ARTIFACT_PATH=""
