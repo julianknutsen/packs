@@ -90,14 +90,17 @@ is_approved() {
   return 1
 }
 
-ROOT_JSON="$(gc bd show "$ROOT_ID" --json 2>/dev/null || true)"
+GC_ERR="$(mktemp)"
+ROOT_JSON="$(gc bd show "$ROOT_ID" --json 2>"$GC_ERR" || true)"
+[ -n "$ROOT_JSON" ] || echo "review check: note: gc bd show $ROOT_ID failed: $(head -c 400 "$GC_ERR" | tr '\n' ' ')" >&2
 PARENT_ROOT="$(metadata_value "$ROOT_JSON" "gc.root_bead_id")"
 if [ -z "$PARENT_ROOT" ]; then
   PARENT_ROOT="$ROOT_ID"
 fi
 PARENT_JSON="$ROOT_JSON"
 if [ "$PARENT_ROOT" != "$ROOT_ID" ]; then
-  PARENT_JSON="$(gc bd show "$PARENT_ROOT" --json 2>/dev/null || true)"
+  PARENT_JSON="$(gc bd show "$PARENT_ROOT" --json 2>"$GC_ERR" || true)"
+  [ -n "$PARENT_JSON" ] || echo "review check: note: gc bd show $PARENT_ROOT failed: $(head -c 400 "$GC_ERR" | tr '\n' ' ')" >&2
 fi
 STEP_ID="$(metadata_value "$ROOT_JSON" "gc.step_id")"
 SCOPE_REF="$(metadata_value "$ROOT_JSON" "gc.scope_ref")"

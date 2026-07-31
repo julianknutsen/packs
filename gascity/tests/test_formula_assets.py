@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -5972,6 +5973,64 @@ description = "Override sink that writes the base triage report contract."
             write_report_step["expand_vars"]["artifact_path_keys"],
             artifact_keys,
         )
+
+
+    def test_build_artifact_check_failure_surfaces_gc_bd_stderr(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "build-artifact-valid.sh"
+        jq_dir = pathlib.Path(shutil.which("jq") or "/usr/bin/jq").parent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "echo 'IMPORT_LOCKED_NOT_CACHED run gc import install' >&2\n"
+                "exit 3\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "bd-err",
+                "PATH": f"{bin_dir}:{jq_dir}:/usr/bin:/bin",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gc bd show bd-err failed", result.stderr)
+        self.assertIn("IMPORT_LOCKED_NOT_CACHED", result.stderr)
+
+    def test_implementation_review_check_notes_gc_bd_stderr_on_tolerant_paths(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "implementation-review-approved.sh"
+        jq_dir = pathlib.Path(shutil.which("jq") or "/usr/bin/jq").parent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "echo 'STORE_UNAVAILABLE backing store offline' >&2\n"
+                "exit 3\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "root-err",
+                "GC_ITERATION": "1",
+                "PATH": f"{bin_dir}:{jq_dir}:/usr/bin:/bin",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        # Tolerant sites keep their fallbacks (the gate still iterates rather
+        # than crashing), but the attempt log now carries the real error.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("review check: note: gc bd show root-err failed", result.stderr)
+        self.assertIn("STORE_UNAVAILABLE", result.stderr)
 
 
 if __name__ == "__main__":

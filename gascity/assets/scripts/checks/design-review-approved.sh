@@ -43,7 +43,11 @@ if [ -z "$BEAD_ID" ]; then
     exit 1
 fi
 
-BEAD_JSON=$(gc bd show "$BEAD_ID" --json 2>/dev/null)
+GC_ERR="$(mktemp)"
+BEAD_JSON=$(gc bd show "$BEAD_ID" --json 2>"$GC_ERR") || {
+    echo "ERROR: gc bd show $BEAD_ID failed: $(head -c 400 "$GC_ERR" | tr '\n' ' ')" >&2
+    exit 1
+}
 ROOT_ID=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.root_bead_id"] // "") else (.metadata["gc.root_bead_id"] // "") end')
 ATTEMPT=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.attempt"] // "") else (.metadata["gc.attempt"] // "") end')
 SCOPE_REF=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.scope_ref"] // .[0].metadata["gc.step_ref"] // "") else (.metadata["gc.scope_ref"] // .metadata["gc.step_ref"] // "") end')
