@@ -422,7 +422,7 @@ class DiscordChatScriptTests(unittest.TestCase):
                 code = reply_current_script.main(["--body-file", str(body_file)])
 
         self.assertEqual(code, 0)
-        create_thread_from_message.assert_called_once_with("22", "orig-22", "sky")
+        create_thread_from_message.assert_called_once_with("22", "orig-22", "corp/sky")
         post_channel_message.assert_called_once_with("333", "safe reply", reply_to_message_id="")
         payload = common.json.loads(stdout.getvalue())
         self.assertEqual(payload["record"]["conversation_id"], "333")
@@ -462,7 +462,7 @@ class DiscordChatScriptTests(unittest.TestCase):
                 )
 
         self.assertEqual(code, 0)
-        create_thread_from_message.assert_called_once_with("22", "orig-29", "sky")
+        create_thread_from_message.assert_called_once_with("22", "orig-29", "corp/sky")
         post_channel_message.assert_called_once_with("444", "hello launcher", reply_to_message_id="")
         payload = common.json.loads(stdout.getvalue())
         self.assertEqual(payload["record"]["launch_id"], "room-launch:orig-29")

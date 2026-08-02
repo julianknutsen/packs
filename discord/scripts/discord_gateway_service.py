@@ -90,6 +90,20 @@ def participant_delivery_selector(participant: dict[str, Any]) -> str:
     return ""
 
 
+def participant_target_identity(participant: dict[str, Any]) -> dict[str, str]:
+    """Build the identity dict written into ingress receipt `targets` entries.
+    Including every known identifier lets find_latest_discord_reply_context /
+    reply-current match by whichever selector (id, name, alias) the caller
+    presents from GC_SESSION_* env vars.
+    """
+    fields: dict[str, str] = {}
+    for key in ("session_name", "session_id", "session_alias"):
+        value = str((participant or {}).get(key, "")).strip()
+        if value:
+            fields[key] = value
+    return fields
+
+
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
     body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     handler.send_response(status)
@@ -695,6 +709,26 @@ def bound_room_claims_message(
     parent = str(parent_id).strip()
     if parent and explicit_room_binding(config, parent, app_name):
         return True
+    return False
+
+
+def launcher_claims_message(config: dict[str, Any], channel_id: str, parent_id: str = "") -> bool:
+    """True if this message belongs to launcher-managed routing: the message
+    is in a configured launcher room OR is inside a launcher-managed thread
+    (parent is a launcher OR channel_id matches a room_launch thread_id).
+    Extmsg's generic thread handler must skip these so the launcher pack's
+    process_room_launch_thread_message can run.
+    """
+    channel = str(channel_id).strip()
+    parent = str(parent_id).strip()
+    if channel and common.resolve_room_launcher(config, channel):
+        return True
+    if parent and common.resolve_room_launcher(config, parent):
+        return True
+    if channel:
+        launch = common.load_room_launch(common.room_launch_record_id(channel))
+        if launch and str(launch.get("thread_id", "")).strip() == channel:
+            return True
     return False
 
 
@@ -1388,7 +1422,27 @@ def process_room_launch_message(
             return {"status": "ignored_untargeted", "ingress_id": ingress_id, "receipt": receipt}
         used_default_handle = True
 
-    if used_default_handle:
+    # Attach-first: if the handle matches an already-running session
+    # (by alias/session_name/id), route to that session directly instead
+    # of resolving as a template + spawning a fresh clone.
+    attached_identity: dict[str, str] = {}
+    try:
+        attached_identity = common.resolve_existing_session_for_handle(requested_handle)
+    except common.GCAPIError as exc:
+        receipt = persist_ingress_receipt(
+            {
+                **base_receipt,
+                "binding_id": str(launcher.get("id", "")).strip(),
+                "status": "failed_lookup",
+                "reason": str(exc),
+                "targets": [],
+            }
+        )
+        return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
+
+    if attached_identity:
+        qualified_handle, resolve_error = requested_handle, ""
+    elif used_default_handle:
         qualified_handle, resolve_error = requested_handle, ""
     else:
         try:
@@ -1442,7 +1496,7 @@ def process_room_launch_message(
         }
     )
     try:
-        launch = common.ensure_room_launch_session(launch)
+        launch = common.ensure_room_launch_session(launch, attached_identity=attached_identity or None)
     except (ValueError, common.GCAPIError) as exc:
         receipt = persist_ingress_receipt(
             {
@@ -1457,6 +1511,7 @@ def process_room_launch_message(
         return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
 
     target_selector = participant_delivery_selector(launch)
+    target_identity = participant_target_identity(launch)
     envelope = build_room_launch_envelope(
         launcher=launcher,
         launch=launch,
@@ -1479,6 +1534,7 @@ def process_room_launch_message(
             "qualified_handle": qualified_handle,
             "targets": [
                 {
+                    **target_identity,
                     "session_name": target_selector,
                     "status": "pending",
                     "intent": "default",
@@ -1538,9 +1594,10 @@ def process_room_launch_thread_message(
         return {"status": "rejected_targeting", "ingress_id": ingress_id, "receipt": receipt}
     target_handle = ""
     routing_mode = ""
+    thread_attached_identity: dict[str, str] = {}
     if mentioned_handles:
         try:
-            qualified_handle, resolve_error = common.resolve_agent_handle(mentioned_handles[0])
+            thread_attached_identity = common.resolve_existing_session_for_handle(mentioned_handles[0])
         except common.GCAPIError as exc:
             receipt = persist_ingress_receipt(
                 {
@@ -1552,20 +1609,37 @@ def process_room_launch_thread_message(
                 }
             )
             return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
-        if resolve_error:
-            receipt = persist_ingress_receipt(
-                {
-                    **base_receipt,
-                    "binding_id": str(launcher.get("id", "")).strip(),
-                    "status": "rejected_targeting",
-                    "reason": resolve_error,
-                    "mentioned_handles": mentioned_handles,
-                    "targets": [],
-                }
-            )
-            return {"status": "rejected_targeting", "ingress_id": ingress_id, "receipt": receipt}
-        target_handle = qualified_handle
-        routing_mode = "explicit_handle"
+        if thread_attached_identity:
+            target_handle = mentioned_handles[0]
+            routing_mode = "explicit_handle_attached"
+        else:
+            try:
+                qualified_handle, resolve_error = common.resolve_agent_handle(mentioned_handles[0])
+            except common.GCAPIError as exc:
+                receipt = persist_ingress_receipt(
+                    {
+                        **base_receipt,
+                        "binding_id": str(launcher.get("id", "")).strip(),
+                        "status": "failed_lookup",
+                        "reason": str(exc),
+                        "targets": [],
+                    }
+                )
+                return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
+            if resolve_error:
+                receipt = persist_ingress_receipt(
+                    {
+                        **base_receipt,
+                        "binding_id": str(launcher.get("id", "")).strip(),
+                        "status": "rejected_targeting",
+                        "reason": resolve_error,
+                        "mentioned_handles": mentioned_handles,
+                        "targets": [],
+                    }
+                )
+                return {"status": "rejected_targeting", "ingress_id": ingress_id, "receipt": receipt}
+            target_handle = qualified_handle
+            routing_mode = "explicit_handle"
     if not target_handle and reply_to_id:
         target_handle = common.room_launch_message_target_handle(launch, reply_to_id)
         if target_handle:
@@ -1590,7 +1664,11 @@ def process_room_launch_thread_message(
         )
         return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
     try:
-        launch, target_participant = common.ensure_room_launch_session_for_handle(launch, target_handle)
+        launch, target_participant = common.ensure_room_launch_session_for_handle(
+            launch,
+            target_handle,
+            attached_identity=thread_attached_identity or None,
+        )
     except (ValueError, common.GCAPIError) as exc:
         receipt = persist_ingress_receipt(
             {
@@ -1603,6 +1681,7 @@ def process_room_launch_thread_message(
         )
         return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
     target_selector = participant_delivery_selector(target_participant)
+    target_identity = participant_target_identity(target_participant)
 
     envelope = build_room_launch_thread_envelope(
         launcher=launcher,
@@ -1630,6 +1709,7 @@ def process_room_launch_thread_message(
             "qualified_handle": target_handle,
             "targets": [
                 {
+                    **target_identity,
                     "session_name": target_selector,
                     "status": "pending",
                     "intent": "default",
@@ -2481,7 +2561,10 @@ class GatewayWorker:
             # Explicit room bindings take precedence over generic extmsg
             # mention/thread launching. This keeps sticky bound rooms, and
             # their inherited thread routing, from spawning new sessions.
-            if guild_id and channel_id and bound_room_claims_message(config, channel_id, parent_id):
+            if guild_id and channel_id and (
+                bound_room_claims_message(config, channel_id, parent_id)
+                or launcher_claims_message(config, channel_id, parent_id)
+            ):
                 return False
 
             # ROOM: @mentions required to launch a new thread.
