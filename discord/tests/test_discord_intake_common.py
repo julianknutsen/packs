@@ -1960,6 +1960,108 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             identity = common.resolve_existing_session_for_handle("nope")
         self.assertEqual(identity, {})
 
+    def test_resolve_existing_session_for_handle_matches_rig_prefixed_alias(self) -> None:
+        # A rig-scoped named session ("fattony" on rig "daytripper" from pack
+        # "gasburger") lands with alias "daytripper/gasburger.fattony". User
+        # types @@daytripper/fattony; suffix match should route to it.
+        sessions = [
+            {"id": "bo-9", "alias": "daytripper/gasburger.fattony",
+             "session_name": "s-bo-9", "state": "active", "running": True},
+        ]
+        with mock.patch.object(common, "list_city_sessions", return_value=sessions):
+            identity = common.resolve_existing_session_for_handle("daytripper/fattony")
+        self.assertEqual(identity["alias"], "daytripper/gasburger.fattony")
+
+    def test_resolve_existing_session_for_handle_rig_alias_stays_scoped_to_rig(self) -> None:
+        # Same-name session under a different rig must NOT match — cross-rig
+        # collision would be a routing bug.
+        sessions = [
+            {"id": "bo-1", "alias": "docbook/gasburger.fattony",
+             "session_name": "s-bo-1", "state": "active", "running": True},
+        ]
+        with mock.patch.object(common, "list_city_sessions", return_value=sessions):
+            identity = common.resolve_existing_session_for_handle("daytripper/fattony")
+        self.assertEqual(identity, {})
+
+    def test_resolve_named_session_for_handle_matches_rig_scoped_named_session(self) -> None:
+        with mock.patch.object(common, "load_city_toml", return_value={
+            "named_session": [
+                {"template": "gasburger.crew", "scope": "rig",
+                 "dir": "daytripper", "name": "fattony", "mode": "on_demand"},
+            ],
+        }):
+            ref = common.resolve_named_session_for_handle("daytripper/fattony")
+        self.assertEqual(ref["template"], "gasburger.crew")
+        self.assertEqual(ref["alias"], "fattony")
+        self.assertEqual(ref["spawn_template"], "daytripper/gasburger.crew")
+        self.assertEqual(ref["scope"], "rig")
+        self.assertEqual(ref["dir"], "daytripper")
+
+    def test_resolve_named_session_for_handle_case_insensitive(self) -> None:
+        with mock.patch.object(common, "load_city_toml", return_value={
+            "named_session": [
+                {"template": "gasburger.crew", "scope": "rig",
+                 "dir": "docbook", "name": "meltron"},
+            ],
+        }):
+            ref = common.resolve_named_session_for_handle("Docbook/Meltron")
+        self.assertEqual(ref["alias"], "meltron")
+
+    def test_resolve_named_session_for_handle_returns_empty_when_no_match(self) -> None:
+        with mock.patch.object(common, "load_city_toml", return_value={
+            "named_session": [
+                {"template": "gasburger.crew", "scope": "rig",
+                 "dir": "daytripper", "name": "fattony"},
+            ],
+        }):
+            ref = common.resolve_named_session_for_handle("daytripper/nobody")
+        self.assertEqual(ref, {})
+
+    def test_resolve_named_session_for_handle_swallows_toml_errors(self) -> None:
+        with mock.patch.object(common, "load_city_toml",
+                               side_effect=common.GCAPIError("boom")):
+            ref = common.resolve_named_session_for_handle("anything")
+        self.assertEqual(ref, {})
+
+    def test_ensure_room_launch_session_spawns_named_session_with_alias(self) -> None:
+        # For a named-session launch, we spawn via the qualified template
+        # (e.g. daytripper/gasburger.crew) but with the declared alias
+        # (fattony) so the session is discoverable next turn.
+        launch = {
+            "launch_id": "room-launch:named",
+            "qualified_handle": "daytripper/fattony",
+            "session_alias": "fattony",
+            "guild_id": "g1",
+            "conversation_id": "c1",
+            "root_message_id": "m1",
+            "from_display": "thunderchief",
+        }
+        sessions_after = [
+            {"id": "bo-9", "alias": "daytripper/gasburger.fattony",
+             "session_name": "s-bo-9", "template": "daytripper/gasburger.crew",
+             "state": "active", "running": True},
+        ]
+        with mock.patch.object(
+            common, "list_city_sessions", return_value=sessions_after,
+        ), mock.patch.object(
+            common, "create_agent_session", return_value={},
+        ) as create_agent_session, mock.patch.object(
+            common, "deliver_session_message", return_value={"status": "accepted"},
+        ), mock.patch.object(common.time, "sleep"):
+            current = common.ensure_room_launch_session(
+                launch,
+                spawn_template_override="daytripper/gasburger.crew",
+                session_alias_override="fattony",
+            )
+
+        create_agent_session.assert_called_once()
+        call_args = create_agent_session.call_args
+        self.assertEqual(call_args.args[0], "daytripper/gasburger.crew")
+        self.assertEqual(call_args.kwargs["alias"], "fattony")
+        self.assertEqual(current["session_id"], "bo-9")
+        self.assertEqual(current["session_name"], "s-bo-9")
+        self.assertEqual(current["session_alias"], "daytripper/gasburger.fattony")
+
     def test_ensure_room_launch_session_attaches_without_creating(self) -> None:
         launch = {
             "launch_id": "room-launch:attach",

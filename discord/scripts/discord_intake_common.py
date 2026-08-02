@@ -3461,14 +3461,25 @@ def resolve_existing_session_for_handle(handle: str) -> dict[str, str]:
     that matches `handle` by alias, session_name, or id. Case-insensitive.
     Returns {} if none matches. This is what lets @@handle target an
     already-running session instead of spawning a new one from a template.
+
+    Also matches rig-prefixed aliases produced by rig-scoped named sessions:
+    when the user types @@daytripper/fattony, this matches sessions whose
+    stored alias is daytripper/gasburger.fattony (rig + pack + name). The
+    match requires the alias to sit under the same rig prefix so a bare
+    tail cannot cross rigs.
     """
     normalized = str(handle).strip()
     if not normalized:
         return {}
     key = normalized.lower()
+    rig_prefix = ""
+    tail = key
+    if "/" in key:
+        rig_prefix, tail = key.split("/", 1)
     alias_match: dict[str, Any] | None = None
     name_match: dict[str, Any] | None = None
     id_match: dict[str, Any] | None = None
+    rig_alias_match: dict[str, Any] | None = None
     try:
         sessions = list_city_sessions(state="all")
     except GCAPIError:
@@ -3493,10 +3504,69 @@ def resolve_existing_session_for_handle(handle: str) -> dict[str, str]:
             id_match is None or _session_record_preference(item) > _session_record_preference(id_match)
         ):
             id_match = item
-    chosen = alias_match or name_match or id_match
+        if rig_prefix and tail and alias.startswith(rig_prefix + "/"):
+            alias_tail = alias.split("/", 1)[1]
+            if alias_tail == tail or alias_tail.endswith("." + tail):
+                if rig_alias_match is None or _session_record_preference(item) > _session_record_preference(rig_alias_match):
+                    rig_alias_match = item
+    chosen = alias_match or name_match or id_match or rig_alias_match
     if not chosen:
         return {}
     return _session_identity_fields(chosen)
+
+
+def resolve_named_session_for_handle(handle: str) -> dict[str, str]:
+    """Named-session launcher lookup: is `handle` a declared but not-yet-
+    running named session? Returns {qualified_handle, template, alias,
+    scope, dir, spawn_template} that the caller can use to spawn via
+    create_agent_session. Returns {} on no match. Best-effort: swallows
+    errors reading city.toml so the launcher stays usable.
+
+    Handle matches are case-insensitive. For scope=rig entries the handle
+    is <dir>/<name>; for scope=city it is <name>.
+
+    spawn_template is the value to pass as create_agent_session(name=...):
+    rig-scoped templates are qualified with the rig prefix (dir/template)
+    so the platform resolves the correct rig-instance of the template.
+    """
+    normalized = str(handle).strip()
+    if not normalized:
+        return {}
+    key = normalized.lower()
+    try:
+        city_cfg = load_city_toml()
+    except (GCAPIError, OSError):
+        return {}
+    entries = city_cfg.get("named_session")
+    if not isinstance(entries, list):
+        return {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        template = str(entry.get("template", "")).strip()
+        if not template:
+            continue
+        raw_name = str(entry.get("name", "")).strip()
+        scope = str(entry.get("scope", "")).strip().lower()
+        dir_name = str(entry.get("dir", "")).strip()
+        alias = raw_name or template.rsplit("/", 1)[-1]
+        if scope == "rig" and dir_name:
+            qualified = f"{dir_name}/{alias}".lower()
+            spawn_template = template if "/" in template else f"{dir_name}/{template}"
+        else:
+            qualified = alias.lower()
+            spawn_template = template
+        if qualified != key:
+            continue
+        return {
+            "qualified_handle": qualified,
+            "template": template,
+            "alias": alias,
+            "scope": scope,
+            "dir": dir_name,
+            "spawn_template": spawn_template,
+        }
+    return {}
 
 
 def resolve_agent_handle(handle: str) -> tuple[str, str]:
@@ -4073,6 +4143,8 @@ def ensure_room_launch_session_for_handle(
     title: str = "",
     initial_message: str = "",
     attached_identity: dict[str, str] | None = None,
+    spawn_template_override: str = "",
+    session_alias_override: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     launch_id = str(launch.get("launch_id", "")).strip()
     normalized_handle = str(qualified_handle).strip()
@@ -4084,8 +4156,12 @@ def ensure_room_launch_session_for_handle(
         participants = room_launch_participants(current)
         participant = copy.deepcopy(participants.get(normalized_handle, {}))
         created_new = False
+        # For named-session launches the caller supplies a stable alias
+        # (e.g. "fattony") so subsequent @@handle turns attach to the same
+        # session instead of spawning a fresh per-launch clone.
         session_alias = (
             str(participant.get("session_alias", "")).strip()
+            or str(session_alias_override).strip()
             or room_launch_session_alias(
                 str(current.get("guild_id", "")).strip(),
                 str(current.get("conversation_id", "")).strip(),
@@ -4093,6 +4169,7 @@ def ensure_room_launch_session_for_handle(
                 normalized_handle,
             )
         )
+        spawn_target = str(spawn_template_override).strip() or normalized_handle
         if attached_identity:
             # Attach mode: participant is an already-running session; skip
             # create + prime + poll. Trust the caller's resolved identity.
@@ -4125,7 +4202,7 @@ def ensure_room_launch_session_for_handle(
         else:
             created_new = True
             created = create_agent_session(
-                normalized_handle,
+                spawn_target,
                 alias=session_alias,
                 title=title or room_launch_thread_name(normalized_handle, str(current.get("from_display", "")).strip()),
                 initial_message=initial_message,
@@ -4162,9 +4239,10 @@ def ensure_room_launch_session_for_handle(
             # Async POST /v0/sessions returns no identity fields, and the
             # platform may store the alias under a pack-namespace prefix
             # (e.g. gasburger.dc-...). Fall back to a suffix match keyed by
-            # the unique sha digest baked into session_alias.
+            # the unique sha digest baked into session_alias, or by the
+            # supplied named-session alias for named-session launches.
             selector_snapshot, hydrated = resolve_launched_session_identity_eventually(
-                normalized_handle,
+                spawn_target,
                 session_alias,
             )
         if hydrated:
@@ -4204,7 +4282,7 @@ def ensure_room_launch_session_for_handle(
                 )
             if not ready_identity:
                 _ready_selector, ready_identity = resolve_launched_ready_session_identity_eventually(
-                    normalized_handle,
+                    spawn_target,
                     session_alias,
                 )
             if not ready_identity:
@@ -4243,6 +4321,8 @@ def ensure_room_launch_session(
     title: str = "",
     initial_message: str = "",
     attached_identity: dict[str, str] | None = None,
+    spawn_template_override: str = "",
+    session_alias_override: str = "",
 ) -> dict[str, Any]:
     qualified_handle = str(launch.get("qualified_handle", "")).strip()
     current, _participant = ensure_room_launch_session_for_handle(
@@ -4251,6 +4331,8 @@ def ensure_room_launch_session(
         title=title,
         initial_message=initial_message,
         attached_identity=attached_identity,
+        spawn_template_override=spawn_template_override,
+        session_alias_override=session_alias_override,
     )
     return current
 

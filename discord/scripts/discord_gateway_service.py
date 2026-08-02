@@ -1440,7 +1440,15 @@ def process_room_launch_message(
         )
         return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
 
-    if attached_identity:
+    # Named-session lookup: if the handle names a declared but not-yet-
+    # running named session (mode = "on_demand" crew, etc.), spawn it via
+    # its declared template + alias so this launch wakes it and future
+    # turns attach to the same instance.
+    named_session_ref: dict[str, str] = {}
+    if not attached_identity:
+        named_session_ref = common.resolve_named_session_for_handle(requested_handle)
+
+    if attached_identity or named_session_ref:
         qualified_handle, resolve_error = requested_handle, ""
     elif used_default_handle:
         qualified_handle, resolve_error = requested_handle, ""
@@ -1484,6 +1492,7 @@ def process_room_launch_message(
             "root_message_id": str(message.get("id", "")).strip(),
             "qualified_handle": qualified_handle,
             "session_alias": str(existing_launch.get("session_alias", "")).strip()
+            or (named_session_ref.get("alias", "") if named_session_ref else "")
             or common.room_launch_session_alias(
                 str(message.get("guild_id", "")).strip(),
                 str(message.get("channel_id", "")).strip(),
@@ -1496,7 +1505,12 @@ def process_room_launch_message(
         }
     )
     try:
-        launch = common.ensure_room_launch_session(launch, attached_identity=attached_identity or None)
+        launch = common.ensure_room_launch_session(
+            launch,
+            attached_identity=attached_identity or None,
+            spawn_template_override=(named_session_ref.get("spawn_template", "") if named_session_ref else ""),
+            session_alias_override=(named_session_ref.get("alias", "") if named_session_ref else ""),
+        )
     except (ValueError, common.GCAPIError) as exc:
         receipt = persist_ingress_receipt(
             {
@@ -1595,6 +1609,7 @@ def process_room_launch_thread_message(
     target_handle = ""
     routing_mode = ""
     thread_attached_identity: dict[str, str] = {}
+    thread_named_session_ref: dict[str, str] = {}
     if mentioned_handles:
         try:
             thread_attached_identity = common.resolve_existing_session_for_handle(mentioned_handles[0])
@@ -1613,33 +1628,38 @@ def process_room_launch_thread_message(
             target_handle = mentioned_handles[0]
             routing_mode = "explicit_handle_attached"
         else:
-            try:
-                qualified_handle, resolve_error = common.resolve_agent_handle(mentioned_handles[0])
-            except common.GCAPIError as exc:
-                receipt = persist_ingress_receipt(
-                    {
-                        **base_receipt,
-                        "binding_id": str(launcher.get("id", "")).strip(),
-                        "status": "failed_lookup",
-                        "reason": str(exc),
-                        "targets": [],
-                    }
-                )
-                return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
-            if resolve_error:
-                receipt = persist_ingress_receipt(
-                    {
-                        **base_receipt,
-                        "binding_id": str(launcher.get("id", "")).strip(),
-                        "status": "rejected_targeting",
-                        "reason": resolve_error,
-                        "mentioned_handles": mentioned_handles,
-                        "targets": [],
-                    }
-                )
-                return {"status": "rejected_targeting", "ingress_id": ingress_id, "receipt": receipt}
-            target_handle = qualified_handle
-            routing_mode = "explicit_handle"
+            thread_named_session_ref = common.resolve_named_session_for_handle(mentioned_handles[0])
+            if thread_named_session_ref:
+                target_handle = mentioned_handles[0]
+                routing_mode = "explicit_handle_named_session"
+            else:
+                try:
+                    qualified_handle, resolve_error = common.resolve_agent_handle(mentioned_handles[0])
+                except common.GCAPIError as exc:
+                    receipt = persist_ingress_receipt(
+                        {
+                            **base_receipt,
+                            "binding_id": str(launcher.get("id", "")).strip(),
+                            "status": "failed_lookup",
+                            "reason": str(exc),
+                            "targets": [],
+                        }
+                    )
+                    return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
+                if resolve_error:
+                    receipt = persist_ingress_receipt(
+                        {
+                            **base_receipt,
+                            "binding_id": str(launcher.get("id", "")).strip(),
+                            "status": "rejected_targeting",
+                            "reason": resolve_error,
+                            "mentioned_handles": mentioned_handles,
+                            "targets": [],
+                        }
+                    )
+                    return {"status": "rejected_targeting", "ingress_id": ingress_id, "receipt": receipt}
+                target_handle = qualified_handle
+                routing_mode = "explicit_handle"
     if not target_handle and reply_to_id:
         target_handle = common.room_launch_message_target_handle(launch, reply_to_id)
         if target_handle:
@@ -1668,6 +1688,8 @@ def process_room_launch_thread_message(
             launch,
             target_handle,
             attached_identity=thread_attached_identity or None,
+            spawn_template_override=(thread_named_session_ref.get("spawn_template", "") if thread_named_session_ref else ""),
+            session_alias_override=(thread_named_session_ref.get("alias", "") if thread_named_session_ref else ""),
         )
     except (ValueError, common.GCAPIError) as exc:
         receipt = persist_ingress_receipt(
