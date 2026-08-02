@@ -1,0 +1,196 @@
+description = """
+Boot patrol loop. Poured as a root-only wisp on startup:
+
+  gc bd mol wisp mol-boot-patrol --root-only --var binding_prefix='{{binding_prefix}}'
+  gc bd update $WISP --assignee=$GC_AGENT
+
+Each wisp is ONE iteration: observe the deacon, decide, act, pour the next
+iteration. On crash, re-read the formula steps and determine where you left
+off from context (wisp state, last action).
+
+Formula steps are NOT materialized as child beads. Read the step
+descriptions below and work through them in order.
+
+The loop mechanism: EVERY step is one leg of the same wisp. Never exit the
+wisp from an intermediate step — either continue to the next step or jump
+directly to `next-iteration` to pour and burn. Exiting without burning leaks
+wisps. The prompt only bootstraps the first wisp.
+
+## Boot Role
+
+Boot is the deacon watchdog. Each cycle answers one question: **is the deacon
+stuck?** The controller handles process liveness; boot judges work health from
+wisps, pane output, and mail.
+
+Narrow scope keeps each cycle cheap. Boot does not monitor witnesses,
+refineries, or polecats — the deacon and witnesses do that.
+
+## Why this is a patrol loop and not a single pass
+
+Boot backs a `mode = "always"` named session, which is *unconditionally
+desired*: the moment its provider session goes away, the controller
+re-materializes it. A single-pass agent that ends every wake with
+`gc runtime drain-ack` + `exit` therefore respawns immediately, with no
+cadence between wakes. Boot was shaped that way and hot-looped — ~500 fresh
+sessions/hr, ~2.4M output tokens in 5h, plus a per-second `bead.updated`
+flood on its own session bead — until it was drained (gci-fed).
+
+Every other always-mode agent (mayor, deacon, witness) avoids the trap the
+same way, and boot now matches them: run a patrol wisp, end the turn WITHOUT
+`drain-ack`, and let the agent's `idle_timeout` pace the recycle. Idle sleep
+does not apply here — always-mode named sessions are exempt from it — so
+`idle_timeout` is the *only* thing standing between this agent and a hot
+loop.
+
+**Do not re-introduce `gc runtime drain-ack` or `exit` into this loop.**
+
+Read each step's description before acting — Config values override defaults."""
+formula = "mol-boot-patrol"
+
+[vars]
+[vars.binding_prefix]
+description = "Import binding prefix for gastown agent identities, including trailing dot when bound."
+default = ""
+
+[[steps]]
+id = "check-deacon"
+title = "Observe the deacon and decide"
+description = """
+**1. Does the deacon session exist?**
+
+```bash
+gc session peek {{binding_prefix}}deacon --lines 1
+```
+
+If the deacon session does not exist, there is nothing to judge — the
+controller restarts dead agents. Skip straight to `next-iteration`.
+
+**2. Observe deacon state:**
+
+```bash
+# Recent pane output — is the deacon actively working?
+gc session peek {{binding_prefix}}deacon --lines 30
+
+# Deacon's current patrol wisp — how fresh is it?
+gc bd list --assignee={{binding_prefix}}deacon --status=in_progress --json --limit=5
+
+# Does the deacon have unread mail? (may explain idle state)
+gc mail count {{binding_prefix}}deacon 2>/dev/null
+```
+
+Read the wisp timestamps and pane output. Build a picture:
+- Recent burned wisp → normal patrol loop
+- Active pane output → working
+- Young in-progress wisp with idle pane → likely backoff wait
+- Very stale in-progress wisp with idle/error pane → likely stuck
+- Idle with unread mail → may need a nudge
+
+**3. Decide.**
+
+Use judgment; there are no hardcoded thresholds. Consider:
+- The deacon's exponential backoff caps at 300s between cycles
+- A stale wisp during a period with no active work is legitimate idle
+- Active output (tool calls, command execution) means the deacon is functioning
+- A pane showing an error message or hanging prompt is a red flag
+- Legitimate work can take several minutes
+
+| Observation | Verdict | Action |
+|-------------|---------|--------|
+| Active output in pane | Healthy | Do nothing |
+| Idle, young wisp | Backoff wait | Do nothing |
+| Idle with unread mail | Needs nudge | Nudge |
+| Stale wisp, no output, ambiguous | Possibly stuck | Nudge |
+| Very stale wisp, errors visible | Clearly stuck | File warrant |
+
+**Possibly stuck** — nudge once, then let the next cycle re-evaluate:
+
+```bash
+gc session nudge {{binding_prefix}}deacon "Boot check: are you making progress?"
+```
+
+**Clearly stuck** — file a warrant for the dog pool. Check for an existing
+open warrant against the same target first: a duplicate warrant spawns a
+second shutdown dance racing the first (duplicate kills, wasted dog cycles).
+
+```bash
+TARGET_SESSION="{{binding_prefix}}deacon"
+EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 \\
+  | jq -r --arg t "$TARGET_SESSION" \\
+      '[.[] | select((.status == "open" or .status == "in_progress") and (.metadata.target == $t))] | length')
+if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
+  echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
+else
+  gc bd create --type=task --labels=warrant \\
+    --title="Stuck: $TARGET_SESSION" \\
+    --metadata '{"target":"{{binding_prefix}}deacon","reason":"Stale patrol wisp, no activity","requester":"boot","gc.routed_to":"{{binding_prefix}}dog"}'
+fi
+```
+
+The dog pool picks up the warrant and runs `mol-shutdown-dance`.
+
+**What boot does NOT do:** kill or restart the deacon directly (file warrants
+— the dog pool handles due process), start the deacon if it is dead (the
+controller handles liveness), or monitor any other agent.
+
+**Exit criteria:** Deacon assessed; nudge or warrant issued if warranted.
+Continue to `next-iteration` — do NOT exit the wisp here. `next-iteration` is
+the only place that pours the next wisp and burns this one."""
+
+[[steps]]
+id = "next-iteration"
+title = "Pour next iteration and loop"
+needs = ["check-deacon"]
+description = """
+End of watchdog cycle. Pour the next iteration, burn this one, end the turn.
+
+**1. Context check:**
+
+If context feels heavy or RSS is high:
+```bash
+gc runtime request-restart
+```
+This blocks forever. The controller restarts you. The next wisp is already
+assigned — the new session resumes from it.
+
+**2. Pour next iteration BEFORE burning (reconcile to exactly one):**
+
+Reuse an already-queued wisp instead of pouring a duplicate. A prior cycle may
+have poured a next wisp without burning, or a restart may have raced — keep
+one open patrol wisp and burn any surplus, so wisps never accumulate. Wisp
+roots are `issue_type=molecule` (never `--type=wisp`, which is not a valid
+gc bd type and matches nothing).
+
+```bash
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
+NEXT=$(printf '%s\\n' $OPEN_WISPS | sed -n '1p')
+for extra in $(printf '%s\\n' $OPEN_WISPS | sed '1d'); do
+  gc bd mol burn "$extra" --force
+done
+if [ -z "$NEXT" ]; then
+  NEXT=$(gc bd mol wisp mol-boot-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
+  gc bd update "$NEXT" --assignee="$GC_AGENT"
+fi
+```
+
+**3. Burn this wisp:**
+```bash
+gc bd mol burn <this-wisp-id> --force
+```
+
+**4. Exit this turn:**
+
+Write exactly:
+```
+IDLE: no work, exiting turn.
+```
+
+Then stop immediately. Do NOT sleep, call ScheduleWakeup, or use Monitor —
+and in particular do NOT call `gc runtime drain-ack` or `exit`. Boot backs a
+`mode = "always"` named session: draining tears down the provider session,
+the controller re-materializes it on the very next tick, and the result is
+the ~500-sessions/hr hot loop this formula exists to prevent (gci-fed).
+Ending the turn leaves the session alive and idle; `idle_timeout` recycles it
+on a sane cadence and the next wisp — already assigned — resumes the loop.
+
+**Exit criteria:** Next wisp poured and assigned, this wisp burned, turn
+ended with the IDLE signal and no drain-ack."""

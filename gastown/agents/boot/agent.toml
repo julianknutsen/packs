@@ -1,4 +1,14 @@
 scope = "city"
 wake_mode = "fresh"
 work_dir = ".gc/agents/boot"
+nudge = "Run 'gc prime' to check deacon health and begin the watchdog cycle."
+# idle_timeout is boot's re-wake cadence, and it is load-bearing. Boot backs a
+# mode="always" named session, so it is exempt from the idle-sleep path and is
+# re-materialized the instant its provider session goes away. Without a timeout
+# the session never recycles and the watchdog goes silent after one pass; with
+# the former drain-ack + exit shape it respawned every ~7s (~500 sessions/hr,
+# 2.4M output tokens in 5h — gci-fed). 15m keeps deacon-stall detection tight
+# (the deacon's own patrol backoff caps at 300s) at ~96 wakes/day. Do not pair
+# this with sleep_after_idle: idle_timeout takes precedence and gc doctor warns.
+idle_timeout = "15m"
 max_active_sessions = 1
