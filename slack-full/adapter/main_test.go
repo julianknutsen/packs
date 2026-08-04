@@ -2720,7 +2720,7 @@ func TestHandlePublishFile(t *testing.T) {
 // reading a regular file inside the upload root must succeed and return
 // the file's bytes verbatim.
 func TestReadConfinedFileReadsRealFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDirResolved(t)
 	path := filepath.Join(dir, "real.txt")
 	want := []byte("hello world")
 	if err := os.WriteFile(path, want, 0o600); err != nil {
@@ -2745,7 +2745,7 @@ func TestReadConfinedFileReadsRealFile(t *testing.T) {
 // ELOOP from open(2) with O_NOFOLLOW on a symlink — errors.Is unwraps
 // through *os.PathError to the underlying syscall.Errno.
 func TestReadConfinedFileRejectsSymlink(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDirResolved(t)
 	target := filepath.Join(dir, "target.txt")
 	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
 		t.Fatalf("write target: %v", err)
