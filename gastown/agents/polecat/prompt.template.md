@@ -425,8 +425,10 @@ fi
 # in_progress bead with an unpushed branch is the worse outcome.
 ```
 
-The `auto_push=false` opt-out (mol-pr-from-issue's halt-at-branch-ready) is
-handled inside submit-and-exit; the "No Idle Polecats" fragment above covers it.
+The push gate lives inside submit-and-exit; the "No Idle Polecats" fragment
+above covers it. It fails closed: `auto_push=false` halts at branch-ready, and
+an ABSENT `auto_push` on a bead whose prose asserts a no-push rail also halts —
+and escalates — rather than pushing on a guess. Absent metadata is not consent.
 
 Your work is not complete until submit-and-exit runs. `gc runtime drain-ack`
 signals the reconciler to kill this session — it will only restart you if the

@@ -69,9 +69,11 @@ fi
 # in_progress bead with an unpushed branch is the worse outcome.
 ```
 
-The `auto_push=false` opt-out (mol-pr-from-issue's halt-at-branch-ready) is
-handled inside submit-and-exit itself: when set, it halts at branch-ready (no
-push, no refinery handoff); otherwise it pushes and reassigns to the refinery.
+The push gate is handled inside submit-and-exit itself, and it fails closed:
+`auto_push=false` halts at branch-ready (no push, no refinery handoff); an
+ABSENT `auto_push` on a bead whose DESCRIPTION or NOTES assert a no-push rail
+also halts, and escalates, because absent metadata is not consent; anything
+else pushes and reassigns to the refinery.
 
 Polecats do not push to main, close beads, create MR beads, or wait around. If
 work appears already merged, still let submit-and-exit reassign it to the

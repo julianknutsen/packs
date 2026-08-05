@@ -141,6 +141,26 @@ coordination with no owning repository belongs at city scope.
 
 **Rule**: Think "X needs Y", not "X comes before Y". Verify with `gc bd blocked`.
 
+**A rail expressed only in prose is enforced by nothing.** If you write "no
+push", "HALT branch-ready", or "the mayor publishes" into a bead, record the
+decision as metadata in the SAME write. Prose is read by an agent exercising
+judgement; the push gate is a shell test on `metadata.auto_push`.
+
+- WRONG: description says "branch + HALT branch-ready, mayor publishes" — and nothing else
+- RIGHT: that description, plus `gc bd update <id> --set-metadata auto_push=false`
+
+`mol-polecat-work` fails closed on the mismatch — a bead whose prose asserts a
+no-push rail with no `auto_push` key halts at branch-ready and escalates rather
+than pushing. That is a backstop, not a substitute: it costs a round trip and a
+human read every time, and it can only see DESCRIPTION and NOTES, so a rail
+that lives in a comment is invisible to it.
+
+**Rule**: if a rail changes what the polecat DOES, it belongs in metadata. Use
+`--set-metadata` (never bare `--metadata`) so `branch` and `gc.routed_to`
+survive the write. Reading it back, prefer
+`if has("auto_push") then .auto_push else "absent" end` over `.auto_push // "-"`
+— the `//` idiom treats the legitimate value `false` as absent.
+
 ## Responsibilities
 
 - **Work dispatch**: Assign work to polecats for issues, coordinate batch work on epics

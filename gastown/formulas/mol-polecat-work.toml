@@ -357,12 +357,32 @@ BODY
 This is a belt-and-suspenders check — self-review should have caught this,
 but we never push with untracked work left behind.
 
-**3. Push your branch:**
+**3. Push gate — FAIL CLOSED, then push:**
+
+Absent metadata is not consent. A rail expressed only in prose is enforced by
+nothing: a bead whose DESCRIPTION says "no push — the mayor publishes" but
+which carries no `auto_push` key used to fall straight through to `git push`,
+because an absent key yielded the empty string and the empty string is not
+`"false"`. Two of the affected rigs are customer repos, and an unintended push
+to a customer repo has already caused an unintended prod deploy once. So the
+gate reads the bead's prose as well as its metadata, and halts rather than
+guess. Four outcomes, evaluated in order:
+
+| `auto_push` | Bead prose | Outcome |
+|---|---|---|
+| `false` | not read | halt at branch-ready — the explicit opt-out |
+| absent | asserts a no-push rail | halt at branch-ready **and escalate** — ambiguous, a human owns the call |
+| absent | no rail | push + refinery handoff — the normal path |
+| any other value | not read | push + refinery handoff — explicit consent |
+
 ```bash
-AUTO_PUSH=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata | if has("auto_push") then (.auto_push | tostring) else "" end')
+WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+AUTO_PUSH=$(printf '%s' "$WORK_JSON" | jq -r '(.[0].metadata // {}) | if has("auto_push") then (.auto_push | tostring) else "" end')
+BRANCH=$(git branch --show-current)
+
+# (a) Explicit opt-out. Never read the prose — the metadata already decided.
 if [ "$AUTO_PUSH" = "false" ]; then
   echo "auto_push=false: halting at branch-ready (no push, no refinery handoff)"
-  BRANCH=$(git branch --show-current)
   gc bd update "$WORK_BEAD_ID" \
     --status=open --assignee="" \
     --set-metadata branch="$BRANCH" \
@@ -374,6 +394,52 @@ if [ "$AUTO_PUSH" = "false" ]; then
   gc runtime drain-ack
   exit 0
 fi
+
+# (b) No decision recorded. Scan DESCRIPTION + NOTES for a no-push rail.
+# Lines about pushing *to main* are a DIFFERENT rail — one every polecat
+# already obeys, since it pushes a feature branch and never main — so they are
+# dropped before matching. Without that filter every bead quoting the standing
+# "polecats do not push to main" rule would halt, and a gate that cries wolf
+# gets routed around. Comments are deliberately out of scope: they are
+# discussion, not standing instructions, and they self-match on any bead that
+# merely talks about no-push rails.
+if [ -z "$AUTO_PUSH" ]; then
+  RAIL_HIT=$(printf '%s' "$WORK_JSON" \
+    | jq -r '(.[0].description // ""), (.[0].notes // "")' \
+    | grep -Eiv 'push(ing|es)?[[:space:]]+(directly[[:space:]]+)?to[[:space:]]+(main|master|trunk|origin)' \
+    | grep -Eic 'no[- ]push([^e]|$)|do not push|don.t push|never push([^e]|$)|(mayor|operator|human) publishes|halt[- ]*(at[- ]+)?branch[- ]ready|branch[- ]ready[- ]+halt|auto_push[[:space:]]*=[[:space:]]*false')
+  # ${RAIL_HIT:-1} — grep -c always prints a count when it runs, so an EMPTY
+  # result means the scan itself broke. Fail closed on that too: an
+  # undetermined rail is treated as an asserted one.
+  if [ "${RAIL_HIT:-1}" -gt 0 ]; then
+    echo "NO-PUSH RAIL IN PROSE + auto_push ABSENT — halting at branch-ready (fail closed) and escalating."
+    gc bd update "$WORK_BEAD_ID" \
+      --status=open --assignee="" \
+      --set-metadata branch="$BRANCH" \
+      --set-metadata target={{base_branch}} \
+      --set-metadata branch_ready=true \
+      --set-metadata halt_reason=no_push_rail_unresolved \
+      --set-metadata gc.routed_to="" \
+      --notes "Branch ready: DESCRIPTION/NOTES assert a no-push rail but the bead carries no auto_push metadata, so the rail is unenforceable. Halted instead of guessing. Whoever owns the rail: set auto_push=false to confirm the halt, or auto_push=true to authorise the push, then re-sling."
+    gc mail send "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" \
+      -s "HELP: no-push rail unresolved on $WORK_BEAD_ID [HIGH]" \
+      -m "Halted at branch-ready instead of pushing.
+
+Bead:   $WORK_BEAD_ID
+Branch: $BRANCH (local only — NOT pushed)
+Reason: DESCRIPTION/NOTES assert a no-push rail, but metadata.auto_push is
+        absent. The push gate cannot tell 'halt' from 'go', so it halted.
+
+Resolve: read the rail, then record the decision as metadata —
+  gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
+  gc bd update $WORK_BEAD_ID --set-metadata auto_push=true    # authorise the push
+and re-sling. Use --set-metadata so branch and gc.routed_to survive."
+    gc runtime drain-ack
+    exit 0
+  fi
+fi
+
+# (c) Normal path.
 git push origin HEAD
 PUSH_EXIT=$?
 if [ $PUSH_EXIT -ne 0 ]; then
