@@ -11,13 +11,14 @@ def test_order_scope_regression_runs_with_installed_gc() -> None:
         REPO_ROOT.joinpath(".github", "workflows", "ci.yml").read_text(encoding="utf-8")
     )
     steps = workflow["jobs"]["check"]["steps"]
-    integration_step = next(
-        step
-        for step in steps
-        if step.get("name") == "Lint and exercise shared role prompt composition"
+    step_name = "Lint and exercise shared role prompt composition"
+    matching = [step for step in steps if step.get("name") == step_name]
+    assert matching, (
+        f"no step named {step_name!r} in CI job 'check'; "
+        f"found: {[step.get('name') for step in steps]}"
     )
 
-    command = integration_step["run"]
+    command = matching[0]["run"]
     assert (
         'GC_TEST_BIN="$GC_BIN" python3 -m pytest '
         "oversight-rig/tests/test_order_scopes.py -q"
