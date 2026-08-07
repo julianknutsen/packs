@@ -1,0 +1,380 @@
+// Socket Mode transport — the ingress-free alternative to the public
+// /slack/events listener.
+//
+// Socket Mode replaces Slack's inbound HTTP webhook with an outbound
+// WebSocket the adapter opens to Slack. Nothing listens on a public port and
+// no TLS terminator or tunnel is needed, which is the only way to run this
+// pack on a network that cannot accept inbound connections.
+//
+// The transport is selected by SLACK_APP_TOKEN: when it is set the adapter
+// runs Socket Mode and never binds LISTEN_PUBLIC; when it is empty the
+// adapter keeps the original Events-API-over-HTTP behaviour unchanged. The
+// two are alternatives, never both at once — Slack itself refuses to deliver
+// events to a Request URL while Socket Mode is enabled on the app.
+//
+// Wire protocol (https://api.slack.com/apis/socket-mode):
+//
+//  1. POST apps.connections.open with the app-level token → a single-use
+//     wss:// URL, valid for ~30s.
+//  2. Dial it. Slack sends {"type":"hello"} on success.
+//  3. Each event arrives as an envelope: {"envelope_id":…,"type":"events_api",
+//     "payload":{…}}. The payload is byte-identical to the HTTP webhook body,
+//     which is why this file reuses bridgeEvent unchanged.
+//  4. Ack every envelope with {"envelope_id":…} within 3s or Slack redelivers.
+//  5. {"type":"disconnect"} warns the connection is going away, ~10s before
+//     it closes, so a replacement can be opened before events are missed.
+//
+// Authenticity differs from the HTTP path and is worth being explicit about:
+// there is no signing secret and no HMAC. The trust boundary is the TLS
+// connection the adapter itself opened using its app-level token — an
+// attacker cannot inject envelopes without already holding that token. This
+// is Slack's designed model for Socket Mode, not a relaxation of the HTTP
+// path, which keeps verifying signatures exactly as before.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/coder/websocket"
+)
+
+const (
+	// socketAckTimeout bounds the ack write. Slack redelivers an envelope
+	// that is not acked within 3s, so a write that cannot complete well
+	// inside that window is better abandoned than left blocking the reader.
+	socketAckTimeout = 2 * time.Second
+
+	// socketReadTimeout is the idle watchdog. Slack pings frequently, so a
+	// read that yields nothing for this long means the connection is wedged
+	// in a way TCP has not noticed yet — drop it and redial.
+	socketReadTimeout = 90 * time.Second
+
+	// socketOpenTimeout bounds apps.connections.open plus the WebSocket
+	// handshake. The URL Slack returns expires in ~30s.
+	socketOpenTimeout = 30 * time.Second
+
+	// Reconnect backoff after a failed or lost connection. Reset once a
+	// connection is established (see runSocketMode).
+	socketBackoffMin = 1 * time.Second
+	socketBackoffMax = 30 * time.Second
+
+	// socketDrainGrace is how long a connection that announced a disconnect
+	// keeps reading after its replacement is live, so in-flight envelopes
+	// still get acked instead of being redelivered.
+	socketDrainGrace = 10 * time.Second
+
+	// maxSocketMessage caps a single inbound WebSocket message, mirroring
+	// maxInboundBody on the HTTP path.
+	maxSocketMessage = 1 << 20 // 1 MiB
+)
+
+// socketEnvelope is the Socket Mode frame wrapping each delivery. Payload is
+// the same JSON body the Events API would have POSTed to /slack/events.
+type socketEnvelope struct {
+	Type         string          `json:"type"`
+	EnvelopeID   string          `json:"envelope_id,omitempty"`
+	Payload      json.RawMessage `json:"payload,omitempty"`
+	Reason       string          `json:"reason,omitempty"`
+	RetryAttempt int             `json:"retry_attempt,omitempty"`
+}
+
+// socketConn is the WebSocket surface this file needs, extracted so the
+// envelope loop can be tested against a scripted connection without standing
+// up a server. realSocketConn is the only production implementation.
+type socketConn interface {
+	Read(ctx context.Context) ([]byte, error)
+	Write(ctx context.Context, data []byte) error
+	Close() error
+}
+
+type realSocketConn struct{ c *websocket.Conn }
+
+func (r realSocketConn) Read(ctx context.Context) ([]byte, error) {
+	_, data, err := r.c.Read(ctx)
+	return data, err
+}
+
+func (r realSocketConn) Write(ctx context.Context, data []byte) error {
+	return r.c.Write(ctx, websocket.MessageText, data)
+}
+
+func (r realSocketConn) Close() error {
+	// CloseNow over a handshaked close: the peer is Slack and the connection
+	// is being discarded either way, so waiting on a close reply only delays
+	// the redial.
+	return r.c.CloseNow()
+}
+
+// runSocketMode supervises the Socket Mode connection until ctx is done,
+// redialing with capped exponential backoff. It returns only when ctx is
+// cancelled; every other failure is a reconnect, because losing the socket
+// is the expected steady state (Slack recycles connections routinely) rather
+// than a fatal condition.
+func runSocketMode(ctx context.Context, cfg config) error {
+	backoff := socketBackoffMin
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		warned := make(chan struct{}, 1)
+		done, err := runSocketConnection(ctx, cfg, func() {
+			select {
+			case warned <- struct{}{}:
+			default: // already warned; one signal is enough
+			}
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("socket mode: connect failed: %v (retrying in %s)", err, backoff)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			if backoff *= 2; backoff > socketBackoffMax {
+				backoff = socketBackoffMax
+			}
+			continue
+		}
+		// A live connection means the backoff has served its purpose.
+		backoff = socketBackoffMin
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case <-warned:
+			// Slack warned this socket is closing, ~10s ahead. Dial the
+			// replacement now, while the old connection keeps draining and
+			// acking in its own goroutine — that overlap is the entire
+			// reason Slack sends the warning early. The drained connection
+			// closes itself; nothing here needs to wait for it.
+			log.Printf("socket mode: opening replacement connection")
+			continue
+
+		case err := <-done:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err != nil {
+				log.Printf("socket mode: connection ended: %v (reconnecting in %s)", err, backoff)
+			} else {
+				log.Printf("socket mode: connection closed (reconnecting in %s)", backoff)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			if backoff *= 2; backoff > socketBackoffMax {
+				backoff = socketBackoffMax
+			}
+		}
+	}
+}
+
+// runSocketConnection dials one connection and pumps it in the background,
+// returning a channel that yields the pump's outcome. Dialing is synchronous
+// so the caller can distinguish "could not connect" (back off) from "was
+// connected and then ended" (reconnect promptly); pumping is not, so the
+// caller can react to a disconnect warning without waiting for the drain.
+// onWarning fires when Slack announces an impending close.
+func runSocketConnection(ctx context.Context, cfg config, onWarning func()) (<-chan error, error) {
+	conn, err := dialSocketMode(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- pumpSocket(ctx, cfg, conn, onWarning) }()
+	return done, nil
+}
+
+// dialSocketMode negotiates a connection URL and opens it.
+func dialSocketMode(ctx context.Context, cfg config) (socketConn, error) {
+	openCtx, cancel := context.WithTimeout(ctx, socketOpenTimeout)
+	defer cancel()
+
+	wsURL, err := openSocketConnectionURL(openCtx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	// Dial through http.DefaultClient rather than a bare TLS dial so
+	// HTTP_PROXY/HTTPS_PROXY are honoured — the adapter is expected to run
+	// on exactly the kind of restricted network that needs an egress proxy.
+	c, _, err := websocket.Dial(openCtx, wsURL, &websocket.DialOptions{
+		HTTPClient: http.DefaultClient,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dial socket mode: %w", err)
+	}
+	c.SetReadLimit(maxSocketMessage)
+	log.Printf("socket mode: connected")
+	return realSocketConn{c: c}, nil
+}
+
+// appsConnectionsOpenResp is the apps.connections.open reply.
+type appsConnectionsOpenResp struct {
+	OK    bool   `json:"ok"`
+	URL   string `json:"url,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+// openSocketConnectionURL calls apps.connections.open, which is the only
+// endpoint that accepts the app-level (xapp-) token rather than the bot
+// token.
+func openSocketConnectionURL(ctx context.Context, cfg config) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.slackAPIBase+"/apps.connections.open", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.appToken)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("apps.connections.open: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSocketMessage))
+	if err != nil {
+		return "", fmt.Errorf("read apps.connections.open response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("apps.connections.open http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out appsConnectionsOpenResp
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("decode apps.connections.open response: %w", err)
+	}
+	if !out.OK {
+		// invalid_auth here almost always means the token is a bot token or
+		// is missing the connections:write scope; say so rather than making
+		// the operator look it up.
+		return "", fmt.Errorf("apps.connections.open: %s (app-level token needs the connections:write scope)", out.Error)
+	}
+	if out.URL == "" {
+		return "", errors.New("apps.connections.open returned no url")
+	}
+	return out.URL, nil
+}
+
+// pumpSocket reads envelopes until the connection ends, acking each one and
+// bridging events through the same path the HTTP listener uses.
+func pumpSocket(ctx context.Context, cfg config, conn socketConn, onWarning func()) error {
+	defer func() { _ = conn.Close() }()
+
+	// A disconnect warning arrives ~10s before Slack drops the socket. Rather
+	// than tear down immediately (which loses whatever is in flight), the
+	// caller is signalled to open a replacement while this loop keeps
+	// draining and acking on the doomed connection.
+	drainUntil := time.Time{}
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !drainUntil.IsZero() && time.Now().After(drainUntil) {
+			return nil
+		}
+
+		readCtx, cancel := context.WithTimeout(ctx, socketReadTimeout)
+		data, err := conn.Read(readCtx)
+		cancel()
+		if err != nil {
+			if !drainUntil.IsZero() {
+				// Expected: the warned-about close finally landed.
+				return nil
+			}
+			return err
+		}
+
+		var env socketEnvelope
+		if err := json.Unmarshal(data, &env); err != nil {
+			log.Printf("socket mode: undecodable frame: %v", err)
+			continue
+		}
+
+		switch env.Type {
+		case "hello":
+			continue
+		case "disconnect":
+			log.Printf("socket mode: disconnect requested (reason=%s), draining", env.Reason)
+			if drainUntil.IsZero() {
+				drainUntil = time.Now().Add(socketDrainGrace)
+				if onWarning != nil {
+					onWarning()
+				}
+			}
+			continue
+		}
+
+		if env.EnvelopeID != "" {
+			ackCtx, ackCancel := context.WithTimeout(ctx, socketAckTimeout)
+			ackErr := conn.Write(ackCtx, socketAck(env.EnvelopeID))
+			ackCancel()
+			if ackErr != nil {
+				// Acking is what stops redelivery, so a failed ack means the
+				// connection is no longer usable — redial and let Slack
+				// redeliver rather than processing on a dead socket.
+				return fmt.Errorf("ack envelope %s: %w", env.EnvelopeID, ackErr)
+			}
+		}
+
+		// Bridge off the read loop, exactly as the HTTP path does after its
+		// ack: postInbound is bounded by gcCallTimeout, and a slow gc must
+		// not stall acks for the envelopes queued behind this one.
+		go handleSocketEnvelope(cfg, env)
+	}
+}
+
+// socketAck builds the ack frame for an envelope.
+func socketAck(envelopeID string) []byte {
+	// Marshal rather than concatenate: envelope ids are Slack-supplied and
+	// must not be able to break out of the JSON they are embedded in.
+	b, err := json.Marshal(map[string]string{"envelope_id": envelopeID})
+	if err != nil {
+		// Unreachable for a map[string]string, but never emit a malformed ack.
+		return []byte(`{}`)
+	}
+	return b
+}
+
+// handleSocketEnvelope routes one non-control envelope. Only events_api is
+// meaningful at Tier 1 — interactivity and slash commands belong to the
+// larger tiers — and the payload is the same shape the HTTP listener decodes,
+// so the bridge itself is shared verbatim with the webhook path.
+func handleSocketEnvelope(cfg config, env socketEnvelope) {
+	if env.Type != "events_api" || len(env.Payload) == 0 {
+		return
+	}
+	var payload slackEventEnvelope
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		log.Printf("socket mode: decode payload: %v", err)
+		return
+	}
+	// The HTTP path proves workspace identity via the signing secret. Socket
+	// Mode has no equivalent, and the adapter stamps every bridged message
+	// with cfg.workspaceID as its account id — so an event from another
+	// workspace (an app installed more than once) would be filed under the
+	// wrong account. Drop it instead.
+	if payload.TeamID != "" && payload.TeamID != cfg.workspaceID {
+		log.Printf("socket mode: dropping event from unexpected team %s (want %s)", payload.TeamID, cfg.workspaceID)
+		return
+	}
+	if env.RetryAttempt > 0 {
+		// gc dedupes on DedupKey, so a redelivery is harmless; log it because
+		// a persistent retry count means acks are not landing in time.
+		log.Printf("socket mode: redelivered envelope (attempt %d)", env.RetryAttempt)
+	}
+	bridgeEvent(cfg, payload)
+}

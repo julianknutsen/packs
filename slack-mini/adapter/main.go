@@ -1,11 +1,16 @@
 // gc-slack-mini-adapter — the Tier-1 ("slack-mini") Slack ↔ gc bridge.
 //
-// The minimal viable Slack→mayor surface, single-file by design:
+// The minimal viable Slack→mayor surface. This file is the whole adapter
+// bar one thing: the Socket Mode transport lives in socketmode.go, kept
+// separate because it is an alternative to the HTTP receiver below rather
+// than an addition to it.
 //
-//   - Inbound: a public HTTPS receiver for the Slack Events API. Only
-//     `app_mention` is handled. Each verified mention is bridged to gc by
-//     POSTing /v0/city/{city}/extmsg/inbound, addressed to the mayor
-//     session (override with SLACK_MINI_INBOUND_TARGET).
+//   - Inbound: either a public HTTPS receiver for the Slack Events API, or —
+//     when SLACK_APP_TOKEN is set — a Socket Mode WebSocket the adapter opens
+//     outbound to Slack, which needs no public ingress at all (see
+//     socketmode.go). Only `app_mention` is handled either way. Each mention
+//     is bridged to gc by POSTing /v0/city/{city}/extmsg/inbound, addressed
+//     to the mayor session (override with SLACK_MINI_INBOUND_TARGET).
 //
 //   - Outbound: a UDS endpoint (/post-message) that posts plain text to a
 //     Slack channel via chat.postMessage using the workspace bot token.
@@ -23,9 +28,11 @@
 //	                       Not used on the inbound path (which only verifies
 //	                       the signing secret and POSTs to gc).
 //	SLACK_SIGNING_SECRET   HMAC secret for verifying Slack request signatures
-//	                       on the inbound bridge. Required at Tier 1 — there is
-//	                       no apps-registry fallback, so without it every
-//	                       inbound is rejected.
+//	                       on the HTTP inbound bridge. Required at Tier 1 when
+//	                       running the HTTP transport — there is no
+//	                       apps-registry fallback, so without it every inbound
+//	                       is rejected. Not used (and not required) in Socket
+//	                       Mode, which has no request signatures.
 //	SLACK_WORKSPACE_ID     Slack workspace (team) id; the extmsg account id.
 //	GC_CITY_NAME           gc city the adapter bridges into.
 //
@@ -39,7 +46,13 @@
 //
 // Optional env:
 //
+//	SLACK_APP_TOKEN            App-level token (xapp-...) with the
+//	                           connections:write scope. When set, the adapter
+//	                           runs Socket Mode instead of the HTTP receiver:
+//	                           LISTEN_PUBLIC is never bound and
+//	                           SLACK_SIGNING_SECRET is not required.
 //	LISTEN_PUBLIC              Public bind for /slack/events (default 0.0.0.0:8775).
+//	                           Ignored in Socket Mode.
 //	LISTEN_INTERNAL            TCP bind for the internal mux when GC_SERVICE_SOCKET
 //	                           is unset (default 127.0.0.1:8776).
 //	REGISTER_ON_START          "true" (default) self-registers as an extmsg adapter.
@@ -109,10 +122,17 @@ type config struct {
 	workspaceID         string
 	botToken            string
 	signingSecret       string
+	appToken            string
 	inboundTarget       string
 	slackAPIBase        string
 	registerOnStart     bool
 }
+
+// socketMode reports whether the adapter takes inbound over a Socket Mode
+// WebSocket instead of the public HTTP listener. The app-level token is the
+// selector: it is required for Socket Mode and useless without it, so its
+// presence is the whole contract — there is no second toggle to keep in sync.
+func (c config) socketMode() bool { return c.appToken != "" }
 
 func main() {
 	cfg, err := loadConfig()
@@ -123,8 +143,12 @@ func main() {
 	if cfg.serviceSocket != "" {
 		internalDescr = "uds:" + cfg.serviceSocket
 	}
-	log.Printf("starting gc-slack-mini-adapter public=%s internal=%s gc=%s city=%s target=%s",
-		cfg.publicListen, internalDescr, cfg.gcAPIBase, cfg.cityName, cfg.inboundTarget)
+	inboundDescr := "http:" + cfg.publicListen
+	if cfg.socketMode() {
+		inboundDescr = "socket-mode (no public listener)"
+	}
+	log.Printf("starting gc-slack-mini-adapter inbound=%s internal=%s gc=%s city=%s target=%s",
+		inboundDescr, internalDescr, cfg.gcAPIBase, cfg.cityName, cfg.inboundTarget)
 
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("/slack/events", handleSlackEvents(cfg))
@@ -156,11 +180,27 @@ func main() {
 			cfg.provider, cfg.workspaceID, cfg.internalCallbackURL)
 	}
 
+	// Socket Mode owns the inbound path when enabled; the public listener is
+	// not merely unused but never bound, which is the point on a network that
+	// cannot accept inbound connections.
+	socketCtx, socketCancel := context.WithCancel(context.Background())
+	defer socketCancel()
+
 	errCh := make(chan error, 2)
-	go func() {
-		log.Printf("public listener serving on %s (Slack events)", cfg.publicListen)
-		errCh <- publicSrv.ListenAndServe()
-	}()
+	if cfg.socketMode() {
+		go func() {
+			// runSocketMode reconnects internally and returns only when its
+			// context is cancelled, so a return here means shutdown.
+			if err := runSocketMode(socketCtx, cfg); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- err
+			}
+		}()
+	} else {
+		go func() {
+			log.Printf("public listener serving on %s (Slack events)", cfg.publicListen)
+			errCh <- publicSrv.ListenAndServe()
+		}()
+	}
 	go func() {
 		if cfg.serviceSocket != "" {
 			log.Printf("internal listener serving on UDS %s (gc proxy_process)", cfg.serviceSocket)
@@ -187,6 +227,7 @@ func main() {
 			log.Printf("listener error: %v", err)
 		}
 	}
+	socketCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = publicSrv.Shutdown(ctx)
@@ -220,6 +261,7 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		workspaceID:     getenv("SLACK_WORKSPACE_ID"),
 		botToken:        getenv("SLACK_BOT_TOKEN"),
 		signingSecret:   getenv("SLACK_SIGNING_SECRET"),
+		appToken:        getenv("SLACK_APP_TOKEN"),
 		inboundTarget:   envOr("SLACK_MINI_INBOUND_TARGET", defaultInboundTarget),
 		slackAPIBase:    strings.TrimRight(envOr("SLACK_API_BASE", defaultSlackAPIBase), "/"),
 		registerOnStart: envOr("REGISTER_ON_START", "true") == "true",
@@ -248,7 +290,11 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	if cfg.botToken == "" {
 		missing = append(missing, "SLACK_BOT_TOKEN")
 	}
-	if cfg.signingSecret == "" {
+	// The signing secret verifies HTTP webhook signatures. Socket Mode has no
+	// request signatures — authenticity comes from the app-token-authenticated
+	// connection the adapter itself opens — so requiring it there would be
+	// demanding a credential the transport never consults.
+	if cfg.signingSecret == "" && !cfg.socketMode() {
 		missing = append(missing, "SLACK_SIGNING_SECRET")
 	}
 	if cfg.cityName == "" {
@@ -256,6 +302,12 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	}
 	if len(missing) > 0 {
 		return cfg, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
+	}
+	// Fail fast on the easiest Socket Mode mistake: pasting the bot token
+	// (xoxb-) into SLACK_APP_TOKEN. Slack would answer invalid_auth on every
+	// reconnect forever, which reads as a network fault rather than a typo.
+	if cfg.socketMode() && !strings.HasPrefix(cfg.appToken, "xapp-") {
+		return cfg, errors.New("SLACK_APP_TOKEN must be an app-level token (xapp-...); the bot token belongs in SLACK_BOT_TOKEN")
 	}
 	// cityName is interpolated into every /v0/city/{city}/... URL. Reject
 	// URL-significant characters so a city name cannot alter routing.
