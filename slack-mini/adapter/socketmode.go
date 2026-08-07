@@ -52,10 +52,15 @@ const (
 	// inside that window is better abandoned than left blocking the reader.
 	socketAckTimeout = 2 * time.Second
 
-	// socketReadTimeout is the idle watchdog. Slack pings frequently, so a
-	// read that yields nothing for this long means the connection is wedged
-	// in a way TCP has not noticed yet — drop it and redial.
-	socketReadTimeout = 90 * time.Second
+	// Liveness is checked by pinging Slack, not by bounding reads. A healthy
+	// Socket Mode connection can sit idle indefinitely — no mentions means no
+	// data messages — and Slack's own keepalive pings are answered inside the
+	// WebSocket library without ever waking a read. A read deadline would
+	// therefore tear down perfectly good connections on any quiet workspace.
+	// A ping that goes unanswered is the real signal that a connection is
+	// wedged in a way TCP has not noticed yet.
+	socketPingInterval = 30 * time.Second
+	socketPingTimeout  = 10 * time.Second
 
 	// socketOpenTimeout bounds apps.connections.open plus the WebSocket
 	// handshake. The URL Slack returns expires in ~30s.
@@ -92,6 +97,10 @@ type socketEnvelope struct {
 type socketConn interface {
 	Read(ctx context.Context) ([]byte, error)
 	Write(ctx context.Context, data []byte) error
+	// Ping sends a WebSocket ping and waits for the matching pong, which is
+	// how liveness is established on a connection that may legitimately carry
+	// no data for hours.
+	Ping(ctx context.Context) error
 	Close() error
 }
 
@@ -105,6 +114,8 @@ func (r realSocketConn) Read(ctx context.Context) ([]byte, error) {
 func (r realSocketConn) Write(ctx context.Context, data []byte) error {
 	return r.c.Write(ctx, websocket.MessageText, data)
 }
+
+func (r realSocketConn) Ping(ctx context.Context) error { return r.c.Ping(ctx) }
 
 func (r realSocketConn) Close() error {
 	// CloseNow over a handshaked close: the peer is Slack and the connection
@@ -273,27 +284,34 @@ func openSocketConnectionURL(ctx context.Context, cfg config) (string, error) {
 func pumpSocket(ctx context.Context, cfg config, conn socketConn, onWarning func()) error {
 	defer func() { _ = conn.Close() }()
 
+	// connCtx bounds this connection specifically: the keepalive cancels it
+	// when Slack stops answering pings, and the drain timer cancels it when a
+	// warned-about connection has had long enough to finish. Reads block on
+	// it with no deadline of their own — see socketPingInterval.
+	connCtx, closeConn := context.WithCancel(ctx)
+	defer closeConn()
+	go keepaliveSocket(connCtx, conn, socketPingInterval, closeConn)
+
 	// A disconnect warning arrives ~10s before Slack drops the socket. Rather
 	// than tear down immediately (which loses whatever is in flight), the
 	// caller is signalled to open a replacement while this loop keeps
 	// draining and acking on the doomed connection.
-	drainUntil := time.Time{}
+	draining := false
 
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !drainUntil.IsZero() && time.Now().After(drainUntil) {
-			return nil
-		}
 
-		readCtx, cancel := context.WithTimeout(ctx, socketReadTimeout)
-		data, err := conn.Read(readCtx)
-		cancel()
+		data, err := conn.Read(connCtx)
 		if err != nil {
-			if !drainUntil.IsZero() {
-				// Expected: the warned-about close finally landed.
+			if draining {
+				// Expected: the warned-about close finally landed, or the
+				// drain window elapsed.
 				return nil
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 			return err
 		}
@@ -309,8 +327,11 @@ func pumpSocket(ctx context.Context, cfg config, conn socketConn, onWarning func
 			continue
 		case "disconnect":
 			log.Printf("socket mode: disconnect requested (reason=%s), draining", env.Reason)
-			if drainUntil.IsZero() {
-				drainUntil = time.Now().Add(socketDrainGrace)
+			if !draining {
+				draining = true
+				// Bound the drain: if Slack never actually closes, this
+				// connection must not linger next to its replacement.
+				time.AfterFunc(socketDrainGrace, closeConn)
 				if onWarning != nil {
 					onWarning()
 				}
@@ -337,6 +358,34 @@ func pumpSocket(ctx context.Context, cfg config, conn socketConn, onWarning func
 	}
 }
 
+// keepaliveSocket pings Slack on a fixed interval and closes the connection
+// when a ping goes unanswered. This is the liveness check for a transport
+// whose healthy state is silence: without it, a connection dropped in a way
+// that never reaches TCP (a NAT timeout, a proxy reaping an idle tunnel)
+// would leave the adapter reading forever from a socket Slack has forgotten.
+func keepaliveSocket(ctx context.Context, conn socketConn, interval time.Duration, closeConn func()) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, socketPingTimeout)
+			err := conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					return // shutting down; not a ping failure
+				}
+				log.Printf("socket mode: keepalive ping failed: %v", err)
+				closeConn()
+				return
+			}
+		}
+	}
+}
+
 // socketAck builds the ack frame for an envelope.
 func socketAck(envelopeID string) []byte {
 	// Marshal rather than concatenate: envelope ids are Slack-supplied and
@@ -354,6 +403,11 @@ func socketAck(envelopeID string) []byte {
 // larger tiers — and the payload is the same shape the HTTP listener decodes,
 // so the bridge itself is shared verbatim with the webhook path.
 func handleSocketEnvelope(cfg config, env socketEnvelope) {
+	// Log every delivery on arrival. Tier 1 subscribes to app_mention alone,
+	// so this is low volume, and without it a dropped event is indis-
+	// tinguishable from Slack never having sent one — which is exactly the
+	// question an operator debugging a silent bot needs answered.
+	log.Printf("socket mode: envelope received type=%s", env.Type)
 	if env.Type != "events_api" || len(env.Payload) == 0 {
 		return
 	}

@@ -28,6 +28,9 @@ type scriptedConn struct {
 	// returning io.EOF once the script is exhausted — used to model a
 	// connection that stays open.
 	blockAfterScript bool
+	// pingErr, when set, makes Ping fail — a wedged connection.
+	pingErr error
+	pings   int
 }
 
 func (s *scriptedConn) Read(ctx context.Context) ([]byte, error) {
@@ -51,6 +54,13 @@ func (s *scriptedConn) Write(_ context.Context, data []byte) error {
 	defer s.mu.Unlock()
 	s.writes = append(s.writes, append([]byte(nil), data...))
 	return nil
+}
+
+func (s *scriptedConn) Ping(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pings++
+	return s.pingErr
 }
 
 func (s *scriptedConn) Close() error {
@@ -510,6 +520,71 @@ func TestRunSocketModeReconnectsAfterDisconnect(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("adapter never reconnected after the disconnect")
+	}
+}
+
+// TestPumpSocketSurvivesIdleConnection is a regression test. An earlier
+// revision bounded each Read with a 90s deadline as an idle watchdog, which
+// tore down healthy connections on any quiet workspace: Slack's keepalives
+// are WebSocket pings, answered inside the library without ever waking a
+// read, so silence is the normal state of a working connection.
+func TestPumpSocketSurvivesIdleConnection(t *testing.T) {
+	cfg := config{gcAPIBase: "http://127.0.0.1:1", cityName: "c", workspaceID: "T123"}
+	conn := &scriptedConn{blockAfterScript: true} // never sends anything
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- pumpSocket(ctx, cfg, conn, nil) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("pumpSocket gave up on an idle but healthy connection: %v", err)
+	case <-time.After(500 * time.Millisecond):
+		// Still reading, which is correct.
+	}
+}
+
+func TestKeepaliveClosesWedgedConnection(t *testing.T) {
+	conn := &scriptedConn{blockAfterScript: true, pingErr: errors.New("no pong")}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	closed := make(chan struct{})
+	var once sync.Once
+	go keepaliveSocket(ctx, conn, time.Millisecond, func() { once.Do(func() { close(closed) }) })
+
+	// A connection Slack has stopped answering must be torn down rather than
+	// read from forever — the failure mode a NAT or proxy timeout produces.
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("unanswered ping did not close the connection")
+	}
+}
+
+func TestKeepaliveStopsWithContext(t *testing.T) {
+	conn := &scriptedConn{blockAfterScript: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	closedCount := 0
+	done := make(chan struct{})
+	go func() {
+		keepaliveSocket(ctx, conn, time.Millisecond, func() { closedCount++ })
+		close(done)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("keepalive ignored context cancellation")
+	}
+	// Healthy pings must never trip the close path.
+	if closedCount != 0 {
+		t.Errorf("closeConn called %d times on a healthy connection", closedCount)
+	}
+	if conn.pings == 0 {
+		t.Error("keepalive never pinged")
 	}
 }
 
