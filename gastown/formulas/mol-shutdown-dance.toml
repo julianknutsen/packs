@@ -13,6 +13,9 @@ gc bd create --type=task \
 The dog pool picks up the warrant and runs this formula against the
 claimed warrant bead. The claimed bead is the warrant id; use
 `$GC_BEAD_ID` for warrant verification, closure, and audit output.
+Some providers export the claimed bead id only as `GC_TRIGGER_WORK_BEAD_ID`
+(never `GC_BEAD_ID`), so every snippet block below first normalizes the id
+with a fallback that fails loudly when neither variable is set.
 Existing warrant producers provide `target`, `reason`, and `requester`
 metadata, not a separate `warrant_id`. Each warrant is one shutdown dance
 for one target. On crash, re-read formula steps and resume from context
@@ -22,6 +25,7 @@ Before running command snippets in any step, load warrant metadata into quoted
 shell variables:
 
 ```bash
+GC_BEAD_ID="${GC_BEAD_ID:-${GC_TRIGGER_WORK_BEAD_ID:?no work bead id in env}}"
 warrant_json="$(gc bd show "$GC_BEAD_ID" --json)"
 target="$(printf '%s' "$warrant_json" | jq -r '.[0].metadata.target // empty')"
 reason="$(printf '%s' "$warrant_json" | jq -r '.[0].metadata.reason // empty')"
@@ -82,6 +86,7 @@ Entry point. Read the warrant metadata from the claimed warrant bead.
 
 **1. Read warrant details:**
 ```bash
+GC_BEAD_ID="${GC_BEAD_ID:-${GC_TRIGGER_WORK_BEAD_ID:?no work bead id in env}}"
 warrant_json="$(gc bd show "$GC_BEAD_ID" --json)"
 target="$(printf '%s' "$warrant_json" | jq -r '.[0].metadata.target // empty')"
 reason="$(printf '%s' "$warrant_json" | jq -r '.[0].metadata.reason // empty')"

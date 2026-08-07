@@ -534,7 +534,7 @@ Handle any urgent messages that arrived during patrol. Archive the rest.
 
 **3. Resolve current wisp and pour next iteration BEFORE burning:**
 ```bash
-CURRENT_WISP=${GC_BEAD_ID:-}
+CURRENT_WISP=${GC_BEAD_ID:-${GC_TRIGGER_WORK_BEAD_ID:-}}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
 fi
