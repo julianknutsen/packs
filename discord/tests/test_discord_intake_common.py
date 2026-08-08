@@ -1711,6 +1711,58 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         assert launch is not None
         self.assertEqual(launch["message_targets"]["msg-launch-11"], "corp/sky")
 
+    def test_publish_binding_message_repins_participant_from_new_session(self) -> None:
+        config = common.set_room_launcher(common.load_config(), "1", "22")
+        route = common.resolve_publish_route(config, "launch-room:22")
+        assert route is not None
+        common.save_room_launch(
+            {
+                "launch_id": "room-launch:orig-13",
+                "launcher_id": "launch-room:22",
+                "guild_id": "1",
+                "conversation_id": "22",
+                "root_message_id": "orig-13",
+                "qualified_handle": "corp/sky",
+                "session_alias": "corp/pack.sky",
+                "session_name": "s-gc-old",
+                "session_id": "gc-old",
+                "thread_id": "333",
+                "participants": {
+                    "corp/sky": {
+                        "qualified_handle": "corp/sky",
+                        "session_alias": "corp/pack.sky",
+                        "session_name": "s-gc-old",
+                        "session_id": "gc-old",
+                        "delivery_selector": "s-gc-old",
+                    }
+                },
+            }
+        )
+
+        with mock.patch.object(
+            common, "post_channel_message", return_value={"id": "msg-launch-13"}
+        ), mock.patch.object(
+            common,
+            "resolve_session_identity",
+            return_value={"session_name": "corp--sky", "session_id": "gc-new", "alias": "corp/sky"},
+        ):
+            payload = common.publish_binding_message(
+                route,
+                "hello from my new body",
+                source_context={"kind": "discord_human_message", "publish_launch_id": "room-launch:orig-13"},
+                source_session_name="corp--sky",
+                source_session_id="gc-new",
+            )
+
+        self.assertEqual(payload["record"]["source_qualified_handle"], "corp/sky")
+        launch = common.load_room_launch("room-launch:orig-13")
+        assert launch is not None
+        participant = launch["participants"]["corp/sky"]
+        self.assertEqual(participant["session_id"], "gc-new")
+        self.assertEqual(participant["session_name"], "corp--sky")
+        self.assertEqual(participant["delivery_selector"], "corp--sky")
+        self.assertEqual(launch["message_targets"]["msg-launch-13"], "corp/sky")
+
     def test_publish_binding_message_does_not_record_non_thread_launch_publish_target(self) -> None:
         common.set_chat_binding(common.load_config(), "room", "22", ["corp--sky"], guild_id="1")
         binding = common.resolve_chat_binding(common.load_config(), "room:22")
@@ -1918,6 +1970,125 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         self.assertEqual(current["session_id"], "gc-new")
         self.assertEqual(current["session_name"], "dc-new-sky")
 
+    def test_ensure_room_launch_session_repins_to_live_handle_session(self) -> None:
+        common.save_room_launch(
+            {
+                "launch_id": "room-launch:repin",
+                "launcher_id": "launch-room:22",
+                "guild_id": "1",
+                "conversation_id": "22",
+                "root_message_id": "repin",
+                "qualified_handle": "corp/sky",
+                "session_alias": "corp/pack.sky",
+                "session_name": "s-gc-old",
+                "session_id": "gc-old",
+                "thread_id": "333",
+                "participants": {
+                    "corp/sky": {
+                        "qualified_handle": "corp/sky",
+                        "session_alias": "corp/pack.sky",
+                        "session_name": "s-gc-old",
+                        "session_id": "gc-old",
+                        "delivery_selector": "s-gc-old",
+                    }
+                },
+            }
+        )
+        launch = common.load_room_launch("room-launch:repin")
+        assert launch is not None
+        sessions = [
+            {
+                "id": "gc-old",
+                "alias": "corp/pack.sky",
+                "session_name": "s-gc-old",
+                "state": "closed",
+                "running": False,
+                "created_at": "2026-03-20T00:00:00Z",
+            },
+            {
+                "id": "gc-new",
+                "alias": "corp/sky",
+                "session_name": "corp--sky",
+                "state": "active",
+                "running": True,
+                "created_at": "2026-03-22T00:00:00Z",
+            },
+        ]
+
+        with mock.patch.object(
+            common, "list_city_sessions", return_value=sessions
+        ), mock.patch.object(
+            common, "create_agent_session"
+        ) as create_agent_session, mock.patch.object(
+            common,
+            "prime_room_launch_participant",
+            side_effect=lambda current, participant, extra_message="": dict(participant),
+        ):
+            current, participant = common.ensure_room_launch_session_for_handle(launch, "corp/sky")
+
+        create_agent_session.assert_not_called()
+        self.assertEqual(participant["session_id"], "gc-new")
+        self.assertEqual(participant["session_name"], "corp--sky")
+        self.assertEqual(participant["delivery_selector"], "corp--sky")
+        self.assertEqual(current["session_id"], "gc-new")
+
+    def test_repin_room_launch_participant_for_session_rebinds_stale_entry(self) -> None:
+        common.save_room_launch(
+            {
+                "launch_id": "room-launch:repin-helper",
+                "launcher_id": "launch-room:22",
+                "guild_id": "1",
+                "conversation_id": "22",
+                "root_message_id": "repin-helper",
+                "qualified_handle": "corp/sky",
+                "session_alias": "corp/pack.sky",
+                "session_name": "s-gc-old",
+                "session_id": "gc-old",
+                "thread_id": "333",
+                "participants": {
+                    "corp/sky": {
+                        "qualified_handle": "corp/sky",
+                        "session_alias": "corp/pack.sky",
+                        "session_name": "s-gc-old",
+                        "session_id": "gc-old",
+                        "delivery_selector": "s-gc-old",
+                    }
+                },
+            }
+        )
+
+        updated = common.repin_room_launch_participant_for_session(
+            "room-launch:repin-helper",
+            "corp/sky",
+            session_name="corp--sky",
+            session_id="gc-new",
+            session_alias="corp/sky",
+        )
+
+        assert updated is not None
+        participant = updated["participants"]["corp/sky"]
+        self.assertEqual(participant["session_id"], "gc-new")
+        self.assertEqual(participant["session_name"], "corp--sky")
+        self.assertEqual(participant["session_alias"], "corp/sky")
+        self.assertEqual(participant["delivery_selector"], "corp--sky")
+        self.assertEqual(updated["session_id"], "gc-new")
+        self.assertIsNone(
+            common.repin_room_launch_participant_for_session(
+                "room-launch:repin-helper",
+                "corp/sky",
+                session_name="corp--sky",
+                session_id="gc-new",
+            )
+        )
+        self.assertIsNone(
+            common.repin_room_launch_participant_for_session(
+                "room-launch:repin-helper",
+                "corp/other",
+                session_name="other-name",
+                session_id="other-id",
+            )
+        )
+
     def test_resolve_existing_session_for_handle_matches_alias_case_insensitively(self) -> None:
         sessions = [
             {"id": "bo-1", "alias": "gasburger.mayor", "session_name": "gasburger__mayor",
@@ -2041,8 +2212,20 @@ class DiscordIntakeCommonTests(unittest.TestCase):
              "session_name": "s-bo-9", "template": "daytripper/gasburger.crew",
              "state": "active", "running": True},
         ]
+        # The named session must not be listed until after the spawn: if a
+        # live session already matches the handle, ensure attaches to it
+        # instead of creating (see the repin fallback).
+        calls = {"count": 0}
+
+        def list_sessions(*, state: str = "all") -> list[dict[str, object]]:
+            self.assertEqual(state, "all")
+            calls["count"] += 1
+            if calls["count"] < 3:
+                return []
+            return sessions_after
+
         with mock.patch.object(
-            common, "list_city_sessions", return_value=sessions_after,
+            common, "list_city_sessions", side_effect=list_sessions,
         ), mock.patch.object(
             common, "create_agent_session", return_value={},
         ) as create_agent_session, mock.patch.object(
