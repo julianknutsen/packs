@@ -364,6 +364,49 @@ BODY
 This is a belt-and-suspenders check — self-review should have caught this,
 but we never push with untracked work left behind.
 
+**2b. Branch-content gate (fails closed — non-negotiable).**
+
+The branch-shape gate proves the branch is *named* right; it does not prove
+it *contains* anything. A branch created at the base tip and never committed
+to passes every other gate here: the name matches, the tree is clean, and
+`git push` of zero commits succeeds and creates the ref, so push verification
+sees origin == HEAD. The handoff is then stamped and the bead moves forward
+looking like success — a phantom handoff. Only the refinery's own
+no-work-on-branch check catches it, one gate slot later; without that check
+it merges as a no-op and the bead closes with the work undone. An idle worker
+is visible, this is not.
+
+```bash
+COMMITS_AHEAD=$(git rev-list --count "origin/{{base_branch}}..HEAD")
+if [ "$COMMITS_AHEAD" -eq 0 ]; then
+    echo "BRANCH CONTENT GATE FAILED"
+    echo "  branch:  $EXPECTED_BRANCH"
+    echo "  commits ahead of origin/{{base_branch}}: 0"
+    echo ""
+    echo "There is nothing to hand off. Do NOT push and do NOT reassign to the"
+    echo "refinery — an empty branch is a phantom handoff, not a completion."
+    echo ""
+    echo "If you HAVE done work, it is uncommitted or on another branch: go back,"
+    echo "commit it on $EXPECTED_BRANCH, and re-run submit-and-exit."
+    echo ""
+    echo "If the honest answer is that no code change is warranted (an"
+    echo "investigation that concluded 'no', a bead already satisfied by main),"
+    echo "that is a legitimate outcome — but it is reported, not handed off."
+    gc bd update "$WORK_BEAD_ID" \
+      --status=open --assignee="" \
+      --set-metadata gc.routed_to="" \
+      --set-metadata halt_reason=no_commits \
+      --notes "$(cat <<'BODY'
+Halted at submit: branch has zero commits ahead of base. No handoff stamped.
+<State what you investigated and why no code change is warranted, or what
+blocked you from producing one. A coordinator reads this to decide next steps.>
+BODY
+)"
+    gc runtime drain-ack
+    exit 1
+fi
+```
+
 **3. Push gate — FAIL CLOSED, then push:**
 
 Absent metadata is not consent. A rail expressed only in prose is enforced by
