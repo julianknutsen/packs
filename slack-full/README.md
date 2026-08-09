@@ -65,7 +65,9 @@ Implemented:
 - [x] `gc slack reply-current` — reply to the latest Slack event in the
       current session, by default through gc's `/extmsg/outbound` so
       transcript recording + peer fanout fire (`--via adapter` keeps the
-      old direct-to-adapter path for diagnostics)
+      old direct-to-adapter path for diagnostics). A thread-reply
+      inbound is answered in its thread by default (`--no-thread`
+      forces a channel-level post)
 - [x] `gc slack publish` — publish to a session's saved binding (target
       session required, no event-scan fallback — fail-fast when the
       session has no active binding)

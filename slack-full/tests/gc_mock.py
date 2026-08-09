@@ -197,17 +197,21 @@ class GcMock:
         provider_message_id: str,
         message_kind: str = "inbound",
         account_id: str = "T0TESTWS",
+        reply_to_message_id: str = "",
     ) -> None:
         """Seed a transcript entry for ``GET /extmsg/transcript`` lookups.
 
         ``message_kind`` is the transcript-row Kind ("inbound" / "outbound").
         ``--thread-current`` resolves the latest *inbound* entry for the
-        session's conversation.
+        session's conversation. ``reply_to_message_id`` mirrors the thread
+        root ts the adapter stamps on a thread-reply inbound (gp-i62);
+        empty means a plain channel/DM message.
         """
         key = (provider, conversation_id, kind)
         entry = {
             "Kind": message_kind,
             "ProviderMessageID": provider_message_id,
+            "ReplyToMessageID": reply_to_message_id,
             "Conversation": {
                 "ScopeID": self.city_name,
                 "Provider": provider,

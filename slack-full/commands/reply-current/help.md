@@ -4,11 +4,18 @@ The session's recent transcript is scanned for the most recent
 `extmsg.inbound` system-reminder. The reply is published through the
 local Slack adapter's /publish endpoint to the same conversation.
 
+When that latest inbound was a thread reply, the reply inherits its
+thread_ts and lands in the same thread — including when
+--conversation-id names the same conversation explicitly. An
+unthreaded inbound keeps the channel-level reply. Use --no-thread to
+force a channel-level post, or --reply-to <ts> to anchor elsewhere.
+
 Examples:
   gc slack reply-current --body "ack"
   gc slack reply-current --body-file /tmp/reply.txt
   gc slack reply-current --turn-ref gct-0123456789abcdef0123 --body-file /tmp/reply.txt
   gc slack reply-current --conversation-id D0B0TTS550F --body "explicit channel"
+  gc slack reply-current --body "top-level on purpose" --no-thread
 
 If the session has no inbound history, --conversation-id is required.
 

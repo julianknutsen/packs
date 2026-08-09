@@ -405,14 +405,35 @@ def find_latest_inbound_message_id_for_session(
     """Find the latest inbound transcript entry routed to this session.
 
     Returns (provider_message_id, conversation_dict) on hit, or None if no
-    inbound has reached this session yet.
+    inbound has reached this session yet. Thin wrapper over
+    find_latest_inbound_thread_for_session for callers that only need the
+    message id (react/upload anchoring).
+    """
+    match = find_latest_inbound_thread_for_session(session_id)
+    if match is None:
+        return None
+    mid, _thread_root, conv = match
+    return mid, conv
+
+
+def find_latest_inbound_thread_for_session(
+    session_id: str,
+) -> tuple[str, str, dict[str, str]] | None:
+    """Find the latest inbound transcript entry routed to this session.
+
+    Returns (provider_message_id, thread_root, conversation_dict) on hit,
+    or None if no inbound has reached this session yet. thread_root is the
+    entry's ReplyToMessageID — the Slack thread_ts the adapter stamps on a
+    thread-reply inbound — or "" when the inbound was a plain channel/DM
+    message (gp-i62).
 
     The lookup chain:
       1. Find the latest extmsg.inbound event targeting this session.
       2. Read its conversation_id from the event payload.
       3. Query the transcript for that conversation newest-first
          (order=desc, gascity#3128), take the first entry whose
-         Kind=="inbound", and return its ProviderMessageID.
+         Kind=="inbound", and return its ProviderMessageID +
+         ReplyToMessageID.
 
     Two queries (event + transcript) because the inbound event payload
     intentionally does NOT carry message_id — that field lives in the
@@ -455,8 +476,11 @@ def find_latest_inbound_message_id_for_session(
         if (entry.get("Kind") or entry.get("kind")) == "inbound":
             mid = (entry.get("ProviderMessageID") or entry.get("provider_message_id") or "").strip()
             if mid:
+                thread_root = (
+                    entry.get("ReplyToMessageID") or entry.get("reply_to_message_id") or ""
+                ).strip()
                 conv = entry.get("Conversation") or entry.get("conversation") or {}
-                return mid, {
+                return mid, thread_root, {
                     "scope_id": conv.get("ScopeID") or conv.get("scope_id") or gc_city_name(),
                     "provider": conv.get("Provider") or conv.get("provider") or provider,
                     "account_id": conv.get("AccountID") or conv.get("account_id") or workspace,

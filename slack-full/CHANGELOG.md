@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `gc slack reply-current` now inherits the thread from the latest
+  inbound (gp-i62): a thread-reply inbound's transcript entry carries
+  the Slack `thread_ts` in `ReplyToMessageID`, and the reply anchors
+  there by default — including when `--conversation-id` names the same
+  conversation explicitly, which previously always posted at channel
+  level (live burns 2026-08-09, #gastown + #fundraising). An unthreaded
+  inbound keeps the channel-level reply; an explicit target naming a
+  *different* conversation never borrows the inbound's thread anchor;
+  a failed lookup degrades to channel level with a stderr warning
+  (`--via adapter` must survive a gc outage). New `--no-thread` flag
+  forces a channel-level post. `--thread-current` now anchors at the
+  thread ROOT when the latest inbound was itself a thread reply —
+  Slack threads hang off the parent ts, so anchoring at the child
+  stranded the reply. Retires the fleet-memory workaround of routing
+  threaded replies through `publish-to-channel --thread-ts`.
+
 ### Added
 
 - Accidental-mrkdwn guard on the send path (gp-o42): `gc slack

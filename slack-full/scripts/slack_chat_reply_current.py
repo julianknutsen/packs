@@ -8,6 +8,12 @@ The lookup order:
    current session, and reply to the same conversation.
 3. If neither yields a target, fall back to the session's saved
    extmsg binding.
+
+Threading: when the latest inbound routed to this session was a thread
+reply, the reply inherits its thread_ts and lands in the same thread —
+including when --conversation-id names the same conversation explicitly
+(gp-i62). --reply-to / --thread-current still override the anchor, and
+--no-thread forces a channel-level post.
 """
 
 from __future__ import annotations
@@ -232,8 +238,18 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help=(
             "Thread the reply under the latest inbound message routed to "
-            "this session (resolved via gc transcript). Cannot be combined "
+            "this session (resolved via gc transcript; a thread-reply "
+            "inbound anchors at its thread root). Cannot be combined "
             "with --reply-to. If no recent inbound is found, fails fast."
+        ),
+    )
+    parser.add_argument(
+        "--no-thread",
+        action="store_true",
+        help=(
+            "Force a channel-level post even when the latest inbound was a "
+            "thread reply (by default the reply inherits that thread_ts). "
+            "Cannot be combined with --reply-to or --thread-current."
         ),
     )
     parser.add_argument("--idempotency-key", default="",
@@ -280,16 +296,43 @@ def main(argv: list[str]) -> int:
         raise SystemExit("missing slack account_id (SLACK_WORKSPACE_ID env)")
 
     reply_to = args.reply_to
+    if args.no_thread and (reply_to or args.thread_current):
+        raise SystemExit(
+            "--no-thread cannot be combined with --reply-to or --thread-current")
     if args.thread_current:
         if reply_to:
             raise SystemExit("pass --reply-to OR --thread-current, not both")
-        match = common.find_latest_inbound_message_id_for_session(session_id)
+        match = common.find_latest_inbound_thread_for_session(session_id)
         if match is None:
             raise SystemExit(
                 "no recent inbound transcript entry for this session; "
                 "cannot thread without --reply-to <ts>"
             )
-        reply_to = match[0]
+        mid, thread_root, _conv = match
+        # A thread-reply inbound anchors at its thread ROOT, not its own
+        # ts — Slack threads hang off the parent message, and a thread_ts
+        # pointing at a child strands the reply outside the conversation.
+        reply_to = thread_root or mid
+    elif not reply_to and not args.no_thread:
+        # gp-i62: a threaded inbound means the human is talking to this
+        # session IN that thread — "reply to the latest inbound" must land
+        # there, not at channel level. Inherit the inbound's thread_ts,
+        # including when --conversation-id names the conversation
+        # explicitly. Guard on conversation match so an explicit target
+        # pointing elsewhere never borrows a foreign thread anchor, and
+        # stay best-effort: no inbound / unthreaded inbound / transcript
+        # miss / gc outage (--via adapter still works then) all keep the
+        # channel-level behavior.
+        try:
+            match = common.find_latest_inbound_thread_for_session(session_id)
+        except common.GCAPIError as exc:
+            print(f"warning: thread-inheritance lookup failed, posting at "
+                  f"channel level: {exc}", file=sys.stderr)
+            match = None
+        if match is not None:
+            _mid, thread_root, inbound_conv = match
+            if thread_root and inbound_conv.get("conversation_id") == conv["conversation_id"]:
+                reply_to = thread_root
 
     idempotency_key = args.idempotency_key.strip()
     if not idempotency_key:
