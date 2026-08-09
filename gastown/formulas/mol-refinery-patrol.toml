@@ -169,9 +169,9 @@ needs = ["check-inbox"]
 description = """
 **Config: event_timeout = {{event_timeout}}**
 
-Search for work beads assigned to you with branch metadata:
+Search for work beads assigned to you — unclaimed, or already claimed by you:
 ```bash
-WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \
+WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open,in_progress \
   --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
 ```
 
@@ -180,6 +180,26 @@ database. Without it, `gc bd list` routes to the HQ database and never
 sees rig-scoped work beads — the `assignee` field alone does not route
 by namespace. For HQ-only refineries `$GC_RIG` is empty and the flag
 expands to nothing.
+
+`--status=open,in_progress` is what makes this query survive its own claim.
+Claiming a bead moves it to `in_progress`, so a filter of `open` alone can
+never see the work this patrol just took: the bead strands in `in_progress`
+with its branch metadata intact and nothing merged, while this step truthfully
+reports an empty queue. It is a leak with a rate — one stranded bead per
+claim, in every rig running this pack (measured in a production rig: the
+stranded count went 1 -> 2 in 30 minutes, with `--status=open` returning
+nothing the whole time and the branches provably unmerged rather than lost).
+
+Both statuses stay narrowed by `--assignee=$GC_AGENT`, so this widens the
+query to *your own* claims only — it never picks up another agent's in-flight
+work. Wisp roots are `ephemeral=true` and this query does not pass
+`--include-infra`, so widening the status cannot make the refinery adopt its
+own patrol wisp. Use the comma-separated form: repeating `-s/--status`
+silently overwrites the previous value instead of unioning them.
+
+Re-finding your own claim is the intended resume path, not a duplicate: a bead
+you claimed but did not land is unfinished work, and the merge-state gate in
+merge-push already closes it as `already_merged` if a previous pass landed it.
 
 If found: read the bead metadata to confirm it has a branch:
 ```bash
