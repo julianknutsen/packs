@@ -784,10 +784,14 @@ func TestHandlePublishDedupesOnIdempotencyKey(t *testing.T) {
 	t.Cleanup(func() { slackAPIBase = origBase })
 	var posts int
 	ts := "1700000000.000100"
-	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		posts++
+	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"ts":"` + ts + `"}`))
+		if r.URL.Path == "/conversations.history" {
+			_, _ = w.Write([]byte(`{"ok":true,"messages":[{"ts":"` + ts + `","text":"hello"}]}`))
+			return
+		}
+		posts++
+		_, _ = w.Write([]byte(`{"ok":true,"channel":"C1","ts":"` + ts + `"}`))
 	}))
 	t.Cleanup(fakeSlack.Close)
 	slackAPIBase = fakeSlack.URL
@@ -850,10 +854,14 @@ func TestHandlePublishNoDedupWithoutKey(t *testing.T) {
 	origBase := slackAPIBase
 	t.Cleanup(func() { slackAPIBase = origBase })
 	var posts int
-	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		posts++
+	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"ts":"1.2"}`))
+		if r.URL.Path == "/conversations.history" {
+			_, _ = w.Write([]byte(`{"ok":true,"messages":[{"ts":"1.2","text":"hi"}]}`))
+			return
+		}
+		posts++
+		_, _ = w.Write([]byte(`{"ok":true,"channel":"C1","ts":"1.2"}`))
 	}))
 	t.Cleanup(fakeSlack.Close)
 	slackAPIBase = fakeSlack.URL

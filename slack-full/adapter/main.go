@@ -1759,7 +1759,6 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 				receipt.FailureKind = "permanent"
 			}
 		default:
-			receipt.Delivered = true
 			receipt.MessageID = slackResp.TS
 			// A delivered-but-truncated message is still ok:true with a real
 			// message_id, so none of the receipt's named fields can show it. On
@@ -1782,6 +1781,27 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 					receipt.Metadata = map[string]string{}
 				}
 				receipt.Metadata["truncated"] = "true"
+			}
+			// The truncation warning is recorded before the readback so the
+			// wire fact survives either outcome: it is what Slack reported
+			// about this write, while Delivered below is what the read API can
+			// confirm. Truncation also fails the readback's exact-text compare,
+			// so a truncated keyed publish now reports Delivered:false with
+			// FailureKind "readback_unconfirmed" *and* metadata["truncated"] —
+			// strictly more than either half could say alone.
+			if err := readBackPublishedMessage(
+				slackReadbackHTTPClient,
+				cfg.slackBotToken,
+				req.Conversation.ConversationID,
+				slackResp.TS,
+				req.ReplyToMessageID,
+				post.Text,
+			); err != nil {
+				log.Printf("slack readback failed: %v", err)
+				receipt.Delivered = false
+				receipt.FailureKind = slackReadbackFailureKind(err)
+			} else {
+				receipt.Delivered = true
 			}
 		}
 		// Remember delivered receipts so a subsequent retry with the same
