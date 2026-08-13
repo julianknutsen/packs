@@ -38,7 +38,15 @@ Underlying calls
 
 1. POST /v0/city/<name>/extmsg/groups   (mode=launcher; with fanout policy if any flag set)
 2. POST /v0/city/<name>/extmsg/participants for each session
+3. Reconcile gc's authoritative direct-binding table so it cannot shadow the
+   group: POST /extmsg/unbind for a group-only room, or POST /extmsg/bind with
+   `replace=true` when `--binding-owner` is set.
+
+Omitting `--binding-owner` declares the room group-only and removes any direct
+binding, including one created separately. Pass the owner on every re-run that
+must preserve outbound publication.
 
 The pack records the binding under
 `.gc/services/slack/data/config.json` so other slack-pack commands can
-resolve the room without re-querying gc.
+resolve the room without re-querying gc. The local record is written only after
+the authoritative reconciliation succeeds.

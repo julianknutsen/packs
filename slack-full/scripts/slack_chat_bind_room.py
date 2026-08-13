@@ -198,6 +198,30 @@ def build_participants(
     return out
 
 
+def reconcile_authoritative_binding(
+    conversation: dict[str, str], binding_owner: str
+) -> dict[str, Any] | None:
+    """Make extmsg's direct-binding table agree with the room topology.
+
+    Inbound resolution consults a direct binding before its group route. A
+    group-only room must therefore have no direct binding, while a room with a
+    publisher owner must replace any stale direct binding with that owner.
+    """
+    try:
+        if binding_owner:
+            return common.gc_post(
+                "/extmsg/bind",
+                {
+                    "session_id": binding_owner,
+                    "conversation": conversation,
+                    "replace": True,
+                },
+            )
+        return common.gc_post("/extmsg/unbind", {"conversation": conversation})
+    except common.GCAPIError as exc:
+        raise SystemExit(f"reconcile authoritative binding: {exc}") from exc
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description="Bind a Slack room/channel to one or more named gc sessions",
@@ -231,9 +255,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--binding-owner", default="",
                         metavar="SESSION",
                         help="Also bind this session to the conversation as the publisher "
-                             "for /extmsg/outbound. Required to make outbound publishes "
-                             "work; without it, peer-fanout still fires but publishes need "
-                             "a separate /extmsg/bind call. Should refer semantically to one "
+                             "for /extmsg/outbound. Required on every bind-room run that must "
+                             "preserve outbound publishing; omitting it declares a group-only "
+                             "room and removes any direct binding that would shadow the group. "
+                             "Should refer semantically to one "
                              "of the participants. Pass the gc-id (e.g. gc-77139) when the "
                              "binding will be looked up by gc-id (e.g. resolve_rig_channel.py); "
                              "pass the participant alias when the rest of the system reads "
@@ -283,15 +308,7 @@ def main(argv: list[str]) -> int:
             raise SystemExit(f"upsert participant {handle}={session}: {exc}") from exc
         participant_records.append(res)
 
-    binding_record: dict[str, Any] | None = None
-    if binding_owner:
-        try:
-            binding_record = common.gc_post(
-                "/extmsg/bind",
-                {"session_id": binding_owner, "conversation": conv},
-            )
-        except common.GCAPIError as exc:
-            raise SystemExit(f"bind {binding_owner}: {exc}") from exc
+    binding_record = reconcile_authoritative_binding(conv, binding_owner)
 
     cfg = common.load_pack_config()
     cfg.setdefault("bindings", {})

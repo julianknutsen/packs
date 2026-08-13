@@ -7,6 +7,7 @@ end-to-end via gc events in the slack-pack README's verification recipe.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -187,6 +188,8 @@ def test_main_round_trip_with_fake_gc(monkeypatch: pytest.MonkeyPatch, capsys: p
             return {"ID": "group-xyz", "FanoutPolicy": body.get("fanout_policy") or {}}
         if path == "/extmsg/participants":
             return {"ID": "p-" + body["handle"], "Handle": body["handle"], "SessionID": body["session_id"]}
+        if path == "/extmsg/unbind":
+            return {"unbound": [{"ID": "binding-old", "SessionID": "gc-stale"}]}
         raise AssertionError(f"unexpected path {path}")
 
     monkeypatch.setattr(common, "gc_post", fake_post)
@@ -199,8 +202,19 @@ def test_main_round_trip_with_fake_gc(monkeypatch: pytest.MonkeyPatch, capsys: p
     ])
     assert rc == 0
     paths = [c[0] for c in calls]
-    # No --binding-owner: bind-room only creates the group + N participants.
-    assert paths == ["/extmsg/groups", "/extmsg/participants", "/extmsg/participants"]
+    assert paths == [
+        "/extmsg/groups",
+        "/extmsg/participants",
+        "/extmsg/participants",
+        "/extmsg/unbind",
+    ]
+    assert calls[-1][1] == {"conversation": {
+        "scope_id": "test-city",
+        "provider": "slack",
+        "account_id": "T0TESTWS",
+        "conversation_id": "C0123ROOM01",
+        "kind": "room",
+    }}
 
     group_body = calls[0][1]
     assert group_body["root_conversation"]["kind"] == "room"
@@ -223,8 +237,7 @@ def test_main_round_trip_with_fake_gc(monkeypatch: pytest.MonkeyPatch, capsys: p
 
     cfg_path = pathlib.Path(os.environ["GC_CITY_PATH"]) / ".gc/services/slack/data/config.json"
     assert cfg_path.exists()
-    import json as _json
-    saved = _json.loads(cfg_path.read_text())
+    saved = json.loads(cfg_path.read_text())
     binding = saved["bindings"]["room:C0123ROOM01"]
     assert binding["group_id"] == "group-xyz"
     assert binding["default_handle"] == "mayor"
@@ -234,8 +247,12 @@ def test_main_round_trip_with_fake_gc(monkeypatch: pytest.MonkeyPatch, capsys: p
     ]
 
     out = capsys.readouterr().out
-    assert "binding_key" in out
-    assert "group-xyz" in out
+    result = json.loads(out)
+    assert result["binding_key"] == "room:C0123ROOM01"
+    assert result["group_id"] == "group-xyz"
+    assert result["binding_record"] == {
+        "unbound": [{"ID": "binding-old", "SessionID": "gc-stale"}],
+    }
 
 
 def test_main_with_binding_owner_emits_extmsg_bind(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
@@ -275,6 +292,7 @@ def test_main_with_binding_owner_emits_extmsg_bind(monkeypatch: pytest.MonkeyPat
     ]
     bind_body = calls[-1][1]
     assert bind_body["session_id"] == "gc-77139"
+    assert bind_body["replace"] is True
     assert bind_body["conversation"] == {
         "scope_id": "test-city",
         "provider": "slack",
@@ -327,5 +345,32 @@ def test_binding_owner_can_be_separate_gcid_when_participants_are_aliases(monkey
     assert bind_call[1]["session_id"] == "gc-77139"
 
 
-# Module-level json import for the test above.
-import json  # noqa: E402
+@pytest.mark.parametrize("binding_owner", ["", "gc-77139"])
+def test_binding_reconciliation_failure_does_not_persist_or_report_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    binding_owner: str,
+):
+    mod = _import_module()
+    common = sys.modules["slack_intake_common"]
+
+    def fake_post(path: str, body: dict):
+        if path == "/extmsg/groups":
+            return {"ID": "group-xyz"}
+        if path == "/extmsg/participants":
+            return {"ID": "p-" + body["handle"]}
+        if path in {"/extmsg/bind", "/extmsg/unbind"}:
+            raise common.GCAPIError("authoritative binding store unavailable")
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(common, "gc_post", fake_post)
+    args = ["C0123ROOM01", "gc-77139", "--no-protocol-nudge"]
+    if binding_owner:
+        args.extend(["--binding-owner", binding_owner])
+
+    with pytest.raises(SystemExit, match="authoritative binding store unavailable"):
+        mod.main(args)
+
+    cfg_path = pathlib.Path(os.environ["GC_CITY_PATH"]) / ".gc/services/slack/data/config.json"
+    assert not cfg_path.exists()
+    assert capsys.readouterr().out == ""
