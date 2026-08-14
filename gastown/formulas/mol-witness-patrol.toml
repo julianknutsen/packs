@@ -341,7 +341,55 @@ gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
 ```
 - Clean up worktree and skip to Step 4.
 
-If the work is NOT on main, proceed with reset:
+If the work is NOT on main, check for a completed-but-unhanded-off submit
+before resetting to pool:
+
+**Step 3a: Was this bead already handed off to the refinery step, just not
+reassigned?** (gastownhall/gascity-packs#276)
+
+`submit-and-exit` sets `metadata.target` in its step 5, then reassigns the
+bead to the refinery in step 6 — two separate, independently-interruptible
+`gc bd update` calls. A polecat killed in that exact window (pool reclaim,
+host restart, context exhaustion) has already pushed the branch, run its
+final clean-state check, and recorded `metadata.target`; the only thing it
+never did was the reassignment itself. Resetting a bead in this state to
+pool is safe (no data is lost — `workspace-setup`'s rejection-aware resume
+picks the existing branch back up) but wasteful and confusing: a fresh
+polecat spins up just to re-run branch-shape/clean-state checks and a
+no-op push before reaching the same step 6 the witness can complete
+directly, right now, with the information already on hand.
+
+```bash
+BEAD_TARGET=$(echo "$META" | jq -r '.target // empty')
+BRANCH_READY=$(echo "$META" | jq -r '.branch_ready // empty')
+```
+
+`metadata.target` is set by exactly two places in `submit-and-exit`: step 5
+(the normal path this recovery targets) and the `auto_push=false` early
+halt, which sets `branch_ready=true` in the *same* update — an intentional
+final state, not a crash. Only treat this as a completed-but-unhanded-off
+submit when `target` is set and `branch_ready` is not:
+
+```bash
+if [ -n "$BEAD_TARGET" ] && [ "$BRANCH_READY" != "true" ]; then
+  REFINERY_TARGET="<rig>/{{binding_prefix}}refinery"
+  gc bd update <bead> --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
+  gc mail send mayor/ -s "ORPHAN_HANDED_OFF: <bead> completed submit, missing only reassignment" \
+    -m "Branch $BRANCH is on origin and metadata.target=$BEAD_TARGET was already recorded -- the crashed polecat had finished submit-and-exit through step 5. Completed step 6 (reassign to refinery) instead of resetting to pool."
+  gc session nudge "$REFINERY_TARGET" "Run 'gc prime' to check merge queue and begin processing." || true
+  # Worktree is disposable, same reasoning as Step 3b:
+  cd <rig-root>
+  git worktree remove <worktree-path> --force 2>/dev/null
+  rm -rf <worktree-path> 2>/dev/null  # Fallback
+  git worktree prune
+  # Skip to Step 4 -- do NOT fall through to Step 3b's pool reset.
+fi
+```
+
+If `metadata.target` is unset, or `branch_ready=true` (an intentional
+`auto_push=false` halt, not a crash), fall through to Step 3b: the crash
+landed earlier than step 5, or this bead was deliberately left branch-ready
+and pool reset is the correct recovery.
 
 **Step 3b: Clean up worktree and return bead to pool.**
 
