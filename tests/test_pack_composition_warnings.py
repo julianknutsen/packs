@@ -43,13 +43,39 @@ def advisory_binding(line: str) -> str | None:
     return match.group(1).rsplit("/", 1)[-1].split(".", 1)[0]
 
 
+def owning_pack(agent_toml: Path) -> Path | None:
+    """The nearest ancestor of an agent.toml that is itself a pack."""
+    for parent in agent_toml.parents:
+        if parent == REPO_ROOT.parent:
+            return None
+        if (parent / "pack.toml").is_file():
+            return parent
+    return None
+
+
 def agent_bearing_packs() -> list[str]:
-    """Pack directories that ship at least one agent definition."""
-    names = {
-        path.parents[2].name
-        for path in REPO_ROOT.glob("*/agents/*/agent.toml")
+    """Pack directories that ship at least one agent definition, REPO_ROOT-relative.
+
+    Derived from `pack.toml` presence rather than from a fixed depth. A glob of
+    `*/agents/*/agent.toml` reads as "every pack" and silently drops any pack that
+    is not a direct child of the repo root: `gascity/roles` is a pack with its own
+    `pack.toml` and twelve agents, and it was never parameterized. The nested case
+    is the one a depth-pinned pattern always misses, so key on the marker file.
+    """
+    packs = {
+        pack.relative_to(REPO_ROOT).as_posix()
+        for pack in (
+            owning_pack(path)
+            for path in REPO_ROOT.rglob("agents/*/agent.toml")
+        )
+        if pack is not None
     }
-    return sorted(names)
+    return sorted(packs)
+
+
+def binding_name(pack_path: str) -> str:
+    """The import binding for a pack path; `gascity/roles` cannot be a bare key."""
+    return pack_path.replace("/", "-")
 
 
 @dataclass(frozen=True)
@@ -103,7 +129,8 @@ def write_canary_pack(root: Path) -> Path:
     return pack_dir
 
 
-def write_city(root: Path, pack_name: str) -> Workspace:
+def write_city(root: Path, pack_path: str) -> Workspace:
+    binding = binding_name(pack_path)
     city_dir = root / "city"
     rig_dir = root / "fixture"
     gc_home = root / "gc-home"
@@ -114,7 +141,7 @@ def write_city(root: Path, pack_name: str) -> Workspace:
     home.mkdir()
 
     canary_pack = write_canary_pack(root)
-    pack_source = (REPO_ROOT / pack_name).resolve()
+    pack_source = (REPO_ROOT / pack_path).resolve()
 
     city_dir.joinpath("pack.toml").write_text(
         textwrap.dedent(
@@ -123,7 +150,7 @@ def write_city(root: Path, pack_name: str) -> Workspace:
             name = "composition-warnings"
             schema = 2
 
-            [imports.{pack_name}]
+            [imports.{binding}]
             source = {json.dumps(str(pack_source))}
 
             [imports.{CANARY_BINDING}]
@@ -173,6 +200,15 @@ def write_city(root: Path, pack_name: str) -> Workspace:
 
 
 def config_show(gc_test_bin: Path, workspace: Workspace) -> str:
+    """Run `gc config show`, refusing to return output from a failed load.
+
+    Returning `stdout + stderr` alone makes "the config loaded and named no
+    offender" indistinguishable from "the config did not load at all": a binary
+    that aborts before it reaches advisory emission prints no advisory line, and
+    every offender assertion below is a search for an absent string. The canary
+    catches most of that, but only for failures that still emit some advisories.
+    A nonzero exit is the one signal that separates the two, so read it.
+    """
     result = subprocess.run(
         [str(gc_test_bin), "config", "show"],
         cwd=workspace.rig_dir,
@@ -181,14 +217,20 @@ def config_show(gc_test_bin: Path, workspace: Workspace) -> str:
         capture_output=True,
         timeout=120,
     )
-    return result.stdout + result.stderr
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, (
+        f"gc config show exited {result.returncode}; an absent advisory in this "
+        f"output is a failed load, not a clean pack. Output:\n{output}"
+    )
+    return output
 
 
-@pytest.mark.parametrize("pack_name", agent_bearing_packs())
+@pytest.mark.parametrize("pack_path", agent_bearing_packs())
 def test_pack_agents_compose_without_idle_advisory(
-    tmp_path: Path, gc_test_bin: Path, pack_name: str
+    tmp_path: Path, gc_test_bin: Path, pack_path: str
 ) -> None:
-    output = config_show(gc_test_bin, write_city(tmp_path, pack_name))
+    pack_name = binding_name(pack_path)
+    output = config_show(gc_test_bin, write_city(tmp_path, pack_path))
 
     advisories = [line for line in output.splitlines() if IDLE_ADVISORY in line]
 
