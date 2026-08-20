@@ -2520,6 +2520,11 @@ def cmd_delegate(argv: list[str]) -> int:
                         help="Pin a specific turn ts when a newer wake overwrote the pointer")
     parser.add_argument("--turn-ref", default="",
                         help="Immutable turn reference from the Slack reminder")
+    parser.add_argument(
+        "--raw", action="store_true",
+        help=("Send the body verbatim, skipping the accidental-mrkdwn guard "
+              "(by default, tildes that would pair into unintended Slack "
+              "strikethrough are neutralized)."))
     args = parser.parse_args(argv)
 
     session_name = os.environ.get("GC_SESSION_NAME", "").strip()
@@ -2529,6 +2534,11 @@ def cmd_delegate(argv: list[str]) -> int:
             turn_ref=args.turn_ref)
     else:
         body = _load_body_arg(args.body, args.body_file)
+        if not args.raw:
+            # gp-o42: tilde pairs render as strikethrough in Slack mrkdwn.
+            # Local import keeps the library surface of this module stdlib-only.
+            import slack_mrkdwn
+            body = slack_mrkdwn.escape_accidental_mrkdwn(body)
         result = run_delegate(
             to=args.to, body=body, origin_ts=args.origin_ts,
             session_name=session_name, turn_ref=args.turn_ref)

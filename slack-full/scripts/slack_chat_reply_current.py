@@ -21,6 +21,7 @@ import sys
 from typing import Any
 
 import slack_intake_common as common
+import slack_mrkdwn
 
 
 def _derive_idempotency_key(
@@ -43,11 +44,17 @@ def _derive_idempotency_key(
 def _load_body(args: argparse.Namespace) -> str:
     if args.body and args.body_file:
         raise SystemExit("pass --body OR --body-file, not both")
+    body = ""
     if args.body:
-        return args.body
-    if args.body_file:
-        return pathlib.Path(args.body_file).read_text(encoding="utf-8")
-    raise SystemExit("either --body or --body-file is required")
+        body = args.body
+    elif args.body_file:
+        body = pathlib.Path(args.body_file).read_text(encoding="utf-8")
+    else:
+        raise SystemExit("either --body or --body-file is required")
+    if not getattr(args, "raw", False):
+        # gp-o42: tilde pairs render as strikethrough in Slack mrkdwn.
+        body = slack_mrkdwn.escape_accidental_mrkdwn(body)
+    return body
 
 
 def _slack_kind_from_channel_id(cid: str, fallback: str = "dm") -> str:
@@ -236,6 +243,12 @@ def main(argv: list[str]) -> int:
                               "the same reply dedupes instead of double-posting."))
     parser.add_argument("--body", default="")
     parser.add_argument("--body-file", default="")
+    parser.add_argument(
+        "--raw", action="store_true",
+        help=("Send the body verbatim, skipping the accidental-mrkdwn guard "
+              "(by default, tildes that would pair into unintended Slack "
+              "strikethrough are neutralized; deliberate ~word~ wrapping and "
+              "code spans always pass through)."))
     parser.add_argument(
         "--via",
         choices=("gc", "adapter"),

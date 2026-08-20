@@ -22,3 +22,10 @@ Routes through `/v0/city/<name>/extmsg/outbound` by default so peer
 fanout + transcript recording fire. Pass `--via adapter` for
 adapter-only diagnostics that bypass gc; peers in a bind-room won't
 see those.
+
+Formatting guard: tildes that would accidentally pair into Slack
+strikethrough (e.g. "~$58.5k … ~$16.5k" — tilde as "approximately") are
+neutralized by default with a visually identical substitute (U+223C).
+Deliberate tight-wrapped `~word~` strikethrough, code spans, lone
+tildes, and every other formatting character pass through untouched.
+Pass --raw to send the body byte-for-byte verbatim.
