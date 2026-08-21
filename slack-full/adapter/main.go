@@ -1491,6 +1491,25 @@ func (c *publishDedupCache) Put(key string, receipt publishReceipt) {
 	}
 }
 
+// referenceSuffix derives the low-visibility marker embedded in outbound
+// publish text so a later reader can find the exact message in Slack channel
+// history. The in-process publishDedupCache only survives publishDedupTTL and
+// process restarts, so it cannot provide durable delivery evidence.
+//
+// This must agree with gas-city's messaging_state_reconciler.py:
+// "dr-3msk6.3-test-vector" maps to "50e90a583c36".
+func referenceSuffix(idempotencyKey string) string {
+	digest := sha256.Sum256([]byte(idempotencyKey))
+	return hex.EncodeToString(digest[:])[:12]
+}
+
+// referenceMarker is appended to outbound text when an idempotency key is
+// present. Slack message metadata would be preferable, but requires app scopes
+// the adapter does not have.
+func referenceMarker(idempotencyKey string) string {
+	return "_ref:" + referenceSuffix(idempotencyKey) + "_"
+}
+
 func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap, dedup *publishDedupCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1539,6 +1558,9 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 			Channel:  req.Conversation.ConversationID,
 			Text:     rewrittenText,
 			ThreadTS: req.ReplyToMessageID,
+		}
+		if req.IdempotencyKey != "" {
+			post.Text += "\n\n" + referenceMarker(req.IdempotencyKey)
 		}
 		identityApplied := ""
 		if reg != nil {

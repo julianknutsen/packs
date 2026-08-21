@@ -810,14 +810,18 @@ func TestHandlePublishDedupesOnIdempotencyKey(t *testing.T) {
 	}
 	second := publish()
 	if second.Code != http.StatusOK {
-		t.Fatalf("retry status = %d, want 200 (body=%q)", second.Code, second.Body.String())
+		t.Fatalf("first retry status = %d, want 200 (body=%q)", second.Code, second.Body.String())
+	}
+	third := publish()
+	if third.Code != http.StatusOK {
+		t.Fatalf("second retry status = %d, want 200 (body=%q)", third.Code, third.Body.String())
 	}
 
 	if posts != 1 {
 		t.Fatalf("Slack chat.postMessage called %d times, want 1 (retry must not re-post)", posts)
 	}
-	// Both responses must carry the same delivered receipt + message id.
-	for _, rec := range []*httptest.ResponseRecorder{first, second} {
+	// All responses must carry the same delivered receipt + message id.
+	for _, rec := range []*httptest.ResponseRecorder{first, second, third} {
 		var got publishReceipt
 		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 			t.Fatalf("decode receipt %q: %v", rec.Body.String(), err)
@@ -825,6 +829,14 @@ func TestHandlePublishDedupesOnIdempotencyKey(t *testing.T) {
 		if !got.Delivered || got.MessageID != ts {
 			t.Errorf("receipt = %+v, want delivered with message_id %q", got, ts)
 		}
+	}
+
+	// Dedup is scoped to the caller-supplied key, not the conversation or text.
+	distinctBody := strings.Replace(body, `"idempotency_key":"k-1"`, `"idempotency_key":"k-2"`, 1)
+	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(distinctBody))
+	handler(httptest.NewRecorder(), req)
+	if posts != 2 {
+		t.Fatalf("Slack chat.postMessage called %d times after a distinct idempotency key, want 2", posts)
 	}
 }
 
@@ -888,6 +900,94 @@ func TestPublishDedupCache(t *testing.T) {
 	clock = clock.Add(2*time.Minute + time.Second)
 	if _, ok := c.Get("k"); ok {
 		t.Error("entry should have expired past its TTL")
+	}
+}
+
+// TestReferenceSuffixMatchesCrossLanguageTestVector asserts the same
+// (key, suffix) pair as gas-city's messaging state reconciler.
+func TestReferenceSuffixMatchesCrossLanguageTestVector(t *testing.T) {
+	const key = "dr-3msk6.3-test-vector"
+	const want = "50e90a583c36"
+	if got := referenceSuffix(key); got != want {
+		t.Errorf("referenceSuffix(%q) = %q, want %q (must match the Python-side test vector)", key, got, want)
+	}
+}
+
+func TestReferenceSuffixIsDeterministicAndKeySensitive(t *testing.T) {
+	if referenceSuffix("a") != referenceSuffix("a") {
+		t.Error(`referenceSuffix("a") produced different output on two calls; want deterministic`)
+	}
+	if referenceSuffix("a") == referenceSuffix("b") {
+		t.Error(`referenceSuffix("a") == referenceSuffix("b"); want distinct keys to derive distinct suffixes`)
+	}
+}
+
+// TestHandlePublishAppendsReferenceMarkerWhenIdempotencyKeySet verifies that
+// a keyed publish can be located later in Slack channel history.
+func TestHandlePublishAppendsReferenceMarkerWhenIdempotencyKeySet(t *testing.T) {
+	reg, err := newIdentityRegistry(filepath.Join(t.TempDir(), "id.json"))
+	if err != nil {
+		t.Fatalf("newIdentityRegistry: %v", err)
+	}
+
+	origBase := slackAPIBase
+	t.Cleanup(func() { slackAPIBase = origBase })
+	var captured slackPostMessageReq
+	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Errorf("decode Slack request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"ts":"1.2"}`))
+	}))
+	t.Cleanup(fakeSlack.Close)
+	slackAPIBase = fakeSlack.URL
+
+	cfg := config{slackBotToken: "xoxb-test"}
+	body := `{"session_id":"gc-pl-1","conversation":{"conversation_id":"C1"},"text":"hello","idempotency_key":"dr-3msk6.3-test-vector"}`
+	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handlePublish(cfg, reg, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%q)", rec.Code, rec.Body.String())
+	}
+	const wantText = "hello\n\n_ref:50e90a583c36_"
+	if captured.Text != wantText {
+		t.Errorf("posted text = %q, want %q", captured.Text, wantText)
+	}
+}
+
+func TestHandlePublishOmitsReferenceMarkerWhenNoIdempotencyKey(t *testing.T) {
+	reg, err := newIdentityRegistry(filepath.Join(t.TempDir(), "id.json"))
+	if err != nil {
+		t.Fatalf("newIdentityRegistry: %v", err)
+	}
+
+	origBase := slackAPIBase
+	t.Cleanup(func() { slackAPIBase = origBase })
+	var captured slackPostMessageReq
+	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Errorf("decode Slack request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"ts":"1.2"}`))
+	}))
+	t.Cleanup(fakeSlack.Close)
+	slackAPIBase = fakeSlack.URL
+
+	cfg := config{slackBotToken: "xoxb-test"}
+	body := `{"session_id":"gc-pl-1","conversation":{"conversation_id":"C1"},"text":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/publish", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handlePublish(cfg, reg, nil, newPublishDedupCache(publishDedupTTL))(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%q)", rec.Code, rec.Body.String())
+	}
+	if captured.Text != "hello" {
+		t.Errorf("posted text = %q, want %q (no marker without an idempotency key)", captured.Text, "hello")
 	}
 }
 
