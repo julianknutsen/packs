@@ -1393,7 +1393,9 @@ func registerAdapter(cfg config) error {
 		Capabilities: adapterCapabilities{
 			SupportsChildConversations: false,
 			SupportsAttachments:        true,
-			MaxMessageLength:           40000, // Slack's chat.postMessage limit
+			// Leave room for the marker handlePublish appends after callers size
+			// keyed messages against this advertised capability.
+			MaxMessageLength: slackMaxMessageLength - referenceMarkerOverhead,
 		},
 	})
 	// PathEscape cityName so URL-significant characters cannot alter
@@ -1502,6 +1504,14 @@ func referenceSuffix(idempotencyKey string) string {
 	digest := sha256.Sum256([]byte(idempotencyKey))
 	return hex.EncodeToString(digest[:])[:12]
 }
+
+const (
+	// slackMaxMessageLength is Slack's chat.postMessage ceiling.
+	slackMaxMessageLength = 40000
+	// referenceMarkerOverhead is the two-newline separator plus the fixed-width
+	// marker appended by handlePublish for keyed messages.
+	referenceMarkerOverhead = 2 + len("_ref:") + 12 + len("_")
+)
 
 // referenceMarker is appended to outbound text when an idempotency key is
 // present. Slack message metadata would be preferable, but requires app scopes

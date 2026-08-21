@@ -991,6 +991,61 @@ func TestHandlePublishOmitsReferenceMarkerWhenNoIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestReferenceMarkerOverheadMatchesActualAppend(t *testing.T) {
+	appended := "\n\n" + referenceMarker("any-key-of-any-length-at-all")
+	if len(appended) != referenceMarkerOverhead {
+		t.Fatalf("referenceMarkerOverhead = %d, but handlePublish appends %d bytes (%q)",
+			referenceMarkerOverhead, len(appended), appended)
+	}
+	short := "\n\n" + referenceMarker("k")
+	if len(short) != len(appended) {
+		t.Fatalf("marker length varies with key length: %d vs %d", len(short), len(appended))
+	}
+}
+
+func TestAdvertisedMaxMessageLengthLeavesRoomForMarker(t *testing.T) {
+	advertised := slackMaxMessageLength - referenceMarkerOverhead
+	stamped := advertised + len("\n\n"+referenceMarker("dr-3msk6.3-test-vector"))
+	if stamped > slackMaxMessageLength {
+		t.Fatalf("a message at the advertised limit (%d) is %d after stamping, over Slack's %d ceiling",
+			advertised, stamped, slackMaxMessageLength)
+	}
+}
+
+func TestRegisterAdapterAdvertisesMarkerSafeMaxMessageLength(t *testing.T) {
+	requestCh := make(chan adapterRegisterRequest, 1)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got adapterRegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode registration request: %v", err)
+		} else {
+			requestCh <- got
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{
+		gcAPIBase: gcStub.URL,
+		cityName:  "test-city",
+		provider:  "slack",
+		accountID: "T0",
+	}
+	if err := registerAdapter(cfg); err != nil {
+		t.Fatalf("registerAdapter: %v", err)
+	}
+
+	select {
+	case got := <-requestCh:
+		want := slackMaxMessageLength - referenceMarkerOverhead
+		if got.Capabilities.MaxMessageLength != want {
+			t.Fatalf("registered MaxMessageLength = %d, want %d", got.Capabilities.MaxMessageLength, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("registerAdapter did not POST registration within 2s")
+	}
+}
+
 func TestParseHandlePrefix(t *testing.T) {
 	const prefix = "@oversight."
 	cases := []struct {
