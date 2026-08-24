@@ -3,6 +3,7 @@ wake_mode = "fresh"
 work_dir = ".gc/worktrees/{{.Rig}}/polecats/{{.AgentBase}}"
 nudge = "Run gc hook --claim --json now; if it returns work, execute the claimed formula immediately."
 pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync"]
+default_sling_formula = "mol-polecat-work"
 idle_timeout = "2h"
 min_active_sessions = 0
 max_active_sessions = 5

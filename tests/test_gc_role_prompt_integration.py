@@ -11,6 +11,9 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+GASCITY_CORE_SOURCE = (
+    "https://github.com/gastownhall/gascity.git//internal/bootstrap/packs/core"
+)
 
 
 @dataclass(frozen=True)
@@ -105,6 +108,79 @@ def write_prompt_workspace(
     return PromptWorkspace(city_dir=city_dir, rig_dir=rig_dir, env=env)
 
 
+def write_gastown_sling_workspace(root: Path) -> PromptWorkspace:
+    city_dir = root / "city"
+    rig_dir = root / "fixture"
+    gc_home = root / "gc-home"
+    home = root / "home"
+    (city_dir / ".gc").mkdir(parents=True)
+    rig_dir.mkdir()
+    gc_home.mkdir()
+    home.mkdir()
+
+    gastown_source = (REPO_ROOT / "gastown").resolve()
+    city_dir.joinpath("pack.toml").write_text(
+        textwrap.dedent(
+            f"""\
+            [pack]
+            name = "gastown-sling-integration"
+            schema = 2
+
+            [imports.core]
+            source = {json.dumps(GASCITY_CORE_SOURCE)}
+            """
+        ),
+        encoding="utf-8",
+    )
+    city_dir.joinpath("city.toml").write_text(
+        textwrap.dedent(
+            f"""\
+            [workspace]
+            provider = "opencode"
+
+            [providers.opencode]
+            base = "builtin:opencode"
+
+            [beads]
+            provider = "file"
+
+            [[rigs]]
+            name = "fixture"
+            prefix = "gc"
+            default_branch = "main"
+
+            [rigs.imports.gastown]
+            source = {json.dumps(str(gastown_source))}
+            """
+        ),
+        encoding="utf-8",
+    )
+    city_dir.joinpath(".gc", "site.toml").write_text(
+        textwrap.dedent(
+            f"""\
+            workspace_name = "gastown-sling-integration"
+
+            [[rig]]
+            name = "fixture"
+            path = {json.dumps(str(rig_dir))}
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "GC_HOME": str(gc_home),
+        "GC_CITY": str(city_dir),
+        "GC_CITY_PATH": str(city_dir),
+        "GC_CITY_ROOT": str(city_dir),
+        "GC_RIG": "fixture",
+        "GC_BEADS": "file",
+    }
+    return PromptWorkspace(city_dir=city_dir, rig_dir=rig_dir, env=env)
+
+
 def run_gc(
     gc_test_bin: Path,
     workspace: PromptWorkspace,
@@ -149,6 +225,34 @@ def test_city_scoped_gascity_registers_claim_command_from_rig(
     assert "Atomically claim one routed workflow bead" in result.stdout
     assert "Usage:\n  gc gc claim" in result.stdout
     assert "Gas City CLI — orchestration-builder" not in result.stdout
+
+
+def test_plain_gastown_polecat_sling_starts_default_graph_workflow(
+    tmp_path: Path, gc_test_bin: Path
+) -> None:
+    workspace = write_gastown_sling_workspace(tmp_path)
+
+    result = run_gc(
+        gc_test_bin,
+        workspace,
+        "--city",
+        str(workspace.city_dir),
+        "--rig",
+        "fixture",
+        "sling",
+        "fixture/gastown.polecat",
+        "Exercise the default polecat workflow",
+        "--json",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["target"] == "fixture/gastown.polecat"
+    assert payload["method"] == "default-on-formula"
+    assert payload["formula"] == "mol-polecat-work"
+    assert payload["workflow_id"]
+    assert payload["bead_id"] == payload["workflow_id"]
+    assert "molecule_id" not in payload
 
 
 @pytest.mark.parametrize(
