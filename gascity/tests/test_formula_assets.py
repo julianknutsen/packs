@@ -5066,6 +5066,38 @@ description = "Override sink that writes the base triage report contract."
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("Implementation review approved from lane verdicts", result.stdout)
 
+        with self.subTest(shape="lane status, mixed case"):
+            # The shared vocabulary reaches the jq lane-status helper via
+            # `--argjson approvals` and is matched with `ascii_downcase`. Every
+            # other `*_verdict` fixture in this file spells the value in lower
+            # case, so a helper that hard-coded a case-sensitive list of its own
+            # would leave the suite green. Spell two lanes' approvals in mixed
+            # case to pin the case-insensitive match on this path specifically.
+            list_json = json.dumps(
+                [
+                    {
+                        "id": f"lane-{key}",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": "1",
+                            f"code_review.{key}_verdict": value,
+                        },
+                    }
+                    for key, value in (
+                        ("acceptance", "Approve"),
+                        ("test_evidence", "approve"),
+                        ("simplicity", "DONE"),
+                    )
+                ]
+            )
+
+            result = self._run_implementation_review_check(
+                show_json=show_json, list_json=list_json
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Implementation review approved from lane verdicts", result.stdout)
+
     def test_implementation_review_check_notes_multiple_owner_candidates(self) -> None:
         """Owner ambiguity is reported on stderr and never fails the gate.
 
