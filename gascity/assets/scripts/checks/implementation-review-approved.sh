@@ -103,7 +103,8 @@ MATCHES="$(gmol "$PARENT_ROOT")"
 # not to write the bare `code_review.verdict`, so a candidate carrying any
 # `code_review.*_verdict` key is a lane and is dropped -- unless dropping the
 # lanes would leave nothing, in which case every candidate is kept. Narrowing
-# may never starve the gate.
+# may never starve the gate. That fallback decides from lane beads alone, so it
+# announces itself on stderr whenever it reduces more than one candidate.
 #
 # The survivors are then reduced to one value by value, never by position: an
 # approval if any survivor carries one, otherwise the lexicographically
@@ -139,6 +140,8 @@ VERDICT_SELECTION="$(printf '%s\n' "$MATCHES" | jq -r \
   | (
       if ($owners | length) > 1 then
         "review check: \($owners | length) owner-shaped beads carry code_review.verdict at attempt \($attempt) (values: \($values | join(", "))); selected \"\($verdict)\""
+      elif ($owners | length) == 0 and ($surviving | length) > 1 then
+        "review check: no owner-shaped bead at attempt \($attempt); reduced \($surviving | length) lane candidates (values: \($values | join(", "))); selected \"\($verdict)\""
       else
         ""
       end

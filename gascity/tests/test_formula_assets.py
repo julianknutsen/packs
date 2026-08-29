@@ -5104,6 +5104,59 @@ description = "Override sink that writes the base triage report contract."
         self.assertIn("Implementation review approved", result.stdout)
         self.assertIn("2 owner-shaped beads carry code_review.verdict", result.stderr)
 
+    def test_implementation_review_check_notes_lane_fallback_without_owner(self) -> None:
+        """The no-starvation fallback announces itself instead of deciding in silence.
+
+        When no owner-shaped bead exists, every candidate survives narrowing and
+        the value reduction runs over lane beads -- so one lane carrying an
+        approval outvotes any number of `iterate`s. That decision is deliberate
+        (narrowing may never starve the gate) and is left unchanged here, but it
+        must not be silent: the note names the fallback, how many candidates it
+        reduced, and what it selected.
+        """
+        show_json = json.dumps(
+            [{"id": "loop", "metadata": {"gc.root_bead_id": "root", "gc.attempt": "1"}}]
+        )
+        list_json = json.dumps(
+            [
+                {
+                    "id": "gcg-aaa",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "1",
+                        "code_review.verdict": "iterate",
+                        "code_review.acceptance_verdict": "iterate",
+                    },
+                },
+                {
+                    "id": "gcg-mmm",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "1",
+                        "code_review.verdict": "iterate",
+                        "code_review.test_evidence_verdict": "iterate",
+                    },
+                },
+                {
+                    "id": "gcg-zzz",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "1",
+                        "code_review.verdict": "approve",
+                        "code_review.simplicity_verdict": "approve",
+                    },
+                },
+            ]
+        )
+
+        result = self._run_implementation_review_check(show_json=show_json, list_json=list_json)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Implementation review approved", result.stdout)
+        self.assertIn("no owner-shaped bead at attempt 1", result.stderr)
+        self.assertIn("reduced 3 lane candidates", result.stderr)
+        self.assertIn('selected "approve"', result.stderr)
+
     def test_design_review_check_unions_every_status_leg(self) -> None:
         """The verdict usually lands on a bead the review just closed.
 
