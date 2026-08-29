@@ -26,11 +26,16 @@ gmol() {   # root_id -> molecule-member JSON array
         echo "gmol: gc ready failed for status: $(tr '\n' ' ' <"$tmp/failed")" >&2
         rc=1
     fi
-    # unique_by sorts by id, so the union comes back in bead-id order. The
-    # verdict extractors below take `| last`, which must mean "most recently
-    # updated" -- without this re-sort the gate picks a verdict by id hash and
-    # can sit on a stale `iterate` forever while a newer `done` is ignored.
-    jq -s 'map(select(type=="array")) | add // [] | unique_by(.id) | sort_by(.updated_at // "")' "$tmp"/*.json || rc=1
+    # unique_by sorts by id, so the union comes back in bead-id order -- and
+    # that is the only order there is. `gc ready --json` emits no `updated_at`,
+    # so the re-sort this line used to carry compared every row equal, left the
+    # id order untouched, and still claimed to mean "most recently updated".
+    #
+    # The verdict selection below does not depend on this order: it partitions
+    # the candidates by ownership and then reduces them to one value by value,
+    # never by position. The lane-status aggregation further down does still
+    # take the id-last value per key; see the note there.
+    jq -s 'map(select(type=="array")) | add // [] | unique_by(.id)' "$tmp"/*.json || rc=1
     rm -rf "$tmp"
     return "$rc"
 }
@@ -56,6 +61,26 @@ metadata_value() {
   ' 2>/dev/null
 }
 
+# The one approval vocabulary. Both consumers read this single definition and
+# both match case-insensitively: the jq lane-status helper, which receives it
+# via --argjson, and the bash dispatch at the bottom of the file. A spelling
+# added here reaches every consumer at once.
+APPROVAL_VERDICTS=(approve approved pass done)
+APPROVAL_VERDICTS_JSON="$(printf '%s\n' "${APPROVAL_VERDICTS[@]}" \
+  | jq -Rsc 'split("\n") | map(select(. != ""))')"
+
+is_approved() {
+  local candidate known
+  candidate="$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')"
+  [ -n "$candidate" ] || return 1
+  for known in "${APPROVAL_VERDICTS[@]}"; do
+    if [ "$candidate" = "$known" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 ROOT_JSON="$(gc bd show "$ROOT_ID" --json 2>/dev/null || true)"
 PARENT_ROOT="$(metadata_value "$ROOT_JSON" "gc.root_bead_id")"
 if [ -z "$PARENT_ROOT" ]; then
@@ -73,23 +98,58 @@ fi
 
 MATCHES="$(gmol "$PARENT_ROOT")"
 
-VERDICT="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
+# One bead owns the loop verdict: the apply step that closes out the review.
+# Review lanes report their own `code_review.<lane>_verdict` and are contracted
+# not to write the bare `code_review.verdict`, so a candidate carrying any
+# `code_review.*_verdict` key is a lane and is dropped -- unless dropping the
+# lanes would leave nothing, in which case every candidate is kept. Narrowing
+# may never starve the gate.
+#
+# The survivors are then reduced to one value by value, never by position: an
+# approval if any survivor carries one, otherwise the lexicographically
+# smallest of the distinct non-approving values. Both are invariant under a
+# permutation of bead ids -- the property the old `| last` could not hold.
+#
+# jq emits two lines: the selected verdict, then an optional ambiguity note.
+VERDICT_SELECTION="$(printf '%s\n' "$MATCHES" | jq -r \
+  --arg attempt "$ATTEMPT" \
+  --argjson approvals "$APPROVAL_VERDICTS_JSON" '
+  def is_approval($value):
+    (($value // "") | ascii_downcase) as $v
+    | any($approvals[]; . == $v);
   [
     .[]
     | select((.metadata["gc.attempt"] // "") == $attempt)
     | select((.metadata["code_review.verdict"] // "") != "")
-    | .metadata["code_review.verdict"]
-  ] | last // ""
+    | {
+        value: .metadata["code_review.verdict"],
+        lane: (
+          [(.metadata // {}) | keys[] | select(test("^code_review\\..+_verdict$"))]
+          | length > 0
+        )
+      }
+  ] as $candidates
+  | ($candidates | map(select(.lane | not))) as $owners
+  | (if ($owners | length) > 0 then $owners else $candidates end) as $surviving
+  | ($surviving | map(.value) | unique) as $values
+  | ($values | map(select(is_approval(.)))) as $approving
+  | (
+      if ($approving | length) > 0 then $approving[0] else ($values[0] // "") end
+    ) as $verdict
+  | (
+      if ($owners | length) > 1 then
+        "review check: \($owners | length) owner-shaped beads carry code_review.verdict at attempt \($attempt) (values: \($values | join(", "))); selected \"\($verdict)\""
+      else
+        ""
+      end
+    ) as $note
+  | "\($verdict)\n\($note)"
 ' 2>/dev/null)"
-
-REPORT="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
-  [
-    .[]
-    | select((.metadata["gc.attempt"] // "") == $attempt)
-    | select((.metadata["code_review.report_path"] // "") != "")
-    | .metadata["code_review.report_path"]
-  ] | last // ""
-' 2>/dev/null)"
+VERDICT="$(printf '%s\n' "$VERDICT_SELECTION" | sed -n '1p')"
+VERDICT_NOTE="$(printf '%s\n' "$VERDICT_SELECTION" | sed -n '2p')"
+if [ -n "$VERDICT_NOTE" ]; then
+  echo "$VERDICT_NOTE" >&2
+fi
 
 REVIEW_MODE="$(metadata_value "$ROOT_JSON" "gc.var.review_mode")"
 if [ -z "$REVIEW_MODE" ]; then
@@ -104,6 +164,9 @@ if [ "$REVIEW_MODE" = "report" ]; then
     REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.var.report_path")"
   fi
   if [ -z "$REPORT_MODE_PATH" ]; then
+    # This `| last` picks a report *path* out of the same id-ordered union, not
+    # a loop decision. Report mode is behavior-preserved here, so the id-order
+    # dependency is documented rather than changed.
     REPORT_MODE_PATH="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
       [
         .[]
@@ -130,7 +193,8 @@ LANE_STATUS="$(printf '%s\n' "$MATCHES" | jq -r \
   --arg root "$PARENT_ROOT" \
   --arg attempt "$ATTEMPT" \
   --arg scope "$SCOPE_REF" \
-  --arg step "$STEP_ID" '
+  --arg step "$STEP_ID" \
+  --argjson approvals "$APPROVAL_VERDICTS_JSON" '
   def current_loop:
     select(.metadata["gc.root_bead_id"] == $root)
     | select(($attempt == "") or ((.metadata["gc.attempt"] // "") == $attempt))
@@ -151,9 +215,10 @@ LANE_STATUS="$(printf '%s\n' "$MATCHES" | jq -r \
           true
         end
       );
+  # Same vocabulary the bash dispatch uses, handed in via --argjson approvals.
   def approved($value):
     (($value // "") | ascii_downcase) as $v
-    | ($v == "approve" or $v == "approved" or $v == "pass" or $v == "done");
+    | any($approvals[]; . == $v);
   [
     .[]
     | current_loop
@@ -164,6 +229,9 @@ LANE_STATUS="$(printf '%s\n' "$MATCHES" | jq -r \
         simplicity: (."code_review.simplicity_verdict" // "")
       }
   ] as $rows
+  # Each key still takes the id-last non-empty value out of the id-ordered
+  # union gmol returns. That dependency is real; this change deliberately
+  # leaves the lane-status path behavior-preserving and does not repair it.
   | {
       acceptance: ([$rows[].acceptance | select(. != "")] | last // ""),
       test_evidence: ([$rows[].test_evidence | select(. != "")] | last // ""),
@@ -180,24 +248,19 @@ LANE_STATUS="$(printf '%s\n' "$MATCHES" | jq -r \
     end
 ' 2>/dev/null)"
 
-if [ "$VERDICT" != "done" ]; then
-  case "$VERDICT" in
-    approved|pass)
-      ;;
-    "")
-      if [ "$LANE_STATUS" = "approved" ]; then
-        echo "Implementation review approved from lane verdicts"
-        exit 0
-      fi
-      echo "Implementation review needs another iteration: ${LANE_STATUS:-missing verdict}"
-      exit 1
-      ;;
-    *)
-      echo "Implementation review needs another iteration: $VERDICT"
-      exit 1
-      ;;
-  esac
+if [ -z "$VERDICT" ]; then
+  if [ "$LANE_STATUS" = "approved" ]; then
+    echo "Implementation review approved from lane verdicts"
+    exit 0
+  fi
+  echo "Implementation review needs another iteration: ${LANE_STATUS:-missing verdict}"
+  exit 1
 fi
 
-echo "Implementation review approved"
-exit 0
+if is_approved "$VERDICT"; then
+  echo "Implementation review approved"
+  exit 0
+fi
+
+echo "Implementation review needs another iteration: $VERDICT"
+exit 1

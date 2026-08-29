@@ -4845,43 +4845,264 @@ description = "Override sink that writes the base triage report contract."
         self.assertIn("code_review.verdict=iterate", apply_text)
         self.assertIn("code_review.report_path=<fix summary path>", apply_text)
 
-    def test_implementation_review_check_takes_newest_verdict_not_highest_id(self) -> None:
-        """`| last` in the verdict extractors has to mean newest, not highest id.
+    def test_implementation_review_check_takes_owner_verdict_not_highest_id(self) -> None:
+        """The owner's verdict decides the loop, and id order is irrelevant.
 
-        gmol dedupes the four status legs with `unique_by(.id)`, and jq's
-        unique_by sorts — so without a re-sort the union arrives in bead-id
-        order and this gate's `| last` picks a verdict by id hash. Here the
-        stale `iterate` sorts after the newer `done`, so an already-approved
-        review would loop until Ralph ran out of attempts: the exact symptom
-        the federating-reader fix was written to end, re-entering by ordering
-        rather than by starvation.
+        gmol dedupes the four status legs with `unique_by(.id)`, so the union
+        arrives in bead-id order and there is no recency signal to recover:
+        `gc ready --json` emits no `updated_at`. The verdict the loop acts on
+        is therefore the one written by the bead that *owns* it -- the apply
+        lane -- not whichever candidate happens to sort last. Here a review
+        lane, marked by its own `code_review.review_verdict`, carries a stale
+        `iterate` and sorts last by id; the owner's `done` must still win.
+
+        This fixture used to set `updated_at` on every row -- a field the real
+        reader never emits. That made the since-removed `sort_by(.updated_at)`
+        look load-bearing and the id-order selection look correct, so this
+        test passed for its entire life while the defect it names shipped.
         """
         show_json = json.dumps(
             [{"id": "loop", "metadata": {"gc.root_bead_id": "root", "gc.attempt": "1"}}]
         )
 
-        def member(bead_id: str, updated: str, verdict: str) -> dict:
-            return {
-                "id": bead_id,
-                "updated_at": updated,
-                "metadata": {
-                    "gc.root_bead_id": "root",
-                    "gc.attempt": "1",
-                    "code_review.verdict": verdict,
-                    "code_review.report_path": f"/reports/{bead_id}.md",
-                },
+        def member(bead_id: str, verdict: str, *, lane: bool = False) -> dict:
+            metadata = {
+                "gc.root_bead_id": "root",
+                "gc.attempt": "1",
+                "code_review.verdict": verdict,
+                "code_review.report_path": f"/reports/{bead_id}.md",
             }
+            if lane:
+                # Any `code_review.*_verdict` key marks a review lane. Every
+                # lane prompt in the packs is contracted not to write the bare
+                # `code_review.verdict` the apply lane owns.
+                metadata["code_review.review_verdict"] = verdict
+            return {"id": bead_id, "metadata": metadata}
 
-        # "gcg-zzz" sorts last by id but carries the OLDER verdict.
+        # "gcg-zzz" sorts last by id but is a review lane, not the owner.
         list_json = json.dumps(
             [
-                member("gcg-aaa", "2026-08-13T03:00:00Z", "done"),
-                member("gcg-zzz", "2026-08-13T01:00:00Z", "iterate"),
+                member("gcg-aaa", "done"),
+                member("gcg-zzz", "iterate", lane=True),
             ]
         )
         result = self._run_implementation_review_check(show_json=show_json, list_json=list_json)
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_implementation_review_check_is_invariant_under_id_permutation(self) -> None:
+        """Exchanging the two bead ids changes neither exit code nor stdout.
+
+        This is the property the id-ordered `| last` could not hold: the same
+        molecule, relabelled, decided the loop differently.
+        """
+        show_json = json.dumps(
+            [{"id": "loop", "metadata": {"gc.root_bead_id": "root", "gc.attempt": "1"}}]
+        )
+
+        def fixture(owner_id: str, lane_id: str) -> str:
+            return json.dumps(
+                [
+                    {
+                        "id": owner_id,
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": "1",
+                            "code_review.verdict": "done",
+                        },
+                    },
+                    {
+                        "id": lane_id,
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": "1",
+                            "code_review.verdict": "iterate",
+                            "code_review.review_verdict": "iterate",
+                        },
+                    },
+                ]
+            )
+
+        first = self._run_implementation_review_check(
+            show_json=show_json, list_json=fixture("gcg-aaa", "gcg-zzz")
+        )
+        second = self._run_implementation_review_check(
+            show_json=show_json, list_json=fixture("gcg-zzz", "gcg-aaa")
+        )
+
+        self.assertEqual(
+            first.returncode,
+            second.returncode,
+            f"{first.stdout}{first.stderr}||{second.stdout}{second.stderr}",
+        )
+        self.assertEqual(first.stdout, second.stdout)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+
+    def test_implementation_review_check_accepts_every_approval_spelling(self) -> None:
+        """One approval vocabulary, matched case-insensitively.
+
+        The bash dispatch and the jq lane-status helper used to carry separate
+        copies of the list, and the bash copy was missing `approve` -- a value
+        the jq copy had always treated as approval.
+        """
+        show_json = json.dumps(
+            [{"id": "loop", "metadata": {"gc.root_bead_id": "root", "gc.attempt": "1"}}]
+        )
+
+        for verdict in ("approve", "approved", "pass", "done", "Approve", "DONE"):
+            with self.subTest(verdict=verdict):
+                list_json = json.dumps(
+                    [
+                        {
+                            "id": "apply",
+                            "metadata": {
+                                "gc.root_bead_id": "root",
+                                "gc.attempt": "1",
+                                "code_review.verdict": verdict,
+                            },
+                        }
+                    ]
+                )
+
+                result = self._run_implementation_review_check(
+                    show_json=show_json, list_json=list_json
+                )
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Implementation review approved", result.stdout)
+
+    def test_implementation_review_check_rejects_owner_iterate_over_lane_approve(self) -> None:
+        """A lane's approval cannot outvote the owner's `iterate`.
+
+        No total order over the *values* satisfies both this case and the
+        `{done, iterate}` fix-pass case below -- they differ only in who wrote
+        each value, which is why the selection partitions by ownership.
+        """
+        show_json = json.dumps(
+            [{"id": "loop", "metadata": {"gc.root_bead_id": "root", "gc.attempt": "1"}}]
+        )
+        # The lane sorts last by id; only ownership keeps it from deciding.
+        list_json = json.dumps(
+            [
+                {
+                    "id": "aaa-apply",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "1",
+                        "code_review.verdict": "iterate",
+                    },
+                },
+                {
+                    "id": "zzz-acceptance",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "1",
+                        "code_review.verdict": "approve",
+                        "code_review.acceptance_verdict": "approve",
+                    },
+                },
+            ]
+        )
+
+        result = self._run_implementation_review_check(show_json=show_json, list_json=list_json)
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("needs another iteration: iterate", result.stdout)
+
+    def test_implementation_review_check_never_starves_a_molecule_with_a_verdict(self) -> None:
+        """Narrowing to owners may never empty the candidate set.
+
+        Two shapes reach the same conclusion. A molecule whose only verdict
+        carrier also looks like a lane has no distinguishable owner, so the
+        selection falls back to the full candidate set instead of reporting a
+        missing verdict; and a molecule with no bare verdict at all still
+        reaches the lane-status aggregation, which this change leaves intact.
+        """
+        show_json = json.dumps(
+            [{"id": "loop", "metadata": {"gc.root_bead_id": "root", "gc.attempt": "1"}}]
+        )
+
+        with self.subTest(shape="no distinguishable owner"):
+            list_json = json.dumps(
+                [
+                    {
+                        "id": "only-carrier",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": "1",
+                            "code_review.verdict": "done",
+                            "code_review.review_verdict": "approve",
+                        },
+                    }
+                ]
+            )
+
+            result = self._run_implementation_review_check(
+                show_json=show_json, list_json=list_json
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("missing verdict", result.stdout)
+
+        with self.subTest(shape="lane status only"):
+            list_json = json.dumps(
+                [
+                    {
+                        "id": f"lane-{key}",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": "1",
+                            f"code_review.{key}_verdict": "approve",
+                        },
+                    }
+                    for key in ("acceptance", "test_evidence", "simplicity")
+                ]
+            )
+
+            result = self._run_implementation_review_check(
+                show_json=show_json, list_json=list_json
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Implementation review approved from lane verdicts", result.stdout)
+
+    def test_implementation_review_check_notes_multiple_owner_candidates(self) -> None:
+        """Owner ambiguity is reported on stderr and never fails the gate.
+
+        Two owner-shaped beads in one attempt is the fix-pass shape: an owner
+        wrote `iterate`, a later pass wrote `done`, and the terminal state is
+        approval. The note names the ambiguity for a human without turning a
+        reported state into a loop decision.
+        """
+        show_json = json.dumps(
+            [{"id": "loop", "metadata": {"gc.root_bead_id": "root", "gc.attempt": "1"}}]
+        )
+        list_json = json.dumps(
+            [
+                {
+                    "id": "gcg-aaa",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "1",
+                        "code_review.verdict": "done",
+                    },
+                },
+                {
+                    "id": "gcg-zzz",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "1",
+                        "code_review.verdict": "iterate",
+                    },
+                },
+            ]
+        )
+
+        result = self._run_implementation_review_check(show_json=show_json, list_json=list_json)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Implementation review approved", result.stdout)
+        self.assertIn("2 owner-shaped beads carry code_review.verdict", result.stderr)
 
     def test_design_review_check_unions_every_status_leg(self) -> None:
         """The verdict usually lands on a bead the review just closed.
