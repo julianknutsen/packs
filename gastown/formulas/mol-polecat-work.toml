@@ -366,10 +366,20 @@ because an absent key yielded the empty string and the empty string is not
 `"false"`. Two of the affected rigs are customer repos, and an unintended push
 to a customer repo has already caused an unintended prod deploy once. So the
 gate reads the bead's prose as well as its metadata, and halts rather than
-guess. Four outcomes, evaluated in order:
+guess.
+
+The metadata itself is read through a shape-normalising probe, because the one
+thing worse than an unenforced rail is a *recorded* rail the gate silently
+fails to read: `jq`'s `has()` errors on a string, so on a ledger that serves
+`metadata` as a JSON string the explicit `auto_push=false` opt-out used to
+evaluate to the empty string and the bead was pushed (gci-to0l). Object, null
+and JSON-string payloads are all read; anything else halts.
+
+Five outcomes, evaluated in order:
 
 | `auto_push` | Bead prose | Outcome |
 |---|---|---|
+| metadata unreadable | not read | halt at branch-ready **and escalate** — a payload that cannot be read cannot be shown to lack the opt-out |
 | `false` | not read | halt at branch-ready — the explicit opt-out |
 | absent | asserts a no-push rail | halt at branch-ready **and escalate** — ambiguous, a human owns the call |
 | absent | no rail | push + refinery handoff — the normal path |
@@ -377,8 +387,92 @@ guess. Four outcomes, evaluated in order:
 
 ```bash
 WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
-AUTO_PUSH=$(printf '%s' "$WORK_JSON" | jq -r '(.[0].metadata // {}) | if has("auto_push") then (.auto_push | tostring) else "" end')
 BRANCH=$(git branch --show-current)
+
+# The metadata probe — NORMALISED, and fail CLOSED on a payload it cannot read.
+#
+# jq's has() ERRORS on a string, printing nothing to stdout, so the old probe
+# turned a string-shaped metadata payload into "" — and "" is not "false", so
+# outcome (a), the EXPLICIT opt-out, silently stopped firing and control
+# reached git push. A fail-OPEN on the one outcome nobody expects to be
+# conditional, and it inverted the incentive the whole no-push-rail arc has
+# been pushing: a bead that recorded its rail properly AS METADATA, and said
+# nothing in prose, is exactly the bead with no prose for (b) to match on.
+# Reproduced against this gate's own shipped text, 2026-09-05: explicit
+# auto_push=false + string-shaped metadata -> PUSH.
+#
+# MEASURED 2026-09-05 across all 7 active ledgers (control, sb, sb-app,
+# gas-city, flinders, arnotts, detmold) through this gate's own probe shape
+# (gc bd show <id> --json | jq of .[0].metadata | type): every one serves an
+# OBJECT when metadata is present and NULL when it is absent. No ledger serves
+# a string today, so this is a latent trap rather than a live hole — but
+# instruments/no-push-rail-detector.sh records that the shape varies by rig
+# (its META_JQ normalises object / string / null for the same reason), so the
+# normalisation is lifted here now rather than on the day it bites.
+#
+#   object -> read it.
+#   null   -> the bead carries no metadata. A legitimate live shape on every
+#             rig and the MAJORITY of beads (308 of the 410 open/in_progress
+#             beads across the six queryable ledgers), so it must fall through
+#             to (b) and never halt.
+#   string -> a JSON-encoded object. Parse it, then read it.
+#   anything else, a string that does not parse to an object, or a probe that
+#             fails outright -> UNREADABLE, handled at (a0) below. Note this is
+#             the OPPOSITE default to the (b) prose scan's empty INPUT case:
+#             there, nothing said is a legitimate "no rail"; here, nothing read
+#             is a failure to retrieve a decision that may well exist.
+AUTO_PUSH=""
+META_UNREADABLE=""
+if [ -z "$WORK_JSON" ]; then
+  META_UNREADABLE=1
+elif ! AUTO_PUSH=$(printf '%s' "$WORK_JSON" | jq -r '
+      if (type != "array") or (length == 0) or ((.[0] | type) != "object")
+      then error("no bead record in the payload")
+      else (.[0].metadata
+            | if   type == "object" then .
+              elif type == "null"   then {}
+              elif type == "string" then (fromjson? // "unparseable")
+              else "not-an-object" end)
+           | if type != "object" then error("metadata is not an object")
+             elif has("auto_push") then (.auto_push | tostring)
+             else "" end
+      end' 2>/dev/null); then
+  META_UNREADABLE=1
+fi
+
+# (a0) The payload could not be read. Absent metadata is not consent, and
+# UNREADABLE metadata is not absent metadata — it is a bead whose recorded
+# decision the gate failed to retrieve. Reading the prose instead would be
+# guessing, so halt and hand it to a human.
+if [ -n "$META_UNREADABLE" ]; then
+  echo "metadata unreadable: halting at branch-ready (fail closed) and escalating."
+  # --append-notes, NEVER --notes — same rule as the other two halts (gci-3f5u).
+  gc bd update "$WORK_BEAD_ID" \
+    --status=open --assignee="" \
+    --set-metadata branch="$BRANCH" \
+    --set-metadata target={{base_branch}} \
+    --set-metadata branch_ready=true \
+    --set-metadata halt_reason=metadata_unreadable \
+    --set-metadata gc.routed_to="" \
+    --append-notes "Branch ready: the push gate could not read this bead's metadata — the ledger read returned no bead record, or served metadata in a shape the probe cannot decode. An unreadable payload cannot be shown to lack auto_push=false, so the gate halted instead of pushing. Re-read the bead, record the push decision explicitly, then re-sling."
+  gc mail send "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" \
+    -s "HELP: push-gate metadata unreadable on $WORK_BEAD_ID [HIGH]" \
+    -m "Halted at branch-ready instead of pushing.
+
+Bead:   $WORK_BEAD_ID
+Branch: $BRANCH (local only — NOT pushed)
+Reason: the ledger read returned no readable bead record, or served the
+        metadata in a shape the gate cannot decode (expected an object, a
+        JSON string, or null). The gate cannot tell 'halt' from 'go', so it
+        halted.
+
+Resolve: check the ledger is healthy, then record the decision as metadata —
+  gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
+  gc bd update $WORK_BEAD_ID --set-metadata auto_push=true    # authorise the push
+and re-sling. Use --set-metadata so branch and gc.routed_to survive."
+  gc runtime drain-ack
+  exit 0
+fi
 
 # (a) Explicit opt-out. Never read the prose — the metadata already decided.
 if [ "$AUTO_PUSH" = "false" ]; then
