@@ -383,6 +383,8 @@ BRANCH=$(git branch --show-current)
 # (a) Explicit opt-out. Never read the prose — the metadata already decided.
 if [ "$AUTO_PUSH" = "false" ]; then
   echo "auto_push=false: halting at branch-ready (no push, no refinery handoff)"
+  # --append-notes, NEVER --notes. --notes REPLACES the entire notes field, so a
+  # halt note written with it destroys whatever the requester left on the bead.
   gc bd update "$WORK_BEAD_ID" \
     --status=open --assignee="" \
     --set-metadata branch="$BRANCH" \
@@ -390,7 +392,7 @@ if [ "$AUTO_PUSH" = "false" ]; then
     --set-metadata branch_ready=true \
     --set-metadata halt_reason=auto_push_false \
     --set-metadata gc.routed_to="" \
-    --notes "Branch ready: auto_push=false (no push, no refinery handoff)"
+    --append-notes "Branch ready: auto_push=false (no push, no refinery handoff)"
   gc runtime drain-ack
   exit 0
 fi
@@ -413,6 +415,9 @@ if [ -z "$AUTO_PUSH" ]; then
   # undetermined rail is treated as an asserted one.
   if [ "${RAIL_HIT:-1}" -gt 0 ]; then
     echo "NO-PUSH RAIL IN PROSE + auto_push ABSENT — halting at branch-ready (fail closed) and escalating."
+    # --append-notes, NEVER --notes. This halt cites a rail that is frequently
+    # written in the very notes a bare --notes would replace, so replacing them
+    # would delete the evidence the halt note tells the reader to go and read.
     gc bd update "$WORK_BEAD_ID" \
       --status=open --assignee="" \
       --set-metadata branch="$BRANCH" \
@@ -420,7 +425,7 @@ if [ -z "$AUTO_PUSH" ]; then
       --set-metadata branch_ready=true \
       --set-metadata halt_reason=no_push_rail_unresolved \
       --set-metadata gc.routed_to="" \
-      --notes "Branch ready: DESCRIPTION/NOTES assert a no-push rail but the bead carries no auto_push metadata, so the rail is unenforceable. Halted instead of guessing. Whoever owns the rail: set auto_push=false to confirm the halt, or auto_push=true to authorise the push, then re-sling."
+      --append-notes "Branch ready: DESCRIPTION/NOTES assert a no-push rail but the bead carries no auto_push metadata, so the rail is unenforceable. Halted instead of guessing. Whoever owns the rail: set auto_push=false to confirm the halt, or auto_push=true to authorise the push, then re-sling."
     gc mail send "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" \
       -s "HELP: no-push rail unresolved on $WORK_BEAD_ID [HIGH]" \
       -m "Halted at branch-ready instead of pushing.
@@ -480,15 +485,33 @@ git branch -D "$BRANCH"              # Branch is pushed; refinery owns it now
 
 **5. Update metadata on the work bead:**
 ```bash
+# --append-notes, NEVER --notes — see the note under this block.
 gc bd update "$WORK_BEAD_ID" \
   --set-metadata target={{base_branch}} \
-  --notes "Implemented: <brief summary>"
+  --append-notes "Implemented: <brief summary>"
 ```
 Branch was recorded in workspace-setup and is already in metadata.
 This adds the target for the refinery. If an existing pull request was
 provided by the caller, `metadata.existing_pr` is preserved for refinery
 validation. The refinery records canonical `pr_url` only after verifying
 the PR is open and matches the branch, base, and origin repository.
+
+**Every `gc bd update` call in this step uses `--append-notes`. Never use
+`--notes`.** The two flags do not differ in emphasis: `--notes` REPLACES the
+whole notes field, `--append-notes` appends to it with a newline separator. The
+bead you are finishing is not yours — it carries the requester's instructions,
+and on a rig it may carry an operator's hold or a prior polecat's handover. A
+closing note written with `--notes` deletes all of it, in one call, with no
+warning and no diff. That is bead-history destruction by the normal happy path,
+which is why it went unnoticed twice.
+
+The rule binds the two halt writes in item 3 hardest, not least. Both of them
+tell the reader to go and act on what the bead says — the ambiguity halt asks
+whoever owns the rail to resolve a rail that is, in the usual case, written in
+the very notes a bare `--notes` would have just deleted. The identity-stamped
+bead record is also the city's anchor against nudge-text spoofing, so a rail
+that silently erases it is a P1, not a formatting nit. The same rule holds
+anywhere a formula writes a note onto a bead it did not create: append.
 
 **6. Reassign to refinery:**
 ```bash
