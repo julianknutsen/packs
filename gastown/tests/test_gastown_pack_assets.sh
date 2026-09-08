@@ -179,6 +179,40 @@ test_review_leg_contract_forbids_synthetic_mutation() {
         fail "polecat prompt must not globally forbid review-leg close steps"
 }
 
+test_witness_wisp_queries_pin_include_infra() {
+    local prompt formula total flagged
+    prompt="$GASTOWN/agents/witness/prompt.template.md"
+    formula="$GASTOWN/formulas/mol-witness-patrol.toml"
+
+    # Wisp roots are ephemeral, so gc bd list skips the wisps tier unless
+    # --include-infra is passed: a wisp-reconcile query without it returns []
+    # even when a wisp is assigned, and the witness pours a duplicate. That
+    # regressed once already, so pin the flag rather than trust the comments.
+    # Deliberately witness-scoped: the refinery and deacon patrol queries
+    # still carry the bare form and are tracked separately in #252, so a
+    # pack-wide assertion would fail here instead of guarding this contract.
+    total=$(grep -h -- '--type=molecule' "$prompt" "$formula" |
+        grep -c -F 'gc bd list' || true)
+    flagged=$(grep -h -- '--type=molecule' "$prompt" "$formula" |
+        grep -F 'gc bd list' | grep -c -- '--include-infra' || true)
+
+    # -ge, not -eq: the flagged/total assertion below owns the contract, so an
+    # exact count only adds a cardinality pin -- and a legitimate sixth query,
+    # or a prose line that happens to name all three tokens counted above,
+    # then fails the suite with nothing wrong. Measured: -ge holds every
+    # regression mode red (flag stripped from a prompt query, from the formula
+    # query, a query site deleted, an unflagged sixth site) while dropping
+    # both false positives. A prose line carrying the query tokens but not the
+    # flag still fails -- loud, in the safe direction. Requiring --json on
+    # counted lines would silence that last one too, but it is not a
+    # substitute: it stops counting any query that does not pipe to jq, so an
+    # unflagged new site written without --json passes silently.
+    [[ "$total" -ge 5 ]] ||
+        fail "expected at least 5 witness --type=molecule wisp queries (4 prompt + 1 formula), found $total"
+    [[ "$flagged" -eq "$total" ]] ||
+        fail "witness --type=molecule wisp queries must pass --include-infra ($flagged/$total do)"
+}
+
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed() {
     local formula direct_block
     formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
@@ -261,6 +295,7 @@ test_composition_is_documented
 test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
+test_witness_wisp_queries_pin_include_infra
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 
 echo "gastown pack asset tests passed"
