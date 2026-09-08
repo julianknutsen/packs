@@ -17,10 +17,14 @@ are fast and hermetic (no real compile, no network):
     missing *explicitly configured* one is fatal (starting on ambient
     credentials would post to whatever workspace is in the environment),
   * the self-heal's failure paths exit 1 and publish nothing: no Go new
-    enough for go.mod under ``GOTOOLCHAIN=local``, and ``go build``
-    failing,
+    enough for go.mod under ``GOTOOLCHAIN=local``, no Go new enough
+    while running *supervised* and the newer toolchain not cached (the
+    fetch it would otherwise start cannot fit the readiness window) —
+    while the same host with that toolchain already cached still
+    builds — and ``go build`` failing,
   * the self-heal survives the minimal supervisor environment it
-    targets (no HOME) by supplying a build cache,
+    targets (no HOME) by supplying a build cache, and that cache is
+    private to this user rather than a shared /tmp name,
   * pack.toml keeps pointing the service at a checked-in command.
 
 The harness owns HOME/XDG_CONFIG_HOME so the *defaulted* env-file path
@@ -46,10 +50,27 @@ GO_STUB = """#!/usr/bin/env bash
 # can pin WHERE the build ran), and on `build` writes an executable at
 # the -o target that prints a marker instead of compiling. Two knobs let
 # tests drive run.sh's failure paths: GO_STUB_VERSION (what `go version`
-# reports, defaulting high enough to satisfy any go.mod directive) and
-# GO_STUB_BUILD_FAILS (make `build` exit non-zero).
+# reports, defaulting high enough to satisfy any go.mod directive),
+# GO_STUB_BUILD_FAILS (make `build` exit non-zero) and
+# GO_STUB_TOOLCHAIN_CACHED (see the toolchain-switch model below).
 echo "go $* cwd=$PWD" >> "$GO_STUB_LOG"
 if [ "$1" = "version" ]; then
+  # Model the toolchain switch. Run inside a module whose go.mod asks
+  # for a newer Go than itself, the real go command resolves that
+  # toolchain before doing anything else — from the local module cache
+  # if it is already there, over the network otherwise. GOPROXY=off
+  # forbids the network, so the call fails outright when the toolchain
+  # is not cached. run.sh uses exactly that combination to tell "this
+  # build would download a toolchain" from "the toolchain is already
+  # local", and only refuses to start in the first case, so the stub has
+  # to distinguish them. GOPROXY=off therefore means "this is the probe"
+  # (the harness clears any inherited GOPROXY so it cannot mean anything
+  # else), and the default answer is the production case F1 is about:
+  # not cached, a download would be required.
+  if [ "${GOPROXY:-}" = "off" ] && [ -z "${GO_STUB_TOOLCHAIN_CACHED:-}" ]; then
+    echo "go: downloading go1.99.0 (unavailable: module lookup disabled by GOPROXY=off)" >&2
+    exit 1
+  fi
   echo "go version go${GO_STUB_VERSION:-99.0.0} stub/stub"
   exit 0
 fi
@@ -84,6 +105,56 @@ def required_go_version() -> str:
     raise AssertionError(f"no `go` directive in {GO_MOD}")
 
 
+# Stub toolchain versions for the two version-gate tests. Both are older
+# than go.mod's directive, but they get there differently and only the
+# pair covers the comparator: "1.0.0" is lower numerically AND lexically,
+# so a plain string compare passes it; "1.9.0" is lower ONLY numerically
+# ("1.9" sorts above "1.25" as text). run.sh's version_key exists for
+# exactly that second case, so a test suite driving only "1.0.0" stays
+# green if the comparator regresses to a string compare.
+OLD_GO_VERSIONS = ["1.0.0", "1.9.0"]
+
+
+def private_tmp(tmpdir: pathlib.Path, name: str) -> str:
+    """The per-user cache path run.sh derives under TMPDIR. The uid
+    suffix is the point: a fixed shared name in world-writable /tmp can
+    be pre-created by another local user, and Go trusts what it finds in
+    these caches.
+
+    Tests that assert on these paths hand run.sh their own TMPDIR — the
+    dirs are deliberately stable across runs, so pointing them at the
+    real /tmp would leave state behind and make the assertions depend on
+    what an earlier run left there."""
+    return f"{str(tmpdir).rstrip('/')}/{name}.{os.geteuid()}"
+
+
+# Where the stub records its invocations. Named once so a test can read
+# the log the harness wrote without re-deriving the path.
+GO_LOG_NAME = "go-invocations.log"
+
+
+def go_version_calls(tmp_path: pathlib.Path) -> list[str]:
+    """The stub's `go version` invocations, each with the cwd it ran in."""
+    log = tmp_path / GO_LOG_NAME
+    if not log.exists():
+        return []
+    return [l for l in log.read_text().splitlines() if l.startswith("go version")]
+
+
+def assert_older_than_go_mod(stub_version: str) -> None:
+    """Pin the parametrization's premise so a future `go` directive bump
+    cannot quietly turn these into no-op tests."""
+    required = required_go_version()
+
+    def key(v: str) -> tuple:
+        return tuple(int(p) for p in (v.split(".") + ["0", "0"])[:3])
+
+    assert key(stub_version) < key(required), (
+        f"test premise broken: stub Go {stub_version} is not older than "
+        f"go.mod's {required}, so the version gate would not fire"
+    )
+
+
 @pytest.fixture()
 def harness(tmp_path: pathlib.Path):
     """Adapter dir holding what a git-only materialization ships —
@@ -107,7 +178,7 @@ def harness(tmp_path: pathlib.Path):
     fake_home = tmp_path / "home"
     (fake_home / ".config").mkdir(parents=True)
 
-    go_log = tmp_path / "go-invocations.log"
+    go_log = tmp_path / GO_LOG_NAME
 
     def run(
         env_file: pathlib.Path | None = None,
@@ -122,6 +193,20 @@ def harness(tmp_path: pathlib.Path):
         # An explicitly set but missing GC_SLACK_ADAPTER_ENV is fatal by
         # design, so the "no env file" baseline is the defaulted path.
         env.pop("GC_SLACK_ADAPTER_ENV", None)
+        # run.sh reads these to decide it is running supervised, which
+        # changes the too-old-toolchain path from warn-and-build to
+        # refuse. The suite itself can run inside a gc service or agent
+        # that exports them, so the baseline must be *unsupervised*
+        # explicitly — inheriting them would flip an unrelated test's
+        # expected outcome depending on who ran pytest.
+        env.pop("GC_SERVICE_NAME", None)
+        env.pop("GC_SERVICE_URL_PREFIX", None)
+        # run.sh sets GOPROXY=off itself, for the single `go version`
+        # call that probes whether the newer toolchain is already
+        # cached. The stub reads GOPROXY=off as "this is that probe"; an
+        # inherited one (a developer building offline, say) would make
+        # every other `go version` look like the probe too.
+        env.pop("GOPROXY", None)
         if env_file is not None:
             env["GC_SLACK_ADAPTER_ENV"] = str(env_file)
         env.update(extra_env or {})
@@ -240,14 +325,17 @@ def test_explicit_env_file_is_still_fatal_when_a_binary_exists(harness):
     assert "PREBUILT_RAN" not in proc.stdout
 
 
-def test_self_heal_builds_when_home_is_unset(harness):
+def test_self_heal_builds_when_home_is_unset(harness, tmp_path):
     """Supervisor environments may not set HOME. Under `set -u` an
     unguarded $HOME aborts before the fast path — and `go build` then
     fails a second way, because it can only locate a build cache via
     GOCACHE, XDG_CACHE_HOME, or HOME. Assert the *build* survives, not
     merely the shell."""
     adapter, run, go_invocations, build_environments = harness
+    cache_tmp = tmp_path / "tmpdir"
+    cache_tmp.mkdir()
     proc = run(
+        extra_env={"TMPDIR": str(cache_tmp)},
         drop_env=[
             "HOME",
             "XDG_CONFIG_HOME",
@@ -267,12 +355,16 @@ def test_self_heal_builds_when_home_is_unset(harness):
     assert len(go_invocations()) == 1, go_invocations()
     # The build was handed a usable cache and module path rather than
     # inheriting neither, which is what actually fails on such a host.
-    tmp = os.environ.get("TMPDIR", "/tmp").rstrip("/")
     assert build_environments() == [
-        f"buildenv GOCACHE={tmp}/gc-slack-adapter-gocache "
-        f"GOPATH={tmp}/gc-slack-adapter-gopath"
+        f"buildenv GOCACHE={private_tmp(cache_tmp, 'gc-slack-adapter-gocache')} "
+        f"GOPATH={private_tmp(cache_tmp, 'gc-slack-adapter-gopath')}"
     ], build_environments()
     assert (adapter / "gc-slack-adapter").exists()
+    # Private to this user, not whatever mode the ambient umask gives.
+    for name in ("gc-slack-adapter-gocache", "gc-slack-adapter-gopath"):
+        created = pathlib.Path(private_tmp(cache_tmp, name))
+        assert created.is_dir(), created
+        assert created.stat().st_mode & 0o077 == 0, oct(created.stat().st_mode)
 
 
 @pytest.mark.parametrize("cache_var", ["XDG_CACHE_HOME", "GOCACHE"])
@@ -287,6 +379,8 @@ def test_gopath_is_defaulted_whenever_home_is_unset(harness, tmp_path, cache_var
     adapter, run, go_invocations, build_environments = harness
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
+    cache_tmp = tmp_path / "tmpdir"
+    cache_tmp.mkdir()
     drop = [
         "HOME",
         "XDG_CONFIG_HOME",
@@ -297,16 +391,96 @@ def test_gopath_is_defaulted_whenever_home_is_unset(harness, tmp_path, cache_var
         "GC_SLACK_ADAPTER_ENV",
     ]
     drop.remove(cache_var)  # extra_env is applied before drop_env
-    proc = run(extra_env={cache_var: str(cache_dir)}, drop_env=drop)
+    proc = run(
+        extra_env={cache_var: str(cache_dir), "TMPDIR": str(cache_tmp)},
+        drop_env=drop,
+    )
     assert proc.returncode == 0, proc.stderr
     assert "STUB_ADAPTER_RAN" in proc.stdout
     assert len(go_invocations()) == 1, go_invocations()
-    tmp = os.environ.get("TMPDIR", "/tmp").rstrip("/")
     expected_gocache = str(cache_dir) if cache_var == "GOCACHE" else "unset"
     assert build_environments() == [
         f"buildenv GOCACHE={expected_gocache} "
-        f"GOPATH={tmp}/gc-slack-adapter-gopath"
+        f"GOPATH={private_tmp(cache_tmp, 'gc-slack-adapter-gopath')}"
     ], build_environments()
+
+
+def test_tmp_cache_is_reused_across_starts(harness, tmp_path):
+    """The per-user path must stay STABLE, not be re-derived per start.
+    A cold build does not fit the supervisor's readiness window, and it
+    only converges across the resulting kill/restart cycles because
+    `go build` finds its earlier per-package results still cached — a
+    fresh dir each attempt would loop forever on exactly the HOME-less
+    hosts this fallback serves."""
+    adapter, run, _, build_environments = harness
+    cache_tmp = tmp_path / "tmpdir"
+    cache_tmp.mkdir()
+    drop = [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "GOCACHE",
+        "GOPATH",
+        "GOMODCACHE",
+        "GC_SLACK_ADAPTER_ENV",
+    ]
+    first = run(extra_env={"TMPDIR": str(cache_tmp)}, drop_env=drop)
+    assert first.returncode == 0, first.stderr
+    # Second start would exec the binary the first one published, so
+    # clear it to force another build.
+    (adapter / "gc-slack-adapter").unlink()
+    second = run(extra_env={"TMPDIR": str(cache_tmp)}, drop_env=drop)
+    assert second.returncode == 0, second.stderr
+    envs = build_environments()
+    assert len(envs) == 2, envs
+    assert envs[0] == envs[1], envs
+
+
+def test_squatted_tmp_cache_is_not_adopted(harness, tmp_path):
+    """/tmp is world-writable, so another local user can pre-create the
+    predictable cache path — and Go trusts these caches: a seeded GOCACHE
+    can serve object files into a binary holding the Slack bot token, and
+    GOPATH is where a fetched toolchain is unpacked and re-exec'd. A path
+    we did not create must not be adopted.
+
+    A symlink stands in for the foreign-owned directory, which a test
+    cannot create without a second uid; run.sh rejects both through the
+    same `-O`/`! -L` check."""
+    adapter, run, go_invocations, build_environments = harness
+    cache_tmp = tmp_path / "tmpdir"
+    cache_tmp.mkdir()
+    attacker = tmp_path / "attacker-cache"
+    attacker.mkdir()
+    squatted = pathlib.Path(private_tmp(cache_tmp, "gc-slack-adapter-gocache"))
+    squatted.symlink_to(attacker)
+
+    proc = run(
+        extra_env={"TMPDIR": str(cache_tmp)},
+        drop_env=[
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "GOCACHE",
+            "GOPATH",
+            "GOMODCACHE",
+            "GC_SLACK_ADAPTER_ENV",
+        ],
+    )
+    # Availability is preserved — it still builds and starts...
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "STUB_ADAPTER_RAN" in proc.stdout
+    assert len(go_invocations()) == 1, go_invocations()
+    # ...but not through the squatted path, and it says so.
+    assert "refusing to reuse it" in proc.stderr
+    envs = build_environments()
+    assert len(envs) == 1, envs
+    assert f"GOCACHE={squatted}" not in envs[0], envs[0]
+    assert str(attacker) not in envs[0], envs[0]
+    # The fallback is still under TMPDIR, just not the predictable name.
+    assert f"GOCACHE={cache_tmp}/" in envs[0], envs[0]
+    # And the symlink was left alone rather than followed into.
+    assert squatted.is_symlink()
+    assert list(attacker.iterdir()) == []
 
 
 def test_no_default_env_file_path_is_never_advertised(harness):
@@ -343,14 +517,19 @@ def test_shell_function_named_go_does_not_shadow_the_toolchain(harness):
     assert "STUB_ADAPTER_RAN" in proc.stdout
 
 
-def test_toolchain_older_than_go_mod_is_rejected_when_pinned(harness):
+@pytest.mark.parametrize("stub_version", OLD_GO_VERSIONS)
+def test_toolchain_older_than_go_mod_is_rejected_when_pinned(harness, stub_version):
     """GOTOOLCHAIN=local means Go cannot upgrade itself, so a toolchain
     below go.mod's directive can never build: say so with a remedy
-    instead of leaking a raw compiler error."""
+    instead of leaking a raw compiler error.
+
+    Driven with both an all-round-older version and one that is older
+    only numerically, so the gate cannot pass on a string compare."""
+    assert_older_than_go_mod(stub_version)
     adapter, run, go_invocations, _ = harness
-    proc = run(extra_env={"GO_STUB_VERSION": "1.0.0", "GOTOOLCHAIN": "local"})
+    proc = run(extra_env={"GO_STUB_VERSION": stub_version, "GOTOOLCHAIN": "local"})
     assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert f"need Go >= {required_go_version()}, found 1.0.0" in proc.stderr
+    assert f"need Go >= {required_go_version()}, found {stub_version}" in proc.stderr
     assert "GOTOOLCHAIN=local" in proc.stderr
     # Refused before building, and nothing was published.
     assert go_invocations() == []
@@ -358,14 +537,124 @@ def test_toolchain_older_than_go_mod_is_rejected_when_pinned(harness):
     assert not list(adapter.glob("gc-slack-adapter.build.*"))
 
 
-def test_toolchain_older_than_go_mod_still_builds_when_downloadable(harness):
-    """Under the default GOTOOLCHAIN=auto, Go fetches the required
-    toolchain itself. Warn, but do not refuse — hosts that build fine
-    today must keep building."""
+@pytest.mark.parametrize("stub_version", OLD_GO_VERSIONS)
+def test_toolchain_older_than_go_mod_still_builds_when_downloadable(
+    harness, stub_version
+):
+    """Run by hand under the default GOTOOLCHAIN=auto, Go fetches the
+    required toolchain itself. Warn, but do not refuse — there is no
+    readiness deadline here and hosts that build fine today must keep
+    building.
+
+    Same two-version parametrization: "1.9.0" only trips the gate if the
+    comparison is numeric."""
+    assert_older_than_go_mod(stub_version)
     adapter, run, go_invocations, _ = harness
-    proc = run(extra_env={"GO_STUB_VERSION": "1.0.0"}, drop_env=["GOTOOLCHAIN"])
+    proc = run(extra_env={"GO_STUB_VERSION": stub_version}, drop_env=["GOTOOLCHAIN"])
     assert proc.returncode == 0, proc.stderr
-    assert f"go.mod needs >= {required_go_version()}" in proc.stderr
+    assert f"is {stub_version} but go.mod needs >= {required_go_version()}" in proc.stderr
+    assert "STUB_ADAPTER_RAN" in proc.stdout
+    assert len(go_invocations()) == 1, go_invocations()
+
+
+@pytest.mark.parametrize("signal", ["GC_SERVICE_NAME", "GC_SERVICE_URL_PREFIX"])
+def test_toolchain_fetch_is_refused_under_the_supervisor(harness, signal):
+    """A too-old toolchain under GOTOOLCHAIN=auto means the build starts
+    by DOWNLOADING a toolchain. gc gives a starting proxy_process ~5s to
+    become ready, then kills the process group and restarts on a 1s
+    backoff with no cap — and unlike a compile, a toolchain fetch keeps
+    no partial progress, so every cycle would re-download it from
+    scratch, forever. Refuse instead: each cycle then exits immediately
+    with a named remedy on stderr rather than burning the network.
+
+    Either supervisor-exported variable is enough to detect this; gc
+    exports both into every proxy_process."""
+    adapter, run, go_invocations, _ = harness
+    proc = run(
+        extra_env={"GO_STUB_VERSION": "1.9.0", signal: "slack"},
+        drop_env=["GOTOOLCHAIN"],
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert f"need Go >= {required_go_version()}, found 1.9.0" in proc.stderr
+    assert "it is not in the local module cache" in proc.stderr
+    assert "refusing to start that download under the gc supervisor" in proc.stderr
+    # A named remedy, not a raw failure.
+    assert "manual fix: install Go >=" in proc.stderr
+    # Refused before building, and nothing was published.
+    assert go_invocations() == []
+    assert "STUB_ADAPTER_RAN" not in proc.stdout
+    assert not (adapter / "gc-slack-adapter").exists()
+    assert not list(adapter.glob("gc-slack-adapter.build.*"))
+
+
+def test_supervised_build_proceeds_when_the_toolchain_is_already_cached(
+    harness, tmp_path
+):
+    """The refusal above is about a DOWNLOAD, not about the version
+    numbers. Once the newer toolchain sits in the local module cache
+    (someone prebuilt by hand, or an earlier unsupervised run fetched
+    it), the supervised build needs no network and converges exactly like
+    any other warm rebuild — refusing it on the version comparison alone
+    would turn a self-healing host into a permanently dead service, which
+    is the outage this script exists to prevent.
+
+    run.sh tells the two apart by asking Go itself, offline: a
+    `GOPROXY=off go version` from inside the module directory, where the
+    toolchain switch actually happens. Nothing in the version numbers
+    distinguishes this case from the one above — only that probe does."""
+    adapter, run, go_invocations, _ = harness
+    proc = run(
+        extra_env={
+            "GO_STUB_VERSION": "1.9.0",
+            "GO_STUB_TOOLCHAIN_CACHED": "1",
+            "GC_SERVICE_NAME": "slack",
+        },
+        drop_env=["GOTOOLCHAIN"],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "already in the local module cache" in proc.stderr
+    assert "refusing to start that download" not in proc.stderr
+    # Built and exec'd, same as any warm supervised rebuild.
+    assert "STUB_ADAPTER_RAN" in proc.stdout
+    assert len(go_invocations()) == 1, go_invocations()
+    # The probe has to run in the module directory: that is the only cwd
+    # where the go command performs the switch this asks about. Probing
+    # from anywhere else answers a different question — "does the local
+    # go run at all" — which is always yes, so the refusal would never
+    # fire again.
+    calls = go_version_calls(tmp_path)
+    probes = [
+        c
+        for c in calls
+        if " cwd=" in c
+        and pathlib.Path(c.split(" cwd=", 1)[1]).resolve() == adapter.resolve()
+    ]
+    assert probes, calls
+
+
+def test_supervised_build_is_untouched_when_the_toolchain_is_new_enough(harness):
+    """The supervised refusal is scoped to the toolchain-fetch case. A
+    host whose Go already satisfies go.mod must still self-heal under the
+    supervisor — that is the outage this whole script exists to fix."""
+    adapter, run, go_invocations, _ = harness
+    proc = run(extra_env={"GC_SERVICE_NAME": "slack"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "STUB_ADAPTER_RAN" in proc.stdout
+    assert "refusing to start that download" not in proc.stderr
+    assert len(go_invocations()) == 1, go_invocations()
+
+
+def test_missing_go_mod_does_not_kill_the_script_silently(harness):
+    """go.mod is tracked, so only a corrupted checkout hits this — but
+    the failure mode was the script's one silent exit: under `set -e` +
+    `pipefail` the sed reading go.mod exited 2 with its stderr
+    suppressed, killing run.sh at the assignment with no message. An
+    unreadable directive must just skip the version gate and let the
+    compiler be the backstop."""
+    adapter, run, go_invocations, _ = harness
+    (adapter / "go.mod").unlink()
+    proc = run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "STUB_ADAPTER_RAN" in proc.stdout
     assert len(go_invocations()) == 1, go_invocations()
 
