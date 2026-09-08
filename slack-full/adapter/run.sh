@@ -53,6 +53,20 @@ version_key() {
 
 bin_dir="$(cd "$(dirname "$0")" && pwd)"
 
+# Printed by every build-failure path, so the remedy is one string instead
+# of three that drift apart. `go mod download` is not decoration: the
+# adapter took its first dependency (golang.org/x/sys) and the self-heal
+# below now needs a warm module cache or GOPROXY egress the first time it
+# builds. A bare `go build` remedy dead-ends on the same "module lookup
+# disabled by GOPROXY=off" that sent the operator here, so name the
+# precondition in the message they actually read rather than only in the
+# CHANGELOG. $1 is an optional lead-in for callers with a further remedy
+# to offer first.
+log_build_remedy() {
+  log "manual fix: ${1:+$1 }cd $bin_dir && go mod download && go build -o gc-slack-adapter ."
+  log "  (go mod download needs a reachable GOPROXY; on an egress-restricted host point GOPROXY at an allowed proxy or warm the module cache first)"
+}
+
 # A defaulted env-file path and one the operator named explicitly are
 # different cases and must not fail the same way. A missing default is
 # ordinary — supervised deployments often inject the env another way.
@@ -145,7 +159,7 @@ else
 fi
 if [[ -z "$go_bin" ]]; then
   log "ERROR: no Go toolchain found (checked PATH, /opt/homebrew/bin, /usr/local/go/bin, /usr/local/bin, /usr/bin, /bin, ~/go/bin)"
-  log "manual fix: cd $bin_dir && go build -o gc-slack-adapter ."
+  log_build_remedy
   exit 1
 fi
 
@@ -168,7 +182,7 @@ if [[ -n "$need_go" && -n "$have_go" ]] &&
   go_too_old=1
   if [[ "${GOTOOLCHAIN:-auto}" == "local" ]]; then
     log "ERROR: need Go >= $need_go, found $have_go at $go_bin (GOTOOLCHAIN=local pins this toolchain)"
-    log "manual fix: install Go >= $need_go, unset GOTOOLCHAIN, or prebuild: cd $bin_dir && go build -o gc-slack-adapter ."
+    log_build_remedy "install Go >= $need_go, unset GOTOOLCHAIN, or prebuild:"
     exit 1
   fi
   log "WARNING: $go_bin is $have_go but go.mod needs >= $need_go — Go will try to fetch the required toolchain (needs network and a writable module cache)"
@@ -208,7 +222,7 @@ if ! (cd "$bin_dir" && "$go_bin" build -o "$tmp_bin" .); then
   if (( go_too_old )); then
     log "likely cause: $go_bin is $have_go but go.mod needs >= $need_go — install Go >= $need_go or prebuild the binary"
   fi
-  log "manual fix: cd $bin_dir && go build -o gc-slack-adapter ."
+  log_build_remedy
   exit 1
 fi
 mv -f "$tmp_bin" "$adapter_bin"

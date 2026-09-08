@@ -379,6 +379,12 @@ def test_go_build_failure_exits_1_and_publishes_nothing(harness):
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "go build failed" in proc.stderr
     assert "manual fix: cd " in proc.stderr
+    # The adapter has an external dependency, so a bare `go build` remedy
+    # dead-ends on the same cold-cache/GOPROXY wall that produced the
+    # failure being reported. The remedy must name the module fetch and
+    # the lever that makes it work on an egress-restricted host.
+    assert "go mod download" in proc.stderr
+    assert "GOPROXY" in proc.stderr
     assert "STUB_ADAPTER_RAN" not in proc.stdout
     assert not (adapter / "gc-slack-adapter").exists()
     assert not list(adapter.glob("gc-slack-adapter.build.*"))
