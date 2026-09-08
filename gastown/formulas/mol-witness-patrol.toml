@@ -335,7 +335,7 @@ If the work is already on main:
   is still assigned to the crashed polecat, so this is a cross-actor close and
   bd's close-authority guard (gastownhall/beads#3734) would otherwise refuse it:
 ```bash
-gc bd close <bead> --force
+gc bd close <bead> --force --reason "Recovered orphan already merged to main."
 gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
   -m "Branch $BRANCH already on main. Closed instead of resetting."
 ```

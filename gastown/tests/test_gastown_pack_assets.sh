@@ -154,6 +154,49 @@ test_polecat_startup_uses_standard_hook_claim() {
         fail "polecat propulsion fragment must not regress to an unclaimed hook/work-query choice"
 }
 
+test_lifecycle_assets_require_dedicated_transitions_and_reasoned_closes() {
+    scan_lifecycle_assets "$GASTOWN" "$ROOT/gascity/template-fragments" || fail "lifecycle asset scan found prohibited command"
+}
+
+scan_lifecycle_assets() {
+    python3 - "$@" <<'PY'
+import pathlib
+import re
+import sys
+
+roots = [pathlib.Path(arg) for arg in sys.argv[1:]]
+status_update = re.compile(r"\bgc[ \t]+bd(?:[ \t]+--[A-Za-z][A-Za-z0-9_-]*(?:=[^ \t]+|[ \t]+(?:\"[^\"]*\"|'[^']*'|[^ \t]+))?)*[ \t]+update\b[^\r\n]*--status(?:=|[ \t]+)")
+close = re.compile(r"\bgc[ \t]+bd(?:[ \t]+--[A-Za-z][A-Za-z0-9_-]*(?:=[^ \t]+|[ \t]+(?:\"[^\"]*\"|'[^']*'|[^ \t]+))?)*[ \t]+close\s+(?:[\"'$<]|[A-Za-z_])")
+errors = []
+for root in roots:
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix not in {".toml", ".md"}:
+            continue
+        body = re.sub(r"\\\r?\n[ \t]*", " ", path.read_text(encoding="utf-8"))
+        for number, line in enumerate(body.splitlines(), 1):
+            if status_update.search(line):
+                errors.append(f"{path}:{number}: use a dedicated lifecycle verb instead of gc bd update --status")
+            if close.search(line) and "--reason" not in line:
+                errors.append(f"{path}:{number}: gc bd close requires --reason")
+if errors:
+    raise SystemExit("\n".join(errors))
+PY
+}
+
+test_lifecycle_asset_scanner_rejects_wrapped_and_flagged_bypasses() {
+    local fixture
+    fixture=$(mktemp -d)
+    trap 'rm -rf "$fixture"' RETURN
+    printf '%s\n' 'gc bd update "$ID" \' '  --status closed' > "$fixture/wrapped.toml"
+    if scan_lifecycle_assets "$fixture" >/dev/null 2>&1; then
+        fail "lifecycle scanner must reject a wrapped gc bd update --status"
+    fi
+    printf 'gc bd --actor worker close "$ID"\n' > "$fixture/flagged.toml"
+    if scan_lifecycle_assets "$fixture" >/dev/null 2>&1; then
+        fail "lifecycle scanner must reject gc bd flags before a bare close"
+    fi
+}
+
 test_review_leg_contract_forbids_synthetic_mutation() {
     local formula prompt
     formula="$GASTOWN/formulas/mol-review-leg.toml"
@@ -293,6 +336,8 @@ test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented
 test_polecat_startup_uses_standard_hook_claim
+test_lifecycle_assets_require_dedicated_transitions_and_reasoned_closes
+test_lifecycle_asset_scanner_rejects_wrapped_and_flagged_bypasses
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_witness_wisp_queries_pin_include_infra

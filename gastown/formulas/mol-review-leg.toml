@@ -140,7 +140,9 @@ EOF
 
 **3. Close the bead and drain:**
 ```bash
-gc bd update "$WORK_BEAD_ID" --status=closed
+# Review legs close the convoy's controller-owned work bead rather than the
+# reviewer wisp, so this explicit controller path is the only cross-owner close.
+gc bd close "$WORK_BEAD_ID" --force --reason "Review leg $LEG completed for $PHASE."
 gc runtime drain-ack
 ```
 

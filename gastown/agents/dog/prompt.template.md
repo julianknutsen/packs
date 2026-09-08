@@ -77,7 +77,7 @@ ample opportunity to respond even if they're in long-running operations.
 **CRITICAL**: When you finish, you MUST close your work and exit:
 
 ```bash
-gc bd close <work-bead>    # Close your assigned work
+gc bd close <work-bead> --reason "Completed: <brief summary>."    # Close your assigned work
 gc runtime drain-ack    # Signal reconciler you're done
 exit                     # Return to pool (controller recycles you)
 ```

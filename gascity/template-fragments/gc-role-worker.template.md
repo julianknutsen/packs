@@ -50,7 +50,7 @@ Set required metadata before closing same claimed bead:
 gc bd update "$CLAIMED_BEAD_ID" \
   --set-metadata 'gc.outcome=pass' \
   --set-metadata 'example.key=example-value'
-gc bd close "$CLAIMED_BEAD_ID"
+gc bd close "$CLAIMED_BEAD_ID" --reason 'Completed: <brief summary>.'
 ```
 
 Review findings, missing tests, or follow-up usually are output, not execution

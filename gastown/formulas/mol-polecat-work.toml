@@ -363,8 +363,8 @@ AUTO_PUSH=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata | if has("a
 if [ "$AUTO_PUSH" = "false" ]; then
   echo "auto_push=false: halting at branch-ready (no push, no refinery handoff)"
   BRANCH=$(git branch --show-current)
+  gc bd unclaim "$WORK_BEAD_ID" --reason "auto_push=false: branch ready for external review"
   gc bd update "$WORK_BEAD_ID" \
-    --status=open --assignee="" \
     --set-metadata branch="$BRANCH" \
     --set-metadata target={{base_branch}} \
     --set-metadata branch_ready=true \
@@ -427,7 +427,8 @@ the PR is open and matches the branch, base, and origin repository.
 **6. Reassign to refinery:**
 ```bash
 REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
-gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
+gc bd unclaim "$WORK_BEAD_ID" --reason "Submitted to refinery for merge review."
+gc bd update "$WORK_BEAD_ID" --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
 ```
 
 `${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery` resolves to

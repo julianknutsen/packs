@@ -229,8 +229,9 @@ Never infer a branch name. If `metadata.branch` is missing, reject the bead.
 ## Rejection Flow
 
 On rebase conflict or test failure:
-1. Put work bead back in pool:
-   `gc bd update $WORK --status=open --assignee="" --set-metadata rejection_reason="..."`
+1. Record the rejection, then put work bead back in pool:
+   `gc bd update $WORK --set-metadata rejection_reason="..."`
+   followed by `gc bd unclaim $WORK --reason "Refinery rejected: ..."`
 2. Branch handling depends on failure type:
    - Conflict: leave branch intact (polecat needs it for rebase)
    - Test failure: delete branch (polecat redoes work)

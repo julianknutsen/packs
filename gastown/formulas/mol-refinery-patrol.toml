@@ -230,9 +230,8 @@ gc workflow delete-source $WORK --apply && gc workflow reopen-source $WORK
 ```
 3. Put the work bead back in the pool with rejection metadata:
 ```bash
+gc bd unclaim $WORK --reason "Rebase conflicts with $TARGET; returning branch to the polecat pool."
 gc bd update $WORK \
-  --status=open \
-  --assignee="" \
   --set-metadata rejection_reason="Conflicts with $TARGET at $(git rev-parse origin/$TARGET)" \
   --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
 ```
@@ -331,9 +330,8 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      ```
    - Put the work bead back in the pool with rejection metadata:
      ```bash
+     gc bd unclaim $WORK --reason "Branch regression; returning branch to the polecat pool."
      gc bd update $WORK \
-       --status=open \
-       --assignee="" \
        --set-metadata rejection_reason="<failure summary>" \
        --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
      ```
@@ -503,9 +501,9 @@ halt_false_completion() {
   # polecat) instead of masking it.
   fc_branch="$1"
   fc_base="$2"
+  gc bd unclaim $WORK --reason "False completion suspected; deferred for human review."
+  gc bd defer $WORK --reason "False completion suspected; branch $fc_branch has no verified change versus $fc_base."
   gc bd update $WORK \
-    --status=blocked \
-    --assignee="" \
     --set-metadata merge_result=refused_false_completion \
     --set-metadata gc.routed_to=human \
     --set-metadata false_completion_suspected="branch $fc_branch no verified change vs $fc_base; refused merge-close"

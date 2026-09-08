@@ -227,7 +227,7 @@ if [ "$SHOW_OK" -ne 1 ]; then
   # Never leave a claimed bead stranded in_progress on an unreadable state:
   # release it so it re-enters the pool instead of being lost.
   echo "CLAIM_RELEASED $WORK_ID unreadable after retries; returning it to the pool"
-  gc bd update "$WORK_ID" --status=open --assignee=""
+  gc bd unclaim "$WORK_ID" --if-assignee "$EXPECTED_ASSIGNEE" --reason "Claim state could not be verified."
   gc runtime drain-ack
   exit 0
 fi
@@ -341,7 +341,7 @@ gc mail send "$WITNESS_TARGET" -s "ESCALATION: Brief description [HIGH]" -m "Det
 gc mail send mayor/ -s "BLOCKED: <topic>" -m "Context"
 ```
 
-After escalating: continue if possible, otherwise `gc bd update <bead> --status=escalated && gc runtime drain-ack && exit`.
+After escalating: continue if possible, otherwise `gc bd defer <bead> --reason "Escalated: <brief reason>." && gc runtime drain-ack && exit`.
 
 ---
 
