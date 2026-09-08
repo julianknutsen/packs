@@ -6011,12 +6011,14 @@ description = "Override sink that writes the base triage report contract."
             fake_gc = bin_dir / "gc"
             fake_gc.write_text(
                 "#!/bin/sh\n"
+                # The member read is `gc ready` (see gmol); let it succeed with an
+                # empty union so this test isolates the tolerant `gc bd show` site.
+                "if [ \"$1\" = \"ready\" ]; then\n"
+                "  printf '[]\\n'\n"
+                "  exit 0\n"
+                "fi\n"
                 "if [ \"$2\" = \"show\" ]; then\n"
                 "  echo 'STDERR_A root lookup unavailable' >&2\n"
-                "  exit 3\n"
-                "fi\n"
-                "if [ \"$2\" = \"list\" ]; then\n"
-                "  echo 'STDERR_B list lookup unavailable' >&2\n"
                 "  exit 3\n"
                 "fi\n"
                 "exit 99\n",
@@ -6036,11 +6038,9 @@ description = "Override sink that writes the base triage report contract."
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("review check: note: gc bd show root-err failed", result.stderr)
         self.assertIn("STDERR_A", result.stderr)
-        self.assertIn("review check: note: gc bd list for root root-err failed", result.stderr)
-        self.assertIn("STDERR_B", result.stderr)
         self.assertIn("Implementation review needs another iteration: missing verdict", result.stdout)
 
-    def test_design_review_check_surfaces_gc_bd_list_pipeline_stderr(self) -> None:
+    def test_design_review_check_surfaces_member_read_stderr(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
         script = root / "assets" / "scripts" / "checks" / "design-review-approved.sh"
 
@@ -6067,7 +6067,7 @@ description = "Override sink that writes the base triage report contract."
             result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn("ERROR: gc bd list/jq pipeline for root root-ok failed", result.stderr)
+        self.assertIn("gmol: gc ready failed for status:", result.stderr)
         self.assertIn("DISTINCTIVE_LIST_FAILURE", result.stderr)
 
     def test_gap_analysis_check_notes_gc_bd_stderr_on_tolerant_paths(self) -> None:
@@ -6080,12 +6080,17 @@ description = "Override sink that writes the base triage report contract."
             fake_gc = bin_dir / "gc"
             fake_gc.write_text(
                 "#!/bin/sh\n"
+                # The member read is `gc ready` (see gmol); let it succeed with an
+                # empty union so this test isolates the tolerant `gc bd show` site.
+                "if [ \"$1\" = \"ready\" ]; then\n"
+                "  printf '[]\\n'\n"
+                "  exit 0\n"
+                "fi\n"
                 "if [ \"$2\" = \"show\" ]; then\n"
                 "  echo 'GAP_SHOW_FAILURE' >&2\n"
-                "else\n"
-                "  echo 'GAP_LIST_FAILURE' >&2\n"
+                "  exit 3\n"
                 "fi\n"
-                "exit 3\n",
+                "exit 99\n",
                 encoding="utf-8",
             )
             fake_gc.chmod(0o755)
@@ -6100,9 +6105,78 @@ description = "Override sink that writes the base triage report contract."
         self.assertEqual(result.returncode, 1)
         self.assertIn("gap check: note: gc bd show gap-root failed", result.stderr)
         self.assertIn("GAP_SHOW_FAILURE", result.stderr)
-        self.assertIn("gap check: note: gc bd list for root gap-root failed", result.stderr)
-        self.assertIn("GAP_LIST_FAILURE", result.stderr)
         self.assertIn("Gap analysis needs another iteration: missing verdict", result.stdout)
+
+    # The member read these gates make is `gc ready`, one leg per status, and a
+    # failed leg has to fail the gate rather than contribute an empty set: an
+    # empty union is indistinguishable from "no verdict yet", so swallowing the
+    # error starves the gate silently until Ralph runs out of attempts. The two
+    # tests below pin that -- the underlying stderr reaches the gate's stderr,
+    # and the gate does NOT reach its "needs another iteration" dispatch.
+
+    def test_implementation_review_check_fails_loudly_when_member_read_fails(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "implementation-review-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$2\" = \"show\" ]; then\n"
+                "  printf '%s\\n' '{\"metadata\":{\"gc.root_bead_id\":\"root-ok\",\"gc.attempt\":\"1\"}}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'REVIEW_MEMBER_READ_FAILURE' >&2\n"
+                "exit 3\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "root-ok",
+                "GC_ITERATION": "1",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gmol: gc ready failed for status:", result.stderr)
+        self.assertIn("REVIEW_MEMBER_READ_FAILURE", result.stderr)
+        self.assertNotIn("needs another iteration", result.stdout)
+
+    def test_gap_analysis_check_fails_loudly_when_member_read_fails(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "gap-analysis-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$2\" = \"show\" ]; then\n"
+                "  printf '%s\\n' '{\"metadata\":{\"gc.root_bead_id\":\"gap-ok\",\"gc.attempt\":\"1\"}}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'GAP_MEMBER_READ_FAILURE' >&2\n"
+                "exit 3\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "gap-ok",
+                "GC_ITERATION": "1",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gmol: gc ready failed for status:", result.stderr)
+        self.assertIn("GAP_MEMBER_READ_FAILURE", result.stderr)
+        self.assertNotIn("needs another iteration", result.stdout)
 
 
 if __name__ == "__main__":
