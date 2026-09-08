@@ -138,6 +138,8 @@ test_polecat_startup_uses_standard_hook_claim() {
 
     grep -F 'gc hook --claim --json' "$agent" >/dev/null ||
         fail "polecat nudge should call the standard hook claim path"
+    grep -F 'default_sling_formula = "mol-polecat-work"' "$agent" >/dev/null ||
+        fail "plain polecat sling must compile the implementation workflow instead of routing a bare task"
     grep -F 'gc hook --claim --json' "$prompt" >/dev/null ||
         fail "polecat prompt should call the standard hook claim path"
     grep -F 'gc hook --claim --json' "$propulsion" >/dev/null ||
