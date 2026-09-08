@@ -21,8 +21,18 @@
 //
 //   - SLACK_WORKSPACE_ID      Slack team id (e.g. T01234567).
 //   - SLACK_BOT_TOKEN         xoxb- bot token. Must have chat:write,
-//     reactions:write, files:write, and (for
-//     identity overrides) chat:write.customize.
+//     reactions:write, files:write, (for identity
+//     overrides) chat:write.customize, and the
+//     history scopes for the conversation kinds in
+//     use — channels:history, groups:history,
+//     im:history, mpim:history. schema/apps.schema.json
+//     is the authoritative list and already requires
+//     them, so manifest-driven installs are covered;
+//     this line is what a hand-provisioned token is
+//     built from. History is not optional: /publish
+//     confirms every post by reading it back, so a
+//     token without it reports every delivery as
+//     failed (failure_kind "auth").
 //   - GC_CITY_NAME            Name of the gc city the adapter posts to
 //     (matches [workspace].name in city.toml). Used
 //     to construct /v0/city/{name}/extmsg/inbound and
@@ -895,7 +905,8 @@ type slackPostMessageResp struct {
 //
 // The bot token requires the `files:write` scope. Without it, step 1 returns
 // {ok: false, error: "missing_scope"} and the failure propagates as
-// FailureKind="permanent" with the auth error logged.
+// FailureKind="auth" with the auth error logged — both upload steps classify
+// through mapSlackError, which maps missing_scope onto gc's `auth` kind.
 
 type slackGetUploadURLResp struct {
 	OK        bool   `json:"ok"`
@@ -1468,13 +1479,13 @@ func registerAdapter(cfg config) error {
 // minutes later is not silently swallowed.
 const publishDedupTTL = 2 * time.Minute
 
-// publishDedupCache remembers delivered publish receipts keyed by the
-// caller-supplied idempotency key, so a retry after a delivered-but-
-// timed-out POST returns the original receipt instead of posting a second
-// Slack message (gpk-lbhl). Only delivered receipts are cached: a retry
-// after a genuine (non-delivered) failure must still re-attempt delivery,
-// so failures are never remembered. An empty idempotency key disables
-// dedup for that call.
+// publishDedupCache remembers publish receipts keyed by the caller-supplied
+// idempotency key, so a retry after a delivered-but-timed-out POST returns the
+// original receipt instead of posting a second Slack message (gpk-lbhl). A
+// retry after a genuine failure must still re-attempt delivery, so failures are
+// never remembered — see publishReceiptBlocksRepost for where the line falls
+// now that a write Slack accepted can still fail its readback. An empty
+// idempotency key disables dedup for that call.
 type publishDedupCache struct {
 	mu      sync.Mutex
 	entries map[string]publishDedupEntry
@@ -1513,11 +1524,35 @@ func (c *publishDedupCache) Get(key string) (publishReceipt, bool) {
 	return e.receipt, true
 }
 
-// Put records a delivered receipt under key and sweeps expired entries so
-// the map stays bounded under churn. Empty keys and non-delivered receipts
-// are ignored.
+// publishReceiptBlocksRepost reports whether a retry on the same idempotency
+// key must be answered from this receipt instead of posting again.
+//
+// A delivered receipt replays outright. The harder case is a write Slack
+// accepted — ok:true with a real ts — whose readback then failed. If the read
+// leg itself was unavailable, or the token cannot read history at all, nothing
+// is known about the message except that Slack took it, so re-posting would
+// duplicate a message that is very probably in the channel. Those receipts are
+// remembered and re-verified (replayPublishReceipt) rather than replayed as-is.
+//
+// readback_unconfirmed stays strict and is never remembered: there the read
+// path answered and the message was not in the channel, so the key must be
+// free to post again.
+func publishReceiptBlocksRepost(receipt publishReceipt) bool {
+	if receipt.Delivered {
+		return true
+	}
+	switch receipt.Metadata[receiptMetadataKeyReadback] {
+	case slackReadbackUnavailable, slackReadbackAuth:
+		return receipt.MessageID != ""
+	}
+	return false
+}
+
+// Put records a receipt a retry must not re-post (publishReceiptBlocksRepost)
+// under key and sweeps expired entries so the map stays bounded under churn.
+// Empty keys and receipts that leave the key free to post again are ignored.
 func (c *publishDedupCache) Put(key string, receipt publishReceipt) {
-	if key == "" || !receipt.Delivered {
+	if key == "" || !publishReceiptBlocksRepost(receipt) {
 		return
 	}
 	c.mu.Lock()
@@ -1529,6 +1564,18 @@ func (c *publishDedupCache) Put(key string, receipt publishReceipt) {
 			delete(c.entries, k)
 		}
 	}
+}
+
+// Delete forgets key. It is how a remembered posted-but-unconfirmed receipt is
+// released once a later readback proves the message is not in the channel: the
+// key has to be free to post again at that point.
+func (c *publishDedupCache) Delete(key string) {
+	if key == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
 }
 
 // referenceSuffix derives the low-visibility marker embedded in outbound
@@ -1693,9 +1740,11 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 		// and a test asserting it would have to hand-build a map the loader
 		// cannot produce, which would pin an unreachable state rather than a
 		// behavior.
+		stampedMarker := ""
 		if req.IdempotencyKey != "" && rewrittenText != "" {
 			if len(rewrittenText)+referenceMarkerOverhead <= slackMaxMessageLength {
-				post.Text += "\n\n" + referenceMarker(req.IdempotencyKey)
+				stampedMarker = referenceMarker(req.IdempotencyKey)
+				post.Text += "\n\n" + stampedMarker
 			} else {
 				// rewritten=, not text=: this is the post-rewrite length the
 				// budget was measured against, while the main publish log
@@ -1726,13 +1775,24 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 			req.Conversation.ConversationID, len(req.Text), len(post.Text), req.ReplyToMessageID,
 			req.IdempotencyKey, identitySessionID, identityApplied, rewrittenText != req.Text)
 
-		// Idempotent replay: if this idempotency key already produced a
-		// delivered receipt, return it without re-posting. This is the
-		// chokepoint that absorbs a retry after a delivered-but-timed-out
-		// POST (gpk-lbhl) — the original Slack message stands, no duplicate.
-		if cached, ok := dedup.Get(req.IdempotencyKey); ok {
-			log.Printf("publish: dedup hit idem=%s conv=%s -> returning cached receipt (no re-post)",
-				req.IdempotencyKey, req.Conversation.ConversationID)
+		// The readback's subject: this conversation, the text actually posted,
+		// and the marker if one was stamped. messageTS is filled in once Slack
+		// answers with a ts (or, on the replay path, from the remembered
+		// receipt).
+		target := slackReadbackTarget{
+			channel:      req.Conversation.ConversationID,
+			threadTS:     req.ReplyToMessageID,
+			expectedText: post.Text,
+			marker:       stampedMarker,
+		}
+
+		// Idempotent replay: if this idempotency key already produced a receipt
+		// that must not be re-posted, answer from it. This is the chokepoint
+		// that absorbs a retry after a delivered-but-timed-out POST (gpk-lbhl)
+		// — the original Slack message stands, no duplicate.
+		if cached, ok := replayPublishReceipt(cfg.slackBotToken, dedup, req.IdempotencyKey, target); ok {
+			log.Printf("publish: dedup hit idem=%s conv=%s delivered=%t -> returning cached receipt (no re-post)",
+				req.IdempotencyKey, req.Conversation.ConversationID, cached.Delivered)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(cached)
 			return
@@ -1785,28 +1845,21 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 			// The truncation warning is recorded before the readback so the
 			// wire fact survives either outcome: it is what Slack reported
 			// about this write, while Delivered below is what the read API can
-			// confirm. Truncation also fails the readback's exact-text compare,
-			// so a truncated keyed publish now reports Delivered:false with
-			// FailureKind "readback_unconfirmed" *and* metadata["truncated"] —
-			// strictly more than either half could say alone.
-			if err := readBackPublishedMessage(
-				slackReadbackHTTPClient,
-				cfg.slackBotToken,
-				req.Conversation.ConversationID,
-				slackResp.TS,
-				req.ReplyToMessageID,
-				post.Text,
-			); err != nil {
-				log.Printf("slack readback failed: %v", err)
-				receipt.Delivered = false
-				receipt.FailureKind = slackReadbackFailureKind(err)
-			} else {
-				receipt.Delivered = true
-			}
+			// confirm. Truncation also fails the readback, so a truncated
+			// publish now reports Delivered:false with FailureKind "permanent"
+			// (metadata["readback"]="readback_unconfirmed") *and*
+			// metadata["truncated"] — strictly more than either half could say
+			// alone. Permanent is the honest kind there: the same oversized
+			// payload truncates identically on every retry, so re-sending it
+			// can only add another visible partial message.
+			target.messageTS = slackResp.TS
+			confirmPublishReceipt(cfg.slackBotToken, &receipt, target)
 		}
-		// Remember delivered receipts so a subsequent retry with the same
-		// idempotency key replays this receipt instead of re-posting. Put
-		// ignores empty keys and non-delivered receipts.
+		// Remember any receipt a retry must not re-post — delivered, or posted
+		// with the read leg unavailable — so a subsequent retry with the same
+		// idempotency key replays it. Put ignores empty keys and the receipts
+		// that carry no evidence Slack took the message
+		// (publishReceiptBlocksRepost).
 		dedup.Put(req.IdempotencyKey, receipt)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(receipt)
@@ -1818,13 +1871,23 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 // req.Conversation.ConversationID, optionally threaded under
 // req.ReplyToMessageID. The bot token requires the `files:write` scope —
 // without it, Slack returns {ok: false, error: "missing_scope"} and the
-// receipt's FailureKind is "permanent".
+// receipt's FailureKind is "auth" (mapSlackError classifies missing_scope as
+// auth, so a consumer branching retry policy on this doc must read `auth`).
 //
 // Slack's files.completeUploadExternal does NOT accept chat:write.customize
 // username/icon overrides, so file posts appear under the default bot
 // identity even when an identity record is registered for the source
 // session. This is a Slack platform limitation, not an adapter bug.
 // The identity lookup still happens for log parity with /publish.
+//
+// Delivery evidence here is weaker than /publish's, deliberately and for now:
+// /publish reads its message back and only then sets Delivered (see
+// confirmPublishReceipt), while this path still reports Delivered on Slack's
+// accepted write. The two emit the same receipt schema, so a consumer cannot
+// tell verified delivery from accepted delivery by the receipt alone — treat a
+// delivered /publish-file receipt as "Slack accepted the upload". Closing the
+// gap means reading back the completed post's ts the same way; it is not done
+// here because this change is scoped to the /publish contract.
 func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -2314,8 +2377,18 @@ func postReactionMethod(client *http.Client, token, method string, req slackReac
 	return &sr, nil
 }
 
+// slackPostTimeout bounds the write leg. /publish now spends its budget on a
+// write and then a read, and gc gives the adapter 30s for the whole call, so an
+// untimed post client could burn the entire budget and leave gc to time out
+// after Slack had already accepted the message — the shape that produces a
+// duplicate on the caller's retry. See slackReadbackTiming for the arithmetic
+// the two legs share.
+const slackPostTimeout = 10 * time.Second
+
+var slackPostHTTPClient = &http.Client{Timeout: slackPostTimeout}
+
 func postToSlack(token string, req slackPostMessageReq) (*slackPostMessageResp, error) {
-	return postMessageWithClient(http.DefaultClient, token, req)
+	return postMessageWithClient(slackPostHTTPClient, token, req)
 }
 
 // postMessageWithClient is the single Slack chat.postMessage path, parameterized

@@ -70,9 +70,19 @@ curl -s https://<your-tailnet>.ts.net/healthz
    **OAuth & Permissions** →
    - Bot Token Scopes — add:
      - `chat:write` (post messages)
-     - `im:history` (read DM history for inbound replies)
+     - `im:history` (read DM history for inbound replies **and** to verify
+       outbound ones — see below)
      - `im:read` (open DM channel)
      - `users:read` (resolve display names — optional but useful)
+
+     A history scope is required for every conversation kind you bind, not
+     just DMs: `/publish` confirms each post by reading it back, so a token
+     without history for a bound channel reports every publish as
+     `Delivered:false` / `readback_auth` even though the message is visible in
+     Slack. Add `channels:history` (public channels), `groups:history`
+     (private channels) and `mpim:history` (group DMs) when you bind rooms.
+     `slack-full/schema/apps.schema.json` is the authoritative list for
+     manifest-driven installs.
    - Click **Install to Workspace** at the top, approve.
    - Copy the **Bot User OAuth Token** (`xoxb-...`) — you need it.
 

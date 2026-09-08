@@ -57,7 +57,9 @@ for the full rationale.
 Implemented:
 
 - [x] `gc slack bind-dm` — bind a Slack DM channel to one named session
-- [x] `gc slack bind-room` — bind a room to multiple sessions; flags
+- [x] `gc slack bind-room` — bind a room to multiple sessions; requires
+      exactly one of `--binding-owner SESSION` / `--group-only` to
+      declare the room's binding shape; further flags
       `--enable-peer-fanout`, `--allow-untargeted-publication`,
       `--max-peer-triggered-publishes`, `--max-total-peer-deliveries`,
       `--default-handle`, `--handle HANDLE=SESSION` (creates a
@@ -295,13 +297,25 @@ reminder to the other bound sessions so they see what their peer just
 said.
 
 `--binding-owner SESSION` is what makes outbound publishes (and
-therefore `gc slack reply-current --via gc`) actually work. Without
-it, peer fanout still fires on inbound, but `/extmsg/outbound` has
-no `SessionBindingRecord` to resolve the conversation through and the
-publish is rejected. The owner must be one of the participants —
-prefer the session that "owns" the room from gc's perspective. Pass
-the gc session id (e.g. `gc-77139`) when alias resolution semantics
-matter; for stable named sessions, the alias works too.
+therefore `gc slack reply-current --via gc`) actually work: without a
+direct binding, `/extmsg/outbound` has no `SessionBindingRecord` to
+resolve the conversation through and the publish is rejected, even
+though peer fanout still fires on inbound. The owner must be one of
+the participants — prefer the session that "owns" the room from gc's
+perspective. Pass the gc session id (e.g. `gc-77139`) when alias
+resolution semantics matter; for stable named sessions, the alias
+works too.
+
+Every run must declare which of the two shapes it wants: pass
+`--binding-owner SESSION` for a room with an outbound publisher, or
+`--group-only` for a purely group-routed room. `--group-only` removes
+*every* active direct binding for the conversation — including ones
+created by other tooling — so that none can shadow the group route,
+and it prints each removed binding to stderr. Because that removal is
+destructive, it is never the default: a run with neither flag is
+rejected before any API call rather than quietly sweeping the room's
+publisher. Re-running `bind-room` on an owned room therefore has to
+name the owner again.
 
 ## Adapter as a proxy_process service
 
