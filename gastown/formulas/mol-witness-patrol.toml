@@ -530,8 +530,17 @@ may have poured a next wisp without burning, or a restart may have raced —
 keep one open patrol wisp and burn any surplus, so wisps never accumulate.
 Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
 valid gc bd type and matches nothing).
+
+Set `THIS_WISP` to the id of the wisp you are executing right now, and
+exclude it from the reconcile. It must never be a reuse or burn candidate
+here — step 3 burns it. Do NOT rely on it being `in_progress`: the current
+wisp is frequently still `status=open`, so a query that only filters on
+status will match it, `NEXT` resolves to the id burned on the next line,
+and the witness is left holding zero wisps.
 ```bash
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
+THIS_WISP=<this-wisp-id>
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json \
+  | jq -r --arg self "$THIS_WISP" '.[] | select(.id != $self) | .id')
 NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force
@@ -544,7 +553,7 @@ fi
 
 **3. Burn this wisp:**
 ```bash
-gc bd mol burn <this-wisp-id> --force
+gc bd mol burn "$THIS_WISP" --force
 ```
 
 **4. Exit this turn:**
