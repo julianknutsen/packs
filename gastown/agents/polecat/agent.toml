@@ -3,6 +3,9 @@ wake_mode = "fresh"
 work_dir = ".gc/worktrees/{{.Rig}}/polecats/{{.AgentBase}}"
 nudge = "Run gc hook --claim --json now; if it returns work, execute the claimed formula immediately."
 pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync"]
+# Agent-level default: outranks a city's [agent_defaults], so a city that routes
+# polecat slings elsewhere must say so in a [[patches.agent]] block. See
+# ../../README.md ("Default Sling Formula").
 default_sling_formula = "mol-polecat-work"
 idle_timeout = "2h"
 min_active_sessions = 0
