@@ -523,31 +523,73 @@ gc runtime request-restart
 This blocks forever. The controller restarts you. The next wisp
 is already assigned — the new session resumes from context.
 
-**2. Pour next iteration BEFORE burning (reconcile to exactly one):**
+**2. Resolve the current wisp, pour next iteration, then burn this wisp:**
 
-Reuse an already-queued wisp instead of pouring a duplicate. A prior cycle
-may have poured a next wisp without burning, or a restart may have raced —
-keep one open patrol wisp and burn any surplus, so wisps never accumulate.
-Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
-valid gc bd type and matches nothing).
+Reconcile the wisps assigned to self down to exactly one before pouring or
+burning anything. `$GC_BEAD_ID` is **not** load-bearing here — it is an
+unpopulated optimization in the live witness runtime (confirmed empty for
+this session type; see vg-5kv) and must never gate behavior or cause a
+non-zero exit when absent — but the query below excludes it **by id**
+whenever it *is* set, so a populated `$GC_BEAD_ID` can never be mistaken for
+an already-queued replacement (review pass 4 Finding 1: checking presence of
+`$CURRENT_WISP`/`$ASSIGNED_WISP` alone, without comparing identity, silently
+reproduces this bead's original starvation bug the moment `$GC_BEAD_ID`
+becomes non-empty). The load-bearing signal is an **open-status scan,
+excluding the current wisp's own id**: a patrol wisp stays `status=open` for
+its entire working life (the bootstrap/resume path only ever sets
+`assignee`), so scanning `--status=open` wisps assigned to self — minus
+`$CURRENT_WISP` itself — reliably finds any *other* already-queued wisp even
+with `$GC_BEAD_ID` empty, and never confuses the current wisp for one.
+Reduce that scan to one `ASSIGNED_WISP`, burning any surplus left by a prior
+raced cycle, then pour+assign the next wisp before burning the current one.
+The steady state (`$GC_BEAD_ID` empty, exactly one open wisp already
+assigned) must fall through to a silent no-op, never an error exit — a scan
+that failed to exclude the current wisp by id would confuse "the current
+wisp" for "a leaked one" and burn the only wisp that exists with nothing
+poured to replace it (wisp starvation — see vg-5kv). Matches the
+mol-deacon-patrol / mol-refinery-patrol next-iteration convention.
 ```bash
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
-NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
+CURRENT_WISP=${GC_BEAD_ID:-}
+
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json \
+  | jq -r --arg self "$CURRENT_WISP" '.[] | select(.id != $self) | .id')
+ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force
 done
-if [ -z "$NEXT" ]; then
-  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
-  gc bd update "$NEXT" --assignee="$GC_AGENT"
+
+if   [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
+  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not pour next witness wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+    echo "Could not assign next witness wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
+  gc bd mol burn "$CURRENT_WISP" --force
+elif [ -n "$CURRENT_WISP" ]; then
+  gc bd mol burn "$CURRENT_WISP" --force
+elif [ -z "$ASSIGNED_WISP" ]; then
+  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not bootstrap next witness wisp."
+    gc runtime drain-ack
+    exit 1
+  fi
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+    echo "Could not assign bootstrap witness wisp."
+    gc runtime drain-ack
+    exit 1
+  fi
 fi
+# else: current unknown (GC_BEAD_ID empty), one already queued -> nothing to do.
 ```
 
-**3. Burn this wisp:**
-```bash
-gc bd mol burn <this-wisp-id> --force
-```
-
-**4. Exit this turn:**
+**3. Exit this turn:**
 Write exactly:
 ```
 IDLE: no work, exiting turn.
@@ -556,4 +598,4 @@ Then stop immediately. Do NOT sleep, call ScheduleWakeup, or use Monitor.
 The session_sleep policy will restart this session after the configured idle interval;
 the next wisp is already assigned and the restarted session resumes from it.
 
-**Exit criteria:** Next wisp poured, this wisp burned, turn ended with IDLE signal."""
+**Exit criteria:** Next wisp poured and assigned, this wisp burned, turn ended with IDLE signal."""
