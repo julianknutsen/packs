@@ -61,7 +61,7 @@ jobs:
                       pr-pipeline slack-channel slack-full slack-mini; do
             "$GC_BIN" lint "$pack"
           done
-          GC_TEST_BIN="$GC_BIN" python3 -m pytest tests/test_gc_role_prompt_integration.py -q
+          GC_TEST_BIN="$GC_BIN" python3 -m pytest tests/test_gc_role_prompt_integration.py tests/test_pack_composition_warnings.py -q
 
       # Installed, not parsed. `gc lint` above reads each pack on its own and
       # the per-pack suites read their own TOML; neither can say what gc does
