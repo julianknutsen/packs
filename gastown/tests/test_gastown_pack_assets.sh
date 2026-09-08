@@ -234,6 +234,10 @@ PY
         fail "direct refinery merge must push the verified merge worktree HEAD"
     [[ "$direct_block" == *'[ "$MERGED_SHA" != "$REMOTE" ]'* ]] ||
         fail "direct refinery merge must compare merged SHA to origin target"
+    [[ "$direct_block" == *'MISSING_PATCHES=$(branch_missing_patches "origin/$TARGET" "origin/$BRANCH")'* ]] ||
+        fail "direct refinery merge must compute post-push missing patches from source branch to target"
+    [[ "$direct_block" == *'halt_unverified_merge "origin/$TARGET" "origin/$BRANCH" "$MISSING_PATCHES"'* ]] ||
+        fail "direct refinery merge must block close when source branch patches are missing on target"
     [[ "$direct_block" == *'STOP. Do not mutate bead state.'* ]] ||
         fail "direct refinery merge must fail closed before metadata writes"
     ! printf '%s\n' "$direct_block" | grep -E '^[[:space:]]*git checkout \$TARGET([[:space:]]|$)' >/dev/null ||
@@ -248,6 +252,30 @@ block = text[start:end]
 verify = block.index('[ "$MERGED_SHA" != "$REMOTE" ]')
 metadata = block.index('--set-metadata merge_result=merged')
 if verify >= metadata:
+    raise SystemExit(1)
+PY
+
+    python3 - "$formula" <<'PY' || fail "direct refinery merge must verify patch presence before setting merged metadata"
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**If MERGE_STRATEGY = "direct"')
+end = text.index('**If MERGE_STRATEGY = "mr"')
+block = text[start:end]
+verify = block.index('MISSING_PATCHES=$(branch_missing_patches "origin/$TARGET" "origin/$BRANCH")')
+metadata = block.index('--set-metadata merge_result=merged')
+if verify >= metadata:
+    raise SystemExit(1)
+PY
+
+    python3 - "$formula" <<'PY' || fail "branch reap must stay after verified merge close contract"
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('**If MERGE_STRATEGY = "direct"')
+end = text.index('**If MERGE_STRATEGY = "mr"')
+block = text[start:end]
+close = block.index('gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"')
+reap = block.index('git push origin --delete $BRANCH')
+if reap <= close:
     raise SystemExit(1)
 PY
 }

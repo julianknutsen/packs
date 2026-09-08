@@ -1084,6 +1084,19 @@ def test_validate_gastown_orchestration_contract_rejects_missing_refinery_false_
         gascity_pack_inference_gate.validate_gastown_orchestration_contract(tmp_path / "gastown")
 
 
+def test_validate_gastown_orchestration_contract_rejects_missing_refinery_post_push_verifier(tmp_path) -> None:
+    formulas = tmp_path / "gastown" / "formulas"
+    formulas.mkdir(parents=True)
+    for formula_name, fragments in gascity_pack_inference_gate.all_gastown_formula_contracts().items():
+        text = "\n".join(fragments)
+        if formula_name == "mol-refinery-patrol":
+            text = text.replace("branch_missing_patches", "")
+        (formulas / f"{formula_name}.toml").write_text(text, encoding="utf-8")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-refinery-patrol"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(tmp_path / "gastown")
+
+
 def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
     for pack_name in gascity_pack_inference_gate.METHODOLOGY_PACKS:
         gascity_pack_inference_gate.validate_methodology_flow_contract(
@@ -1138,6 +1151,8 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
     }
     assert "gc session wake \"$REFINERY_TARGET\"" in contracts["mol-polecat-work"]
     assert 'git worktree add --detach "$MERGE_WT" "origin/$TARGET"' in contracts["mol-refinery-patrol"]
+    assert "branch_missing_patches" in contracts["mol-refinery-patrol"]
+    assert 'halt_unverified_merge "origin/$TARGET" "origin/$BRANCH" "$MISSING_PATCHES"' in contracts["mol-refinery-patrol"]
     assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in contracts["mol-refinery-patrol"]
     assert "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"" in contracts["mol-refinery-patrol"]
     assert "FAIL-SAFE: empty liveness map" in contracts["mol-witness-patrol"]

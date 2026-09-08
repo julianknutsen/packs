@@ -494,6 +494,57 @@ branch_has_real_change() {
   return 0
 }
 
+branch_patches_missing_from_target() {
+  # Verify that every patch carried by <branch-ref> is present on
+  # <target-ref>, ignoring commit-hash rewrites from rebase/cherry-pick.
+  # `git cherry upstream head` prints "+" for patches in head not found
+  # upstream, "-" for patch-equivalent commits already present.
+  #   exit 0 = all branch patches found on target
+  #   exit 1 = one or more branch patches missing (prints offending SHAs)
+  #   exit 2 = verification could not run (missing refs / git error)
+  bpmft_target="$1"
+  bpmft_branch="$2"
+  git rev-parse --verify "$bpmft_target" >/dev/null 2>&1 || return 2
+  git rev-parse --verify "$bpmft_branch" >/dev/null 2>&1 || return 2
+  bpmft_missing=$(git cherry "$bpmft_target" "$bpmft_branch" 2>/dev/null | awk '$1 == "+" {print $2}')
+  bpmft_status=$?
+  [ "$bpmft_status" -eq 0 ] || return 2
+  if [ -n "$bpmft_missing" ]; then
+    printf '%s\n' "$bpmft_missing"
+    return 1
+  fi
+  return 0
+}
+
+requeue_unverified_merge() {
+  rum_branch="$1"
+  rum_target="$2"
+  rum_reason="$3"
+  gc workflow delete-source "$WORK" --apply && gc workflow reopen-source "$WORK"
+  gc bd update "$WORK" \
+    --status=open \
+    --assignee="" \
+    --set-metadata merge_result=verification_failed \
+    --set-metadata rejection_reason="Merge verification failed for $rum_branch -> $rum_target: $rum_reason" \
+    --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+  echo "MERGE VERIFICATION FAILED: $rum_reason"
+  echo "Work bead re-queued to polecat. Branch left intact for recovery."
+  gc runtime drain-ack
+  exit 1
+}
+
+branch_missing_patches() {
+  # Post-push merge verifier. `git cherry <target> <branch>` lists commits
+  # from <branch> whose patch-id is missing from <target>. Empty output means
+  # every source-branch patch landed on target, even if the rebase rewrote
+  # commit SHAs. Any "+" line after push means the close-as-merged claim would
+  # be false, so the caller must halt before bead close or branch reap.
+  bmp_target="$1"
+  bmp_branch="$2"
+  bmp_raw=$(git cherry "$bmp_target" "$bmp_branch" 2>/dev/null) || return 1
+  printf '%s\n' "$bmp_raw" | sed -n 's/^+ //p'
+}
+
 halt_false_completion() {
   # branch_has_real_change tripped: a close-as-merged would assert "work was
   # merged" for a branch that merges to a no-op, which is definitionally
@@ -513,6 +564,25 @@ halt_false_completion() {
   gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "FALSE-COMPLETION HALT: $WORK — branch $fc_branch no verified change vs $fc_base; refused close-as-merged."
   echo "REFUSED close-as-merged: $WORK branch $fc_branch introduces no real change vs $fc_base."
   echo "STOP. Bead left blocked + escalated to mayor/witness. NEVER silent retry."
+  gc runtime drain-ack
+  exit 1
+}
+
+halt_unverified_merge() {
+  vum_target="$1"
+  vum_branch="$2"
+  vum_missing="$3"
+  vum_reason="post-push verification failed: $vum_target is missing patches from $vum_branch: $vum_missing"
+  gc bd update $WORK \
+    --status=blocked \
+    --assignee="" \
+    --set-metadata merge_result=verification_failed \
+    --set-metadata merged_target="$TARGET" \
+    --set-metadata blocked_reason="$vum_reason"
+  gc session nudge mayor "MERGE VERIFICATION FAILED: $WORK — $vum_reason. Bead left blocked; source branch preserved for debug."
+  gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "MERGE VERIFICATION FAILED: $WORK — $vum_reason."
+  echo "MERGE VERIFICATION FAILED: $vum_reason"
+  echo "STOP. Do not close bead. Do not reap branch."
   gc runtime drain-ack
   exit 1
 }
@@ -763,6 +833,25 @@ pour the next wisp and burn this one) — the same tail a normal merge takes. Do
 NOT drain-ack here; that would strand the loop and leak the merged branch.
 Otherwise the branch has a verified real change and you continue to the merge.
 
+**0.5. Refuse a rebase that dropped branch patches:**
+
+Before touching `$TARGET`, prove the rebased `temp` branch still contains
+patch-equivalent copies of every commit from `origin/$BRANCH`. This catches
+the silent-loss case where rebase/cherry-pick drops a commit and the refinery
+would otherwise fast-forward and later close the bead on an incomplete land.
+```bash
+if PRE_PUSH_MISSING=$(branch_patches_missing_from_target temp "origin/$BRANCH"); then
+  PRE_PUSH_STATUS=0
+else
+  PRE_PUSH_STATUS=$?
+fi
+case "$PRE_PUSH_STATUS" in
+  0) ;;
+  1) requeue_unverified_merge "$BRANCH" "$TARGET" "rebased temp branch is missing source patches: $(printf '%s' "$PRE_PUSH_MISSING" | paste -sd',' -)" ;;
+  *) echo "Could not verify rebased branch contents before merge. STOP. Do not mutate bead state."; gc runtime drain-ack; exit 1 ;;
+esac
+```
+
 **1. Merge, push, verify, and close work bead:**
 
 Run this as one script. It uses a temporary detached worktree for the
@@ -797,6 +886,25 @@ if [ "$MERGED_SHA" != "$REMOTE" ]; then
   gc runtime drain-ack
   exit 1
 fi
+MISSING_PATCHES=$(branch_missing_patches "origin/$TARGET" "origin/$BRANCH") || {
+  echo "POST-PUSH VERIFICATION FAILED — could not compare origin/$TARGET to origin/$BRANCH. STOP. Do not mutate bead state."
+  gc runtime drain-ack
+  exit 1
+}
+if [ -n "$MISSING_PATCHES" ]; then
+  halt_unverified_merge "origin/$TARGET" "origin/$BRANCH" "$MISSING_PATCHES"
+fi
+
+if POST_PUSH_MISSING=$(branch_patches_missing_from_target "origin/$TARGET" "origin/$BRANCH"); then
+  POST_PUSH_STATUS=0
+else
+  POST_PUSH_STATUS=$?
+fi
+case "$POST_PUSH_STATUS" in
+  0) ;;
+  1) requeue_unverified_merge "$BRANCH" "$TARGET" "target is missing source patches after push: $(printf '%s' "$POST_PUSH_MISSING" | paste -sd',' -)" ;;
+  *) echo "Could not verify origin/$TARGET contains branch patches after push. STOP. Do not mutate bead state."; gc runtime drain-ack; exit 1 ;;
+esac
 
 gc bd update "$WORK" \
   --set-metadata merge_result=merged \
@@ -814,6 +922,12 @@ Both the `--set-metadata` write and the `gc bd close` are required —
 closed bead to its merge commit on `$TARGET`. `--unset-metadata
 rejection_reason` clears any stale rejection field from an earlier
 rejected/reworked attempt before the successful close.
+
+The post-push patch verification is the close gate. A successful push only
+proves ref movement; it does NOT prove the source branch's patches landed on
+the target. If any missing patch remains, leave the bead blocked or requeued
+with explicit verification metadata, preserve the branch, and escalate instead
+of closing.
 
 **2. Cleanup:**
 ```bash
