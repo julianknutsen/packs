@@ -1,5 +1,10 @@
 [order]
 description = "Watch for severity:escalate rollup beads and deliver them. Pure mechanical — no agent decision."
+# Deliberately NOT city-scoped, unlike patrol-project-leads: deliver-rollup.sh
+# routes each bead by its own `rig:` label and is idempotent per bead
+# (idempotency_key `rollup-<id>`, plus an `--add-label delivered` on success),
+# so overlapping per-rig instances converge on the same delivery instead of
+# fanning out. oversight-rig/tests/test_order_scopes.py pins this fan-out.
 trigger = "condition"
 check = "bash $GC_PACK_DIR/assets/scripts/has-undelivered-escalates.sh"
 exec = "bash $GC_PACK_DIR/assets/scripts/deliver-rollup.sh"
