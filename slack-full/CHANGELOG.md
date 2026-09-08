@@ -26,6 +26,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commands sends the body verbatim. Pure script-side change — no
   adapter restart needed.
 
+  Two limits worth knowing. "Lone tilde" is per rendered line, so two
+  home-relative paths on one line (`rsync ~/a ~/b`) are a pairable pair
+  and both get substituted; wrap twin paths in a code span, or use
+  `--raw`, when the exact bytes matter. And `gc slack post-message` is
+  deliberately out of scope: its milestone summary, field values, and
+  rollup items are rendered as mrkdwn by the Go Block Kit renderer,
+  downstream of this Python guard, so a payload carrying
+  "~$58.5k … ~$16.5k" still strikes through (titles are `plain_text`
+  and unaffected). That surface predates this change and guarding it
+  would need a second implementation of the heuristic in Go plus a
+  `gc-slack-cli` rebuild; tracked as gp-x5bdy.
+
+  Scope is this pack only. The sibling packs `slack-channel` (same
+  `publish` / `publish-to-channel` / `reply-current` verbs) and
+  `slack-mini` (`post-message`) carry no guard, so the same `gc slack`
+  verb behaves differently depending on which pack a city installed.
+  Porting was left out deliberately to keep this change script-side
+  with no adapter rebuild; guard-port vs. documented exclusion is
+  tracked as gp-cbxzk.
+
 ### Fixed
 
 - Inbound files recorded inside Slack itself — voice clips (file subtype

@@ -41,7 +41,7 @@ def _load_body(args: argparse.Namespace) -> str:
         body = pathlib.Path(args.body_file).read_text(encoding="utf-8")
     else:
         raise SystemExit("either --body or --body-file is required")
-    if not getattr(args, "raw", False):
+    if not args.raw:
         # gp-o42: tilde pairs render as strikethrough in Slack mrkdwn.
         body = slack_mrkdwn.escape_accidental_mrkdwn(body)
     return body

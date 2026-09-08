@@ -71,6 +71,14 @@ Slack already attributes every reply to your agent identity. Write the message
 directly; do not prefix the message with your name or handle.
 Do not pipe the command through filters that can hide failures.
 
+Slack mrkdwn has no escape character, so the send commands neutralize tildes
+that would pair into unintended strikethrough — the "approximately" tilde in
+"~$58.5k … ~$16.5k" struck through half a runway summary. Deliberate `~word~`
+and code spans survive untouched. Two `~/` paths on one line do pair, so wrap
+those in a code span (or pass `--raw`) when the exact bytes matter.
+`gc slack post-message` payloads are rendered downstream of this guard and are
+not protected: write "approx." there instead.
+
 ## Agent-to-agent delegation
 
 To formally hand work to one peer, visibly:

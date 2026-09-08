@@ -2524,7 +2524,8 @@ def cmd_delegate(argv: list[str]) -> int:
         "--raw", action="store_true",
         help=("Send the body verbatim, skipping the accidental-mrkdwn guard "
               "(by default, tildes that would pair into unintended Slack "
-              "strikethrough are neutralized)."))
+              "strikethrough are neutralized; deliberate ~word~ wrapping and "
+              "code spans always pass through)."))
     args = parser.parse_args(argv)
 
     session_name = os.environ.get("GC_SESSION_NAME", "").strip()

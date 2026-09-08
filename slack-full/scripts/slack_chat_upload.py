@@ -92,7 +92,8 @@ def main(argv: list[str]) -> int:
         "--raw", action="store_true",
         help=("Send --initial-comment verbatim, skipping the accidental-"
               "mrkdwn guard (by default, tildes that would pair into "
-              "unintended Slack strikethrough are neutralized)."))
+              "unintended Slack strikethrough are neutralized; deliberate "
+              "~word~ wrapping and code spans always pass through)."))
     parser.add_argument("--via", choices=("gc", "adapter"), default="gc",
                         help="Routing path. 'gc' (default) records the upload "
                              "in the transcript and fans out to peer sessions; "
