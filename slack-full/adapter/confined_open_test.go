@@ -12,6 +12,30 @@ import (
 // paths open, and a symlink at ANY component — the stand-in for a
 // parent directory swapped mid-flight — is a hard failure.
 
+// tempDirResolved is t.TempDir() with symlinks resolved.
+//
+// readConfinedFile's contract is that the caller passes an already
+// EvalSymlinks-resolved path — in production confineFileUploadPath does
+// that — and confineFileUploadPath resolves the ROOT but only Abs+Cleans
+// the PATH. A test that hands it a raw t.TempDir() therefore compares a
+// resolved root against an unresolved path.
+//
+// On Linux that is invisible: TMPDIR has no symlinked component, so the
+// two forms are identical. On macOS TMPDIR lives under /var, which IS a
+// symlink to private/var, so the root canonicalizes to /private/var/...
+// while the path stays /var/..., filepath.Rel returns a ../.. escape and
+// every one of these tests fails with "is outside root" — a test-harness
+// artifact, not a confinement defect.
+func tempDirResolved(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("resolving temp dir %q: %v", dir, err)
+	}
+	return resolved
+}
+
 func TestOpenBeneathReadsNestedFile(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "a", "b"), 0o700); err != nil {
@@ -70,7 +94,7 @@ func TestOpenBeneathRejectsInvalidRel(t *testing.T) {
 }
 
 func TestReadConfinedFileStillReadsAndStillConfines(t *testing.T) {
-	root := t.TempDir()
+	root := tempDirResolved(t)
 	sub := filepath.Join(root, "files")
 	if err := os.MkdirAll(sub, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)

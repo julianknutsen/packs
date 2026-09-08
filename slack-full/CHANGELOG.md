@@ -48,6 +48,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The adapter builds and its tests pass on darwin again. The confined-open
+  walk called `syscall.Openat`, which exists only on Linux — darwin's
+  libSystem-based `syscall` package exports neither `Openat` nor
+  `SYS_OPENAT` — so the entire adapter failed to compile on macOS. The
+  walk now binds `golang.org/x/sys/unix`; every flag constant and syscall
+  it swaps is a value-identical mirror on Linux, so behavior there is
+  unchanged. Three `readConfinedFile` tests also failed on macOS, where
+  `TMPDIR` lives under `/var`, itself a symlink to `/private/var`:
+  `confineFileUploadPath` EvalSymlinks-resolves only the *root* and
+  documents the path as caller-pre-resolved, so a fixture handing it a
+  raw `t.TempDir()` broke that contract and made every path — including
+  genuinely in-root ones — read as an escape. The fixtures now resolve
+  their temp dir once through `tempDirResolved`. A harness defect, not a
+  confinement one: no production behavior changed.
 - Inbound files recorded inside Slack itself — voice clips (file subtype
   `slack_audio`) and video clips (`slack_video`) — arrive with an empty
   `mimetype` AND `filetype`, which the adapter passed through verbatim.
@@ -100,6 +114,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The adapter module takes its first dependency, `golang.org/x/sys`
+  (hash-pinned in `adapter/go.sum`), because it is the only maintained
+  source of a darwin-capable `Openat`. The module's zero-dependency
+  property was traded away deliberately; the rejected alternatives and
+  the reason are recorded in `adapter/confined_open.go`. One
+  operator-visible consequence: `adapter/run.sh`'s build-on-missing
+  self-heal used to rebuild the binary with no module downloads at all,
+  and now needs either a warm module cache or GOPROXY egress the first
+  time it builds. On a host behind an egress allowlist, pre-warm with
+  `go mod download` in `slack-full/adapter/` before relying on the
+  self-heal — a cold cache there fails the rebuild with `module lookup
+  disabled by GOPROXY=off`, and the remedy `run.sh` prints on failure
+  hits the same wall.
 - **Behavior change on upgrade:** the slack service now *exits 1 at
   startup* when `GC_SLACK_ADAPTER_ENV` is set to a path that does not
   exist, where it previously logged one warning and started on the
