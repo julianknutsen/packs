@@ -534,6 +534,12 @@ Handle any urgent messages that arrived during patrol. Archive the rest.
 
 **3. Resolve current wisp and pour next iteration BEFORE burning:**
 ```bash
+# Preferring the spawn trigger is safe here only because the deacon is a
+# singleton with a fresh wake (agents/deacon/agent.toml: max_active_sessions = 1,
+# wake_mode = "fresh"), so one process env holds exactly one wisp and the
+# trigger cannot name a foreign molecule. Do not copy this order into a pooled
+# role, and do not keep it here if this formula ever rotates wisps in-session
+# or the deacon gains a second slot.
 CURRENT_WISP=${GC_BEAD_ID:-${GC_TRIGGER_WORK_BEAD_ID:-}}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')

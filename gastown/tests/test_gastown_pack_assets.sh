@@ -111,6 +111,129 @@ test_shutdown_dance_lifecycle_and_audit_contracts() {
         fail "dog prompt DOG_DONE guidance should use the normalized requester endpoint"
 }
 
+# Five role-surfaces resolve a work bead from the environment, by deliberately
+# different rules, and the differences are load-bearing. Two properties decide
+# which form is safe -- NOT "pooled vs singleton": the refinery and the deacon
+# carry identical max_active_sessions = 1 + wake_mode = "fresh" pins, so pooling
+# cannot tell them apart. What differs is (a) whether more than one session
+# shares the env, and (b) whether the role rotates wisps IN-SESSION, which makes
+# a spawn-fixed trigger go stale mid-loop:
+#   shutdown dance (dog pool, max_active_sessions = 3) - resolve the CLAIM
+#     first. The spawn trigger is fixed at wake and is not advanced by
+#     `gc hook --claim`, so under contention it names a bead this session never
+#     claimed - and the dance closes whatever it resolves.
+#   deacon patrol formula (singleton, wake_mode = "fresh", pours the next wisp
+#     then EXITS the turn) - may prefer the trigger: one process env holds
+#     exactly one wisp for its whole life.
+#   refinery patrol formula (singleton too, but re-reads the formula steps
+#     in-session after burning) - bare ${GC_BEAD_ID:-} plus a live assignee
+#     query, never the trigger: the wisp advances while the trigger does not.
+#   refinery / witness / deacon prompt templates - bare ${GC_BEAD_ID:-} plus the
+#     same live query. Exempt from the trigger rule by form, not by luck: a bare
+#     resolution backed by the assignee query cannot mis-select on any role, so
+#     it stays correct even on the singletons. Pinned below so the exemption is
+#     gated rather than conventional.
+# Pin the discriminator, and the rotation property it rests on, so the forms
+# cannot silently converge on the permissive one.
+test_work_bead_resolution_discriminator_is_pinned() {
+    local dance="$GASTOWN/formulas/mol-shutdown-dance.toml"
+    local deacon="$GASTOWN/formulas/mol-deacon-patrol.toml"
+    local refinery="$GASTOWN/formulas/mol-refinery-patrol.toml"
+    local refinery_prompt="$GASTOWN/agents/refinery/prompt.template.md"
+
+    local claim_first='GC_BEAD_ID="${GC_BEAD_ID:-$(gc hook current --id-only 2>/dev/null)}"'
+    local trigger_fallback='GC_BEAD_ID="${GC_BEAD_ID:-${GC_TRIGGER_WORK_BEAD_ID:?no work bead id in env}}"'
+
+    # Order-sensitive by construction: presence greps alone would stay green on
+    # a reordering. Record both forms in file order and require claim-then-
+    # trigger at exactly the two normalization sites the formula prose names.
+    local dance_order
+    dance_order="$(awk -v claim="$claim_first" -v trig="$trigger_fallback" '
+        index($0, claim) { printf "C"; next }
+        index($0, trig)  { printf "T" }
+    ' "$dance")"
+    [[ "$dance_order" == "CTCT" ]] ||
+        fail "shutdown dance must resolve the claimed warrant before the spawn trigger at exactly the two normalization sites (preamble and receive-warrant step 1); got '$dance_order'"
+
+    # Nesting the resolver inside the trigger fallback is inert: ${A:-${B:-$(C)}}
+    # never evaluates $(C) while B is non-empty, so a stale trigger still wins
+    # and the dance closes a foreign bead.
+    ! grep -F 'GC_TRIGGER_WORK_BEAD_ID:-$(gc hook current' "$dance" >/dev/null ||
+        fail "shutdown dance must not nest the claim resolver inside the trigger fallback; that form is inert whenever the trigger is set"
+
+    # The signature above matches two exact literals, so it is blind to a
+    # NOVEL-form trigger resolution added to a third block (a bare
+    # ${GC_TRIGGER_WORK_BEAD_ID:-} matches neither literal and leaves the
+    # signature at CTCT). Bound the references instead of only their shape, so a
+    # new one has to be added consciously rather than silently.
+    local dance_trigger_refs
+    dance_trigger_refs="$(grep -cF 'GC_TRIGGER_WORK_BEAD_ID' "$dance" || true)"
+    [[ "$dance_trigger_refs" -eq 3 ]] ||
+        fail "shutdown dance must carry exactly 3 GC_TRIGGER_WORK_BEAD_ID references (the prose paragraph plus the two fallback lines); got $dance_trigger_refs. A new one is a new resolution site: update the prose contract and this pin together."
+
+    local deacon_trigger
+    deacon_trigger="$(grep -cF 'CURRENT_WISP=${GC_BEAD_ID:-${GC_TRIGGER_WORK_BEAD_ID:-}}' "$deacon" || true)"
+    [[ "$deacon_trigger" -eq 1 ]] ||
+        fail "deacon patrol should keep exactly one trigger-preferring wisp resolution; got $deacon_trigger"
+    grep -F 'max_active_sessions = 1' "$GASTOWN/agents/deacon/agent.toml" >/dev/null ||
+        fail "the deacon's trigger-first wisp resolution is safe only while the deacon is a singleton; agent.toml no longer pins max_active_sessions = 1"
+    grep -F 'wake_mode = "fresh"' "$GASTOWN/agents/deacon/agent.toml" >/dev/null ||
+        fail "the deacon's trigger-first wisp resolution is safe only on a fresh wake; agent.toml no longer pins wake_mode"
+
+    # The third precondition lives in the formula, not in agent.toml, so neither
+    # pin above can ever catch its loss: the deacon pours the successor, burns
+    # this wisp, and EXITS the turn, so one process env holds exactly one wisp
+    # for its whole life and the restarted session gets a fresh trigger. An
+    # in-session loop here revives the stale-trigger failure with both config
+    # pins still green.
+    grep -F 'IDLE: no work, exiting turn.' "$deacon" >/dev/null ||
+        fail "the deacon's trigger-first wisp resolution is safe only while each iteration ends by exiting the turn; mol-deacon-patrol.toml no longer emits the IDLE exit signal"
+    grep -F 'the restarted session resumes from it' "$deacon" >/dev/null ||
+        fail "the deacon's trigger-first wisp resolution is safe only while the successor wisp is resumed by a RESTARTED session (fresh trigger); mol-deacon-patrol.toml no longer hands the successor to a restarted session"
+    ! grep -F 're-read formula steps to begin' "$deacon" >/dev/null ||
+        fail "the deacon now rotates wisps in-session like the refinery, so its spawn trigger goes stale mid-loop; mol-deacon-patrol.toml must drop the trigger-preferring resolution for the bare \${GC_BEAD_ID:-} plus live assignee query"
+
+    # The refinery's opposite rule rests on the opposite property, so pin that
+    # too rather than leaving it asserted only in a comment: it re-reads the
+    # formula steps in-session after burning, advancing the wisp while the
+    # spawn-fixed trigger stays put.
+    grep -F 're-read formula steps to begin' "$refinery" >/dev/null ||
+        fail "the refinery no longer rotates wisps in-session; that rotation is the recorded reason it must never resolve a wisp from the spawn trigger, so re-derive the per-role rule and this discriminator before relaxing either form"
+
+    # Every environment-resolved wisp assignment in the refinery must be the
+    # bare query-backed form. Comparing the two counts catches conversion in
+    # either direction without freezing the number of call sites.
+    local path env_assignments bare_assignments
+    for path in "$refinery" "$refinery_prompt"; do
+        ! grep -F 'GC_TRIGGER_WORK_BEAD_ID' "$path" >/dev/null ||
+            fail "the refinery rotates wisps in-session, so a spawn-fixed trigger goes stale mid-loop; it must resolve every wisp from \$GC_BEAD_ID plus the live assignee query, never the trigger: $path"
+        env_assignments="$(grep -cF 'CURRENT_WISP=${GC_BEAD_ID' "$path" || true)"
+        bare_assignments="$(grep -cF 'CURRENT_WISP=${GC_BEAD_ID:-}' "$path" || true)"
+        [[ "$env_assignments" -ge 1 ]] ||
+            fail "refinery should resolve its current wisp from \$GC_BEAD_ID: $path"
+        [[ "$env_assignments" -eq "$bare_assignments" ]] ||
+            fail "every refinery wisp resolution must be the bare \${GC_BEAD_ID:-} form backed by the live assignee query ($bare_assignments of $env_assignments): $path"
+    done
+
+    # The remaining two surfaces of the census in the header comment. They are
+    # correct today by form -- bare plus the live query cannot mis-select on a
+    # singleton -- so gate that exemption instead of leaving it to convention: a
+    # harmonization edit that copies the deacon formula's trigger-preferring
+    # line into either template goes red here rather than passing silently.
+    local template
+    for template in "$GASTOWN/agents/witness/prompt.template.md" \
+                    "$GASTOWN/agents/deacon/prompt.template.md"; do
+        ! grep -F 'GC_TRIGGER_WORK_BEAD_ID' "$template" >/dev/null ||
+            fail "singleton prompt templates stay exempt from the per-role trigger rules by using the bare \${GC_BEAD_ID:-} form; they must not resolve a wisp from the spawn trigger: $template"
+        env_assignments="$(grep -cF 'CURRENT_WISP=${GC_BEAD_ID' "$template" || true)"
+        bare_assignments="$(grep -cF 'CURRENT_WISP=${GC_BEAD_ID:-}' "$template" || true)"
+        [[ "$env_assignments" -ge 1 ]] ||
+            fail "prompt template should resolve its current wisp from \$GC_BEAD_ID: $template"
+        [[ "$env_assignments" -eq "$bare_assignments" ]] ||
+            fail "every prompt-template wisp resolution must be the bare \${GC_BEAD_ID:-} form backed by the live assignee query ($bare_assignments of $env_assignments): $template"
+    done
+}
+
 test_composition_is_documented() {
     # The retired maintenance pack is gone: the runtime composes the builtin
     # core pack via explicit city.toml includes, and gastown owns the only
@@ -291,6 +414,7 @@ test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
+test_work_bead_resolution_discriminator_is_pinned
 test_composition_is_documented
 test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
