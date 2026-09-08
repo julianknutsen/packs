@@ -7,12 +7,15 @@
 #
 # Pack-shipped binary:
 #
-#   - Adapter (./adapter/gc-slack-mini-adapter, built from adapter/main.go).
-#     A single-file Slack webhook receiver + outbound publisher. The
-#     [[service]] block below has gc supervise it as a proxy_process. It
-#     binds a Unix domain socket at $GC_SERVICE_SOCKET for /post-message +
-#     /healthz, and a public TCP port for /slack/events (the Slack Events
-#     API receiver — terminate TLS in front of it, e.g. Tailscale Funnel).
+#   - Adapter (./adapter/gc-slack-mini-adapter, built from adapter/main.go
+#     + adapter/socketmode.go). A Slack inbound receiver + outbound
+#     publisher. The [[service]] block below has gc supervise it as a
+#     proxy_process. It binds a Unix domain socket at $GC_SERVICE_SOCKET for
+#     /post-message + /healthz. Inbound arrives one of two ways, chosen by
+#     env: with SLACK_APP_TOKEN set it runs Socket Mode (an outbound
+#     WebSocket to Slack — no public port at all); otherwise it binds a
+#     public TCP port for /slack/events (the Slack Events API receiver —
+#     terminate TLS in front of it, e.g. Tailscale Funnel).
 #
 # This pack ships NO operator CLI binary: the single outbound verb is a
 # bash wrapper (commands/post-message.sh) that POSTs to the adapter through
@@ -30,17 +33,18 @@ schema = 2
 
 # proxy_process service: gc supervises the adapter as part of the city's
 # service set. The adapter binds a UDS at $GC_SERVICE_SOCKET for
-# /post-message + /healthz; gc reverse-proxies /svc/slack-mini/* to it. The
-# adapter also binds public TCP (LISTEN_PUBLIC, default 0.0.0.0:8775) for
-# /slack/events. proxy_process owns only the UDS lifecycle.
+# /post-message + /healthz; gc reverse-proxies /svc/slack-mini/* to it. In
+# HTTP mode the adapter also binds public TCP (LISTEN_PUBLIC, default
+# 0.0.0.0:8775) for /slack/events; in Socket Mode (SLACK_APP_TOKEN set) it
+# binds no public port. proxy_process owns only the UDS lifecycle either way.
 #
 # The service is named "slack-mini" (matching the pack) so it does not
 # collide with a slack-full install's "slack" service. Per the tiering
 # design, run exactly one Slack tier per city regardless.
 #
-# Secrets (SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, SLACK_WORKSPACE_ID) and
-# GC_CITY_NAME are inherited from the service environment at start. See
-# README.md "Configure".
+# Secrets (SLACK_BOT_TOKEN, SLACK_WORKSPACE_ID, plus SLACK_SIGNING_SECRET in
+# HTTP mode or SLACK_APP_TOKEN in Socket Mode) and GC_CITY_NAME are inherited
+# from the service environment at start. See README.md "Configure".
 
 [[service]]
 name = "slack-mini"
