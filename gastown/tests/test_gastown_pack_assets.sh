@@ -253,8 +253,23 @@ test_prime_prompts_are_city_generic_and_compact() {
         fail "operational awareness must fail closed when endpoint discovery fails"
 }
 
+test_wisp_reconciliation_queries_include_infra() {
+    # Wisp roots are ephemeral infrastructure beads. `gc bd list` hides infra
+    # beads unless --include-infra is passed, so a --type=molecule
+    # reconciliation query without the flag returns [] no matter how many
+    # wisps are open. Every patrol then concludes "no wisp exists" and pours a
+    # fresh one, leaking a wisp per iteration (gastownhall/gascity-packs#252).
+    local offenders
+    offenders=$(grep -rn -- 'gc bd list' "$GASTOWN/formulas" |
+        grep -F -- '--type=molecule' |
+        grep -vF -- '--include-infra' || true)
+    [[ -z "$offenders" ]] ||
+        fail "wisp reconciliation queries must pass --include-infra:"$'\n'"$offenders"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
+test_wisp_reconciliation_queries_include_infra
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented

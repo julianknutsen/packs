@@ -529,9 +529,12 @@ Reuse an already-queued wisp instead of pouring a duplicate. A prior cycle
 may have poured a next wisp without burning, or a restart may have raced —
 keep one open patrol wisp and burn any surplus, so wisps never accumulate.
 Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
-valid gc bd type and matches nothing).
+valid gc bd type and matches nothing). `--include-infra` is required:
+wisp roots are ephemeral infrastructure beads, which `gc bd list` hides by
+default, so without the flag this returns `[]` even when wisps are open and
+every iteration pours a duplicate instead of reusing the queued one.
 ```bash
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
 NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force
