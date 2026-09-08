@@ -791,6 +791,19 @@ type publishReceipt struct {
 	MessageID    string          `json:"message_id,omitempty"`
 	Delivered    bool            `json:"delivered"`
 	FailureKind  string          `json:"failure_kind,omitempty"`
+	// Metadata carries out-of-band facts about a delivery that the four
+	// named fields above cannot express — currently only "truncated". gc
+	// does not decode this body into its public PublishReceipt directly: it
+	// unmarshals into a fixed intermediate shim, wirePublishReceipt
+	// (gascity internal/extmsg/http_adapter.go:140-157), whose six fields
+	// are copied across one by one in toPublishReceipt. `metadata` is one
+	// of those six and reaches PublishReceipt.Metadata; any key outside
+	// that set is silently discarded at gc's boundary, so widening this
+	// struct with a new top-level field would produce a value no gc
+	// consumer can ever observe. Measured against gc's real code, not
+	// inferred. The request side already uses this idiom
+	// (publishRequest.Metadata).
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 type externalActor struct {
@@ -857,6 +870,15 @@ type slackPostMessageResp struct {
 	TS      string `json:"ts,omitempty"`
 	Channel string `json:"channel,omitempty"`
 	Error   string `json:"error,omitempty"`
+	// Slack reports non-fatal problems here instead of failing the call. The
+	// one that matters to us is "message_truncated": Slack truncates text past
+	// slackMaxMessageLength rather than rejecting it, and returns ok:true, so
+	// the receipt looks perfect. handlePublish stamps the reference marker at
+	// the very end of the text, so this warning is the only wire signal that a
+	// delivered keyed message is no longer findable by its marker.
+	ResponseMetadata struct {
+		Warnings []string `json:"warnings,omitempty"`
+	} `json:"response_metadata,omitempty"`
 }
 
 // Slack files-upload-v2 API types.
@@ -1393,7 +1415,25 @@ func registerAdapter(cfg config) error {
 		Capabilities: adapterCapabilities{
 			SupportsChildConversations: false,
 			SupportsAttachments:        true,
-			MaxMessageLength:           40000, // Slack's chat.postMessage limit
+			// Reserve room for the marker handlePublish appends to keyed
+			// messages. Slack does not reject text over its ceiling — it
+			// truncates from the end and still answers ok:true, with a
+			// "message_truncated" warning in response_metadata — so the
+			// reservation is not overflow protection, it is what keeps the
+			// trailing marker inside the 40,000 window for callers that size
+			// against this advertised capability. Nothing in gc reads
+			// MaxMessageLength today, so handlePublish also enforces the same
+			// budget itself rather than trusting the advertisement.
+			//
+			// The reservation is uniform because a capability is advertised
+			// once per adapter while the stamp decision is per request: only
+			// keyed publishes are stamped, but there is no way to express
+			// "20 bytes less, but only when you send an idempotency key". So
+			// unkeyed publishes — the majority — also give up the 20 bytes.
+			// Harmless while no gc-side sizer exists; if one lands and the
+			// reserve is worth recovering, it needs a per-call capability,
+			// not a different constant here.
+			MaxMessageLength: slackMaxMessageLength - referenceMarkerOverhead,
 		},
 	})
 	// PathEscape cityName so URL-significant characters cannot alter
@@ -1491,6 +1531,78 @@ func (c *publishDedupCache) Put(key string, receipt publishReceipt) {
 	}
 }
 
+// referenceSuffix derives the low-visibility marker embedded in outbound
+// publish text so a later reader can find the exact message in Slack channel
+// history. The in-process publishDedupCache only survives publishDedupTTL and
+// process restarts, so it cannot provide durable delivery evidence.
+//
+// The digest is a forward contract with the gas-city delivery-state
+// reconciler tracked as dr-3msk6.3, which has not landed:
+// messaging_state_reconciler.py exists at no ref in that repo yet, so this
+// side is currently the only one pinning the format. When the Python reader
+// lands it must embed this same vector verbatim — "dr-3msk6.3-test-vector"
+// maps to "50e90a583c36" — and cite it back by repo, path, and commit. Until
+// then TestReferenceSuffixMatchesCrossLanguageTestVector is the sole
+// executable guard of the agreement.
+func referenceSuffix(idempotencyKey string) string {
+	digest := sha256.Sum256([]byte(idempotencyKey))
+	return hex.EncodeToString(digest[:])[:12]
+}
+
+const (
+	// slackMaxMessageLength is Slack's chat.postMessage ceiling.
+	slackMaxMessageLength = 40000
+	// referenceMarkerOverhead is the two-newline separator plus the fixed-width
+	// marker appended by handlePublish for keyed messages.
+	referenceMarkerOverhead = 2 + len("_ref:") + 12 + len("_")
+)
+
+// referenceMarker is appended to outbound text when an idempotency key is
+// present and the marker is both meaningful and survivable. Slack message
+// metadata would be preferable, but requires app scopes the adapter does not
+// have.
+//
+// Readback contract, for whatever reads these markers back. This comment is
+// the normative statement of the scheme; the CHANGELOG entry and the stamp
+// guard in handlePublish point here rather than restating it, so there is one
+// place to edit when the contract changes:
+//
+//   - Marker absence means UNKNOWN, never undelivered. Everything posted
+//     before this change is unmarked; keyed publishes with empty text are not
+//     stamped; text that cannot fit the marker under Slack's ceiling is posted
+//     unstamped (see handlePublish); and keyed file publishes are outside the
+//     contract entirely — handlePublishFile ignores IdempotencyKey and uploads
+//     without a marker, so a reader sweeping "all keyed outbound" will not
+//     find file deliveries.
+//   - The scan surface is not conversations.history alone. A keyed publish
+//     carrying reply_to_message_id is posted with thread_ts, and history does
+//     not return thread replies — the adapter reads its own threads back
+//     through conversations.replies for exactly this reason (thread_context.go,
+//     company_hydration.go). The one Slack shape that would put a reply in
+//     history is a thread_broadcast copy, and this adapter never sets
+//     reply_broadcast (docs/company-rooms.md, "reply_broadcast is never set"),
+//     so no threaded delivery is reachable from history here. A reader
+//     sweeping history alone therefore finds no marker for any threaded
+//     delivery and, by the rule above, must call that UNKNOWN rather than
+//     undelivered; to resolve those it must walk conversations.replies for
+//     each parent whose reply_count is non-zero.
+//     TestHandlePublishStampsThreadRepliesWhichHistoryDoesNotReturn pins the
+//     thread_ts half of this — the half that lives in this repo.
+//   - A delivered message can still lose its marker after the fact: Slack
+//     truncates text past its ceiling from the end and answers ok:true. The
+//     stamp guard makes that unreachable for stamped messages, and the
+//     publish receipt reports metadata["truncated"]="true" when Slack warns,
+//     so a reader that keeps receipts can tell this case apart from an
+//     unstamped post instead of inferring it.
+//   - The scheme is slack-full-only. The slack-channel sibling accepts keyed
+//     publishes and even derives a key when the caller omits one, but stamps
+//     nothing; slack-mini has no idempotency surface at all. A reader must not
+//     expect markers from either. Porting the marker to slack-channel is
+//     deliberate follow-up work, not an oversight here.
+func referenceMarker(idempotencyKey string) string {
+	return "_ref:" + referenceSuffix(idempotencyKey) + "_"
+}
+
 func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap, dedup *publishDedupCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1540,6 +1652,61 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 			Text:     rewrittenText,
 			ThreadTS: req.ReplyToMessageID,
 		}
+		// Stamp only when the marker is both meaningful and survivable.
+		//
+		// Empty text: a keyed publish carrying no text failed loudly at base —
+		// Slack answers no_text, the receipt is Delivered:false with
+		// FailureKind "permanent". Stamping unconditionally posts a
+		// marker-only message, which Slack accepts, converting that visible
+		// failure into Delivered:true plus a real MessageID for a payload that
+		// delivered nothing — and dedup then caches that receipt, so a
+		// legitimate retry on the same key replays "delivered" instead of
+		// re-posting. `gc slack publish --idempotency-key K --body-file <empty
+		// file>` arrives here with exactly that shape, because _load_body
+		// tests the truthiness of the path, not the file contents.
+		//
+		// Over the ceiling: Slack truncates text past slackMaxMessageLength
+		// from the end rather than rejecting it, and the marker is the tail of
+		// the string, so stamping an oversized message delivers a mangled
+		// partial marker that matches nothing on readback. Skipping keeps the
+		// caller's text whole (trimming it to make room would trade their
+		// content for our bookkeeping) and leaves an honest absence, which the
+		// readback contract already requires readers to treat as unknown. That
+		// contract is stated normatively on referenceMarker; this comment only
+		// covers why the stamp is skipped, so the two cannot drift apart.
+		//
+		// Both are measured on rewrittenText because that is what is actually
+		// posted: the alias rewrite can expand @handle into <@U…>, so a caller
+		// that sized itself to the advertised capability can still land over
+		// the budget here. len is bytes while Slack counts characters; for
+		// multibyte text that over-counts, which can only make this skip a
+		// marker that would have fit, never stamp one that will not.
+		//
+		// Only the fit check has a reachable input distinguishing rewrittenText
+		// from req.Text, and the alias-rewrite case in
+		// TestHandlePublishSkipsReferenceMarkerWhenItCannotFitUnderSlackCeiling
+		// pins it. The emptiness check cannot be told apart the same way today:
+		// rewrite returns text unchanged when it is empty, and parseUserAliasMap
+		// rejects any target slackMentionFor does not recognize, so no loadable
+		// alias map can rewrite non-empty text to "". rewrittenText is still the
+		// right operand — it is what gets posted — but that half is defensive,
+		// and a test asserting it would have to hand-build a map the loader
+		// cannot produce, which would pin an unreachable state rather than a
+		// behavior.
+		if req.IdempotencyKey != "" && rewrittenText != "" {
+			if len(rewrittenText)+referenceMarkerOverhead <= slackMaxMessageLength {
+				post.Text += "\n\n" + referenceMarker(req.IdempotencyKey)
+			} else {
+				// rewritten=, not text=: this is the post-rewrite length the
+				// budget was measured against, while the main publish log
+				// below reports the request length under text=. Two adjacent
+				// lines of one request carrying the same label with different
+				// quantities is what makes a grep on text= ambiguous.
+				log.Printf("publish: rewritten=%dch leaves no room for the reference marker (ceiling=%d overhead=%d) idem=%s conv=%s -> posting unstamped; this delivery is not readable back",
+					len(rewrittenText), slackMaxMessageLength, referenceMarkerOverhead,
+					req.IdempotencyKey, req.Conversation.ConversationID)
+			}
+		}
 		identityApplied := ""
 		if reg != nil {
 			if rec, ok := reg.Get(identitySessionID); ok {
@@ -1549,8 +1716,14 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 				identityApplied = rec.Username
 			}
 		}
-		log.Printf("publish: conv=%s text=%dch reply_to=%s idem=%s session=%s as=%q mentions_rewritten=%t",
-			req.Conversation.ConversationID, len(req.Text), req.ReplyToMessageID,
+		// text= is the request as received; posted= is what actually reaches
+		// Slack, after the alias rewrite and the marker stamp. They diverge by
+		// the marker on a keyed publish and by the rewrite otherwise, and
+		// posted= is the number that matters at Slack's ceiling — logging only
+		// the pre-stamp length is what would make a length-related outcome
+		// look inexplicable from the logs.
+		log.Printf("publish: conv=%s text=%dch posted=%dch reply_to=%s idem=%s session=%s as=%q mentions_rewritten=%t",
+			req.Conversation.ConversationID, len(req.Text), len(post.Text), req.ReplyToMessageID,
 			req.IdempotencyKey, identitySessionID, identityApplied, rewrittenText != req.Text)
 
 		// Idempotent replay: if this idempotency key already produced a
@@ -1588,6 +1761,28 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 		default:
 			receipt.Delivered = true
 			receipt.MessageID = slackResp.TS
+			// A delivered-but-truncated message is still ok:true with a real
+			// message_id, so none of the receipt's named fields can show it. On
+			// a keyed publish the marker is the tail of the text, so truncation
+			// is precisely the case where delivery succeeded but readback will
+			// not find it. Log it for the operator and put it on the receipt
+			// for the caller: a log line cannot be observed by the reconciler
+			// this scheme exists to serve, and it is the caller — not this
+			// process — that knows whether the message was keyed. Routed
+			// through metadata because that is the only additive channel gc
+			// actually carries through; see publishReceipt.Metadata.
+			for _, warning := range slackResp.ResponseMetadata.Warnings {
+				if warning != "message_truncated" {
+					continue
+				}
+				log.Printf("publish: slack truncated the posted text (posted=%dch ceiling=%d) idem=%s conv=%s ts=%s -> any reference marker did not survive",
+					len(post.Text), slackMaxMessageLength, req.IdempotencyKey,
+					req.Conversation.ConversationID, slackResp.TS)
+				if receipt.Metadata == nil {
+					receipt.Metadata = map[string]string{}
+				}
+				receipt.Metadata["truncated"] = "true"
+			}
 		}
 		// Remember delivered receipts so a subsequent retry with the same
 		// idempotency key replays this receipt instead of re-posting. Put

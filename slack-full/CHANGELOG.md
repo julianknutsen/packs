@@ -100,6 +100,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Outbound publishes carrying an idempotency key are stamped with a
+  low-visibility reference marker (`_ref:<12 hex>_`) so a later reader can
+  find the exact message in Slack. The in-process dedup cache only lives
+  for its TTL and does not survive a restart, so it cannot provide durable
+  delivery evidence; the marker can. The readback contract — what a marker's
+  absence does and does not mean, and where a reader has to look — is stated
+  normatively in the `referenceMarker` doc comment in `adapter/main.go`, and
+  this entry deliberately does not restate it, so there is one place to edit.
+  Two properties worth knowing without opening the source: absence always
+  means UNKNOWN, never undelivered (all history predating this change is
+  unmarked); and a marker on a threaded reply is not reachable from
+  `conversations.history`, which does not return thread replies.
+
+  Note on Slack's ceiling, since the obvious assumption is wrong: Slack does
+  not reject text over 40,000 — it truncates from the end and still answers
+  `ok:true`. The marker is the tail of the text, so an oversized post would
+  deliver a mangled partial marker under a receipt that looks perfect. The
+  advertised `MaxMessageLength` therefore reserves the marker's 20 bytes, and
+  `handlePublish` enforces the same budget itself rather than trusting an
+  advertisement nothing in gc reads today. Over the budget the caller's text
+  is posted **unstamped** rather than trimmed: the message is the caller's,
+  the bookkeeping is ours, and an honest absence is already something the
+  contract requires readers to tolerate. When Slack reports a truncation
+  anyway, the publish receipt carries `metadata["truncated"]="true"`
+  (`dr-3msk6.3`).
 - `gc slack retry-peer-fanout` — operational recovery for peer-fanout.
   Walks recent `extmsg.peer_fanout_failed` events (added in this change
   too), filters by `--since` / `--conversation` / `--max`, deduplicates
