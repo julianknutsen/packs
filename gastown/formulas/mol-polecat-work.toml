@@ -85,29 +85,240 @@ if [ -z "$WORK_BEAD_ID" ]; then
 fi
 ```
 
-**2. Ensure worktree exists.**
+**2. Ensure a safe per-bead artifact worktree exists.**
 
-Check if `metadata.work_dir` already records your worktree path:
+Task worktrees use the canonical `metadata.artifact_dir` key. The deprecated
+task `metadata.work_dir` key may be adopted only after proving that it is an
+existing per-bead Git worktree at this city's exact historical Gastown
+provider path. A legacy core may already have launched the session inside that
+valid task worktree, so current cwd equality is not a rejection criterion.
+Adoption migrates the metadata key in place; it does not claim that a legacy
+provider-nested directory has physically moved. Never `cd` to either task
+metadata path before it passes the city, rig, layout, bead, and Git checks.
+
+Load both task keys and resolve the city-managed artifact root before changing
+directories. New task worktrees are siblings of prunable polecat homes, never
+children of them:
 ```bash
-WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
+BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || {
+  echo "Could not read work bead metadata for $WORK_BEAD_ID." >&2
+  gc runtime drain-ack
+  exit 1
+}
+BEAD_META=$(printf '%s' "$BEAD_JSON" | jq -ce '
+  if type == "array" and length == 1 and (.[0] | type) == "object" and
+     ((.[0].metadata // {}) | type) == "object"
+  then .[0].metadata // {}
+  else error("expected exactly one work bead object")
+  end
+') || {
+  echo "Invalid work bead response for $WORK_BEAD_ID; refusing to create or adopt an artifact." >&2
+  gc runtime drain-ack
+  exit 1
+}
+ARTIFACT_DIR=$(printf '%s' "$BEAD_META" | jq -r '.artifact_dir // empty')
+LEGACY_WORK_DIR=$(printf '%s' "$BEAD_META" | jq -r '.work_dir // empty')
+if [ -z "${GC_CITY_PATH:-}" ] || [ -z "${GC_RIG:-}" ] ||
+   [ -z "${GC_RIG_ROOT:-}" ]; then
+  echo "GC_CITY_PATH, GC_RIG, and GC_RIG_ROOT are required for task worktrees." >&2
+  gc runtime drain-ack
+  exit 1
+fi
+case "$WORK_BEAD_ID" in
+  ""|"."|".."|*[!A-Za-z0-9._-]*)
+    echo "Unsafe work bead id for artifact path: $WORK_BEAD_ID" >&2
+    gc runtime drain-ack
+    exit 1
+    ;;
+esac
+case "$GC_RIG" in
+  ""|"."|".."|*[!A-Za-z0-9._-]*)
+    echo "Unsafe rig name for artifact path: $GC_RIG" >&2
+    gc runtime drain-ack
+    exit 1
+    ;;
+esac
+CITY_ROOT=$(CDPATH= cd -- "$GC_CITY_PATH" 2>/dev/null && pwd -P) || {
+  echo "City root is missing: $GC_CITY_PATH" >&2
+  gc runtime drain-ack
+  exit 1
+}
+RIG_ROOT=$(CDPATH= cd -- "$GC_RIG_ROOT" 2>/dev/null && pwd -P) || {
+  echo "Rig root is missing: $GC_RIG_ROOT" >&2
+  gc runtime drain-ack
+  exit 1
+}
 ```
 
-**If worktree path exists in metadata** — reuse it:
+Use this validator for canonical paths, legacy adoption, and any newly-created
+path:
 ```bash
-cd "$WORKTREE"              # Enter existing worktree
-```
-If the directory is missing (witness cleaned it, disk issue), fall through
-to create a new one.
+# BEGIN ARTIFACT_WORKTREE_VALIDATOR
+artifact_git_common_dir() {
+  local repo_dir=$1 common_dir
+  common_dir=$(git -C "$repo_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+    return 1
+  (CDPATH= cd -- "$common_dir" 2>/dev/null && pwd -P)
+}
 
-**If no worktree** — create one scoped to the bead, not the agent:
-```bash
-WORKTREE_PATH=$(pwd)/worktrees/"$WORK_BEAD_ID"
-git worktree add "$WORKTREE_PATH" --detach origin/{{base_branch}}
-cd "$WORKTREE_PATH"
+validate_artifact_worktree() {
+  local candidate=$1 city_root=$2 rig_name=$3 rig_root=$4 bead_id=$5
+  local policy=${6:-existing}
+  local candidate_real candidate_top candidate_common rig_common
+  local rig_namespace rig_namespace_real canonical_path
+  local worktrees_parent provider_home provider_root provider_name
+
+  [ -n "$candidate" ] && [ -d "$candidate" ] || return 1
+  candidate_real=$(CDPATH= cd -- "$candidate" 2>/dev/null && pwd -P) || return 1
+
+  # Only the exact bead-scoped .../worktrees/<bead-id> shape is reusable.
+  [ "$(basename -- "$candidate_real")" = "$bead_id" ] || return 1
+  [ "$(basename -- "$(dirname -- "$candidate_real")")" = "worktrees" ] || return 1
+
+  # Same-repository is not an ownership boundary: multiple cities and rigs can
+  # share one Git common dir. Require this city's exact canonical path or the
+  # one historical provider-nested layout that Gastown actually created.
+  rig_namespace="$city_root/.gc/worktrees/$rig_name"
+  rig_namespace_real=$(CDPATH= cd -- "$rig_namespace" 2>/dev/null && pwd -P) ||
+    return 1
+  [ "$rig_namespace_real" = "$rig_namespace" ] || return 1
+  canonical_path="$rig_namespace_real/artifacts/worktrees/$bead_id"
+  if [ "$candidate_real" = "$canonical_path" ]; then
+    [ "$policy" != legacy-only ] || return 1
+  else
+    [ "$policy" != canonical-only ] || return 1
+    worktrees_parent=$(dirname -- "$candidate_real")
+    provider_home=$(dirname -- "$worktrees_parent")
+    provider_root=$(dirname -- "$provider_home")
+    provider_name=$(basename -- "$provider_home")
+    [ "$provider_root" = "$rig_namespace_real/polecats" ] || return 1
+    case "$provider_name" in
+      ""|"."|".."|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+  fi
+
+  # Reject a plain subdirectory of a worktree and worktrees from another repo.
+  candidate_top=$(git -C "$candidate_real" rev-parse --show-toplevel 2>/dev/null) ||
+    return 1
+  candidate_top=$(CDPATH= cd -- "$candidate_top" 2>/dev/null && pwd -P) || return 1
+  [ "$candidate_top" = "$candidate_real" ] || return 1
+  candidate_common=$(artifact_git_common_dir "$candidate_real") || return 1
+  rig_common=$(artifact_git_common_dir "$rig_root") || return 1
+  [ "$candidate_common" = "$rig_common" ] || return 1
+
+  printf '%s\n' "$candidate_real"
+}
+# END ARTIFACT_WORKTREE_VALIDATOR
 ```
-Record immediately so restarts and witness recovery can find it:
+
+Canonical metadata wins. If it is absent, a valid legacy path can be adopted
+in place. A stale, missing, provider-root, wrong-city, wrong-rig, wrong-bead,
+or foreign-repo legacy path is ignored and a new canonical artifact worktree
+is created:
 ```bash
-gc bd update "$WORK_BEAD_ID" --set-metadata work_dir="$WORKTREE_PATH"
+WORKTREE=
+if [ -n "$ARTIFACT_DIR" ]; then
+  if WORKTREE=$(validate_artifact_worktree \
+      "$ARTIFACT_DIR" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
+      "$WORK_BEAD_ID" existing); then
+    echo "Reusing artifact_dir=$WORKTREE"
+  else
+    echo "Canonical artifact_dir is missing or unsafe: $ARTIFACT_DIR" >&2
+    echo "STOP. Preserve it for manual recovery; only an absent canonical key may fall back or create." >&2
+    gc runtime drain-ack
+    exit 1
+  fi
+elif [ -n "$LEGACY_WORK_DIR" ]; then
+  if WORKTREE=$(validate_artifact_worktree \
+      "$LEGACY_WORK_DIR" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
+      "$WORK_BEAD_ID" legacy-only); then
+    echo "Adopting validated in-place legacy work_dir=$WORKTREE as artifact_dir."
+    echo "It remains provider-nested until terminal cleanup; new artifacts are always canonical."
+  else
+    echo "Ignoring unsafe legacy work_dir=$LEGACY_WORK_DIR; creating a new per-bead worktree." >&2
+  fi
+fi
+
+if [ -z "$WORKTREE" ]; then
+  ARTIFACT_HOME="$CITY_ROOT/.gc/worktrees/$GC_RIG/artifacts"
+  if [ -L "$ARTIFACT_HOME" ] ||
+     { [ -e "$ARTIFACT_HOME" ] && [ ! -d "$ARTIFACT_HOME" ]; }; then
+    echo "Task artifact root is redirected or is not a directory: $ARTIFACT_HOME" >&2
+    gc runtime drain-ack
+    exit 1
+  fi
+  mkdir -p -- "$ARTIFACT_HOME"
+  ARTIFACT_HOME_REAL=$(CDPATH= cd -- "$ARTIFACT_HOME" 2>/dev/null && pwd -P) || {
+    echo "Cannot resolve task artifact root." >&2
+    gc runtime drain-ack
+    exit 1
+  }
+  if [ "$ARTIFACT_HOME_REAL" != "$ARTIFACT_HOME" ]; then
+    echo "Task artifact root is redirected outside the city/rig namespace." >&2
+    gc runtime drain-ack
+    exit 1
+  fi
+  WORKTREE_PARENT="$ARTIFACT_HOME/worktrees"
+  if [ -L "$WORKTREE_PARENT" ] ||
+     { [ -e "$WORKTREE_PARENT" ] && [ ! -d "$WORKTREE_PARENT" ]; }; then
+    echo "Task worktree parent is redirected or is not a directory: $WORKTREE_PARENT" >&2
+    gc runtime drain-ack
+    exit 1
+  fi
+  mkdir -p -- "$WORKTREE_PARENT"
+  WORKTREE_PARENT=$(CDPATH= cd -- "$WORKTREE_PARENT" 2>/dev/null && pwd -P) || {
+    echo "Cannot resolve task worktree parent under the city artifact root." >&2
+    gc runtime drain-ack
+    exit 1
+  }
+  if [ "$WORKTREE_PARENT" != "$ARTIFACT_HOME/worktrees" ]; then
+    echo "Task worktree parent is redirected outside the city artifact root." >&2
+    gc runtime drain-ack
+    exit 1
+  fi
+  WORKTREE_PATH="$WORKTREE_PARENT/$WORK_BEAD_ID"
+
+  if [ -e "$WORKTREE_PATH" ]; then
+    # Recover the narrow crash window after git worktree add but before the
+    # metadata write. Never reuse an unrelated directory at this path.
+    if WORKTREE=$(validate_artifact_worktree \
+        "$WORKTREE_PATH" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
+        "$WORK_BEAD_ID" canonical-only); then
+      echo "Recovering existing validated per-bead worktree=$WORKTREE"
+    else
+      echo "Canonical artifact path already exists but is not this bead's validated worktree: $WORKTREE_PATH" >&2
+      echo "STOP. Preserve and resolve the collision manually; do not create an alternate artifact." >&2
+      gc runtime drain-ack
+      exit 1
+    fi
+  fi
+
+  if [ -z "$WORKTREE" ]; then
+    git -C "$RIG_ROOT" worktree prune
+    git -C "$RIG_ROOT" worktree add "$WORKTREE_PATH" --detach origin/{{base_branch}}
+    WORKTREE=$(validate_artifact_worktree \
+      "$WORKTREE_PATH" "$CITY_ROOT" "$GC_RIG" "$RIG_ROOT" \
+      "$WORK_BEAD_ID" canonical-only) || {
+        echo "New task worktree failed validation: $WORKTREE_PATH" >&2
+        gc runtime drain-ack
+        exit 1
+      }
+  fi
+fi
+
+# Record the canonical key immediately, then retire any legacy task key.
+gc bd update "$WORK_BEAD_ID" \
+  --set-metadata artifact_dir="$WORKTREE" \
+  --unset-metadata work_dir || {
+    echo "Could not record artifact_dir; refusing to enter an untracked task worktree." >&2
+    gc runtime drain-ack
+    exit 1
+  }
+cd -- "$WORKTREE" || {
+  echo "Validated task worktree disappeared: $WORKTREE" >&2
+  gc runtime drain-ack
+  exit 1
+}
 ```
 
 Worktrees are scoped to the work bead (not the agent name) so that:
@@ -164,23 +375,62 @@ if [ -n "$REJECTION" ]; then
 fi
 ```
 
-**If no branch** — create one and record it. Always branch from the
-freshly-fetched `origin/{{base_branch}}`, never from local
-{{base_branch}} or whatever branch happens to be checked out.
-Polecat worktrees are reused across beads, so the local copy of
-{{base_branch}} may lag the remote — branching from a stale local ref
-inherits already-merged commits with stale hashes and causes the next
-refinery rebase to reject for spurious "duplicate" conflicts.
-
+**If no branch** — preserve the narrow interruption case where this worktree
+is already on the expected branch and only the metadata write was missed.
+Every other non-pristine state fails closed; never delete or reset a ref to
+repair empty metadata:
 ```bash
-git fetch origin {{base_branch}}                     # ensure origin ref is current
-BRANCH="polecat/$WORK_BEAD_ID"
-git branch -D "$BRANCH" 2>/dev/null || true          # drop any stale local branch with the same name
-git checkout -B "$BRANCH" "origin/{{base_branch}}"   # force-create from the freshly-fetched remote tip
-gc bd update "$WORK_BEAD_ID" \
-  --set-metadata branch="$BRANCH" \
-  --set-metadata fork_sha="$(git rev-parse "origin/{{base_branch}}")"
+EXPECTED_BRANCH="polecat/$WORK_BEAD_ID"
+CURRENT_BRANCH=$(git branch --show-current)
+if [ "$CURRENT_BRANCH" = "$EXPECTED_BRANCH" ]; then
+  BRANCH="$EXPECTED_BRANCH"
+  FORK_SHA=$(git merge-base "$BRANCH" "origin/{{base_branch}}") || {
+    echo "Cannot derive fork point for recovered branch $BRANCH." >&2
+    gc runtime drain-ack
+    exit 1
+  }
+  gc bd update "$WORK_BEAD_ID" \
+    --set-metadata branch="$BRANCH" \
+    --set-metadata fork_sha="$FORK_SHA" || {
+      echo "Could not record recovered branch metadata." >&2
+      gc runtime drain-ack
+      exit 1
+    }
+elif [ -n "$CURRENT_BRANCH" ] ||
+     [ -n "$(git status --porcelain)" ] ||
+     git show-ref --verify --quiet "refs/heads/$EXPECTED_BRANCH" ||
+     git show-ref --verify --quiet "refs/remotes/origin/$EXPECTED_BRANCH" ||
+     ! git merge-base --is-ancestor HEAD "origin/{{base_branch}}"; then
+  echo "artifact_dir contains branch/work not recorded in metadata.branch." >&2
+  echo "STOP. Recover and record it manually; do not reset or delete refs." >&2
+  gc runtime drain-ack
+  exit 1
+else
+  # A clean detached checkout at or behind the fetched base has no unique work.
+  git fetch origin {{base_branch}} || {
+    echo "Could not refresh origin/{{base_branch}}." >&2
+    gc runtime drain-ack
+    exit 1
+  }
+  BRANCH="$EXPECTED_BRANCH"
+  git checkout -b "$BRANCH" "origin/{{base_branch}}" || {
+    echo "Could not create $BRANCH from origin/{{base_branch}}." >&2
+    gc runtime drain-ack
+    exit 1
+  }
+  gc bd update "$WORK_BEAD_ID" \
+    --set-metadata branch="$BRANCH" \
+    --set-metadata fork_sha="$(git rev-parse "origin/{{base_branch}}")" || {
+      echo "Could not record new branch metadata." >&2
+      gc runtime drain-ack
+      exit 1
+    }
+fi
 ```
+
+Always create new branches from freshly-fetched `origin/{{base_branch}}`,
+never a stale local base. Existing expected refs with missing metadata are
+left untouched for manual recovery rather than force-deleted.
 
 Recording the branch early means:
 - Witness can find and salvage your work if you crash
@@ -320,9 +570,9 @@ if [ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]; then
     echo "Pushing this commit and reassigning to refinery would strand the work."
     echo ""
     echo "Recover by re-running the workspace-setup step:"
-    echo "  - Create the per-bead worktree at \\$(pwd)/worktrees/$WORK_BEAD_ID"
-    echo "  - Create branch '$EXPECTED_BRANCH' from origin/{{base_branch}}"
-    echo "  - Cherry-pick your commits from $CURRENT_BRANCH onto the new branch"
+    echo "  - Let workspace-setup validate or create metadata.artifact_dir"
+    echo "  - Preserve the existing branch/commits; never create a worktree under the provider home"
+    echo "  - Reconcile them onto '$EXPECTED_BRANCH' without deleting either ref"
     echo "  - Re-run submit-and-exit"
     echo ""
     echo "Do NOT proceed past this gate."
@@ -416,13 +666,17 @@ git branch -D "$BRANCH"              # Branch is pushed; refinery owns it now
 ```bash
 gc bd update "$WORK_BEAD_ID" \
   --set-metadata target={{base_branch}} \
+  --unset-metadata artifact_source_sha \
+  --unset-metadata artifact_cleanup_state \
   --notes "Implemented: <brief summary>"
 ```
 Branch was recorded in workspace-setup and is already in metadata.
-This adds the target for the refinery. If an existing pull request was
-provided by the caller, `metadata.existing_pr` is preserved for refinery
-validation. The refinery records canonical `pr_url` only after verifying
-the PR is open and matches the branch, base, and origin repository.
+This adds the target for the refinery and clears any pre-rebase artifact proof
+left by a rejected refinery attempt; refinery captures the freshly-published
+source SHA on its next handoff. If an existing pull request was provided by
+the caller, `metadata.existing_pr` is preserved for refinery validation. The
+refinery records canonical `pr_url` only after verifying the PR is open and
+matches the branch, base, and origin repository.
 
 **6. Reassign to refinery:**
 ```bash

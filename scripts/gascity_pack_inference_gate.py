@@ -97,7 +97,8 @@ GASTOWN_FORMULA_CONTRACTS = {
     ),
     "mol-witness-patrol": (
         "Orphaned bead recovery",
-        "metadata.work_dir",
+        "metadata.artifact_dir",
+        "validate_recovery_artifact_worktree",
         "return beads to the pool",
         "gc session list --state=all --json",
     ),
@@ -136,7 +137,7 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
     "mol-witness-patrol": (
         "LIVENESS_MAP=$(jq -n",
         "FAIL-SAFE: empty liveness map",
-        "git push origin HEAD",
+        'git push origin "HEAD:refs/heads/$BRANCH"',
         "gc workflow delete-source <bead> --apply && gc workflow reopen-source <bead>",
         "gc bd update <bead> --set-metadata recovered=true",
         "gc session nudge <rig>/{{binding_prefix}}refinery",

@@ -12,7 +12,7 @@
 #   a polecat mid-claim and silently recycled.
 #
 #   A normal refinery handoff is NOT churn: it leaves the bead open but
-#   assigned to the refinery (with work_dir still set), so requiring
+#   assigned to the refinery (normally with artifact_dir still set), so requiring
 #   assignee=="" excludes it. Detection keys on an EXACT
 #   metadata.polecat_session match, not a work_dir substring, so a path that
 #   merely contains a session name no longer false-positives. Beads must
@@ -84,7 +84,7 @@ printf "%s\n" "$current_pids" > "$STATE_FILE"
 # For each disappeared polecat session, check rig bd for a churned claim.
 # Churn = an OPEN + UNASSIGNED bead whose metadata.polecat_session EXACTLY
 # matches the dead session. Requiring assignee=="" excludes a normal refinery
-# handoff (open, assigned to refinery, work_dir still set). Exact-match on the
+# handoff (open, assigned to refinery, artifact_dir normally still set). Exact-match on the
 # recorded session identity avoids the old work_dir-substring false positives.
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 

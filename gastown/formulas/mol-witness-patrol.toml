@@ -39,9 +39,13 @@ worktree → (push) → branch → (merge) → target branch
 ```
 
 Each transition moves the canonical location of the work. Once moved,
-the previous location is disposable:
-- After push: worktree disposable (branch is canonical)
-- After merge: branch disposable (target is canonical)
+the previous local execution state can be retired only after its remote
+replacement is proved:
+- After push: the worktree is eligible for validated cleanup (branch is
+  canonical).
+- After merge: the target is canonical, while the exact successfully
+  handed-off source ref is retained as independent recovery evidence. Witness
+  recovery never deletes that ref.
 
 The witness's core recovery job: when a bead is orphaned (agent won't
 come back), ensure the work reaches the branch (push), then clean up
@@ -153,7 +157,8 @@ gc bd list --status=open --json --limit=0
 Filter for beads with an assignee (skip unassigned beads). This pass does not
 solve the controller race where orphaned work may already have been released to
 open/unassigned before witness observes it; that requires a separate
-worktree-salvage scan keyed by `metadata.work_dir`. Bound Gastown polecat
+worktree-salvage scan keyed by canonical `metadata.artifact_dir`, with a
+validated legacy `metadata.work_dir` fallback. Bound Gastown polecat
 assignees use the shape `<rig>/{{binding_prefix}}<polecat-suffix>`.
 
 Get the full session roster for liveness checks:
@@ -257,27 +262,220 @@ lifecycle directly.
 The canonical work chain: `worktree → (push) → branch → (merge) → target`.
 Our job is to ensure work reaches the branch so it's schedulable.
 
-Read the bead metadata to find the worktree and branch:
+Read the bead metadata to find the artifact worktree and branch. Canonical
+`artifact_dir` wins. A legacy `work_dir` may be adopted in place only if its
+physical path is this city's exact historical
+`.gc/worktrees/<rig>/polecats/<provider>/worktrees/<bead>` layout and the
+worktree belongs to this rig repository. Same-repository paths from another
+city, rig, or namespace are unsafe. The persistent Gastown provider home
+itself cannot pass the bead-scoped shape check.
 ```bash
-META=$(gc bd show <bead> --json | jq '.[0].metadata')
-WORKTREE=$(echo "$META" | jq -r '.worktree // empty')
-BRANCH=$(echo "$META" | jq -r '.branch // empty')
+RECOVERY_BLOCKED=false
+BEAD_JSON=$(gc bd show <bead> --json) || {
+  echo "Cannot read metadata for orphan candidate <bead>; leaving it untouched." >&2
+  RECOVERY_BLOCKED=true
+  BEAD_JSON='[]'
+}
+META=$(printf '%s' "$BEAD_JSON" | jq -ce '
+  if type == "array" and length == 1 and (.[0] | type) == "object" and
+     ((.[0].metadata // {}) | type) == "object"
+  then .[0].metadata // {}
+  else error("expected exactly one work bead object")
+  end
+') || {
+  echo "Invalid metadata response for orphan candidate <bead>; leaving it untouched." >&2
+  RECOVERY_BLOCKED=true
+  META='{}'
+}
+ARTIFACT_DIR=$(printf '%s' "$META" | jq -r '.artifact_dir // empty')
+LEGACY_WORK_DIR=$(printf '%s' "$META" | jq -r '.work_dir // empty')
+BRANCH=$(printf '%s' "$META" | jq -r '.branch // empty')
+if [ -z "${GC_CITY_PATH:-}" ] || [ -z "${GC_RIG:-}" ] ||
+   [ -z "${GC_RIG_ROOT:-}" ]; then
+  echo "GC_CITY_PATH, GC_RIG, and GC_RIG_ROOT are required for orphan artifact recovery." >&2
+  RECOVERY_BLOCKED=true
+fi
+case "${GC_RIG:-}" in
+  ""|"."|".."|*[!A-Za-z0-9._-]*)
+    echo "Unsafe or missing rig name for orphan artifact recovery: ${GC_RIG:-<empty>}" >&2
+    RECOVERY_BLOCKED=true
+    ;;
+esac
+
+recovery_git_common_dir() {
+  local repo_dir=$1 common_dir
+  common_dir=$(git -C "$repo_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+    return 1
+  (CDPATH= cd -- "$common_dir" 2>/dev/null && pwd -P)
+}
+
+validate_recovery_artifact_worktree() {
+  local candidate=$1 city_root=$2 rig_name=$3 rig_root=$4 bead_id=$5
+  local candidate_real candidate_top candidate_common rig_common
+  local city_real rig_namespace rig_namespace_real canonical_path
+  local worktrees_parent provider_home provider_root provider_name
+
+  [ -n "$candidate" ] && [ -d "$candidate" ] || return 1
+  candidate_real=$(CDPATH= cd -- "$candidate" 2>/dev/null && pwd -P) || return 1
+  [ "$(basename -- "$candidate_real")" = "$bead_id" ] || return 1
+  [ "$(basename -- "$(dirname -- "$candidate_real")")" = "worktrees" ] || return 1
+
+  city_real=$(CDPATH= cd -- "$city_root" 2>/dev/null && pwd -P) || return 1
+  rig_namespace="$city_real/.gc/worktrees/$rig_name"
+  rig_namespace_real=$(CDPATH= cd -- "$rig_namespace" 2>/dev/null && pwd -P) ||
+    return 1
+  [ "$rig_namespace_real" = "$rig_namespace" ] || return 1
+  canonical_path="$rig_namespace_real/artifacts/worktrees/$bead_id"
+  if [ "$candidate_real" != "$canonical_path" ]; then
+    worktrees_parent=$(dirname -- "$candidate_real")
+    provider_home=$(dirname -- "$worktrees_parent")
+    provider_root=$(dirname -- "$provider_home")
+    provider_name=$(basename -- "$provider_home")
+    [ "$provider_root" = "$rig_namespace_real/polecats" ] || return 1
+    case "$provider_name" in
+      ""|"."|".."|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+  fi
+
+  candidate_top=$(git -C "$candidate_real" rev-parse --show-toplevel 2>/dev/null) ||
+    return 1
+  candidate_top=$(CDPATH= cd -- "$candidate_top" 2>/dev/null && pwd -P) || return 1
+  [ "$candidate_top" = "$candidate_real" ] || return 1
+  candidate_common=$(recovery_git_common_dir "$candidate_real") || return 1
+  rig_common=$(recovery_git_common_dir "$rig_root") || return 1
+  [ "$candidate_common" = "$rig_common" ] || return 1
+  printf '%s\n' "$candidate_real"
+}
+
+# Re-check immediately before recovery mutations. The cycle-wide liveness map
+# is only a classifier; a replacement may have started since it was built.
+confirm_orphan_still_unowned() {
+  local current current_status current_assignee sessions live_count
+  current=$(gc bd show <bead> --json) || return 1
+  current=$(printf '%s' "$current" | jq -ce '
+    if type == "array" and length == 1 and (.[0] | type) == "object"
+    then .[0]
+    else error("expected exactly one current work bead")
+    end
+  ') || return 1
+  current_status=$(printf '%s' "$current" | jq -r '.status // empty') ||
+    return 1
+  current_assignee=$(printf '%s' "$current" | jq -r '.assignee // empty') ||
+    return 1
+  { [ "$current_status" = open ] || [ "$current_status" = in_progress ]; } ||
+    return 1
+  [ "$current_assignee" = "$ASSIGNEE" ] || return 1
+
+  sessions=$(gc session list --state=all --json) || return 1
+  live_count=$(printf '%s' "$sessions" | jq -r --arg owner "$current_assignee" '
+    def identities: [.id, .name, .session_name, .alias, .agent_name]
+      | map(select((. // "") | length > 0));
+    [.sessions[]
+     | select((identities | index($owner)) != null)
+     | select(.state == "active" or .state == "awake" or
+              .state == "creating" or .state == "asleep" or
+              .state == "drained" or .state == "suspended" or
+              .state == "draining" or .state == "quarantined")]
+    | length') || return 1
+  [ "$live_count" -eq 0 ]
+}
+
+WORKTREE=
+ARTIFACT_SOURCE=
+if [ -n "$ARTIFACT_DIR" ]; then
+  ARTIFACT_CANDIDATE=$ARTIFACT_DIR
+  ARTIFACT_SOURCE=artifact_dir
+elif [ -n "$LEGACY_WORK_DIR" ]; then
+  ARTIFACT_CANDIDATE=$LEGACY_WORK_DIR
+  ARTIFACT_SOURCE=work_dir
+else
+  ARTIFACT_CANDIDATE=
+fi
+
+if [ "$RECOVERY_BLOCKED" != true ] && [ -n "$ARTIFACT_CANDIDATE" ]; then
+  if WORKTREE=$(validate_recovery_artifact_worktree \
+      "$ARTIFACT_CANDIDATE" "$GC_CITY_PATH" "$GC_RIG" \
+      "$GC_RIG_ROOT" <bead>); then
+    if [ "$ARTIFACT_SOURCE" = work_dir ]; then
+      if confirm_orphan_still_unowned; then
+        gc bd update <bead> \
+          --set-metadata artifact_dir="$WORKTREE" \
+          --unset-metadata work_dir || RECOVERY_BLOCKED=true
+      else
+        RECOVERY_BLOCKED=true
+      fi
+    fi
+  else
+    echo "Unsafe $ARTIFACT_SOURCE=$ARTIFACT_CANDIDATE for <bead>; it is not a recoverable task worktree." >&2
+    if [ "$ARTIFACT_SOURCE" = artifact_dir ]; then
+      echo "Canonical artifact metadata is present but invalid; preserving the bead for manual recovery." >&2
+      RECOVERY_BLOCKED=true
+    fi
+    WORKTREE=
+  fi
+fi
+
+# Recover an interrupted branch-metadata write without resetting work.
+if [ "$RECOVERY_BLOCKED" != true ] && [ -z "$BRANCH" ] && [ -n "$WORKTREE" ]; then
+  if ! confirm_orphan_still_unowned; then
+    echo "Orphan ownership changed before branch recovery; leaving bead untouched." >&2
+    RECOVERY_BLOCKED=true
+  fi
+fi
+if [ "$RECOVERY_BLOCKED" != true ] && [ -z "$BRANCH" ] && [ -n "$WORKTREE" ]; then
+  EXPECTED_BRANCH="polecat/<bead>"
+  CURRENT_BRANCH=$(git -C "$WORKTREE" branch --show-current)
+  if [ "$CURRENT_BRANCH" = "$EXPECTED_BRANCH" ]; then
+    BRANCH=$EXPECTED_BRANCH
+  elif [ -z "$CURRENT_BRANCH" ] &&
+       ! git -C "$WORKTREE" show-ref --verify --quiet "refs/heads/$EXPECTED_BRANCH" &&
+       ! git -C "$WORKTREE" show-ref --verify --quiet "refs/remotes/origin/$EXPECTED_BRANCH"; then
+    # Preserve detached HEAD exactly; do not reset it to the target.
+    if git -C "$WORKTREE" checkout -b "$EXPECTED_BRANCH"; then
+      BRANCH=$EXPECTED_BRANCH
+    else
+      echo "Cannot attach detached orphan work to $EXPECTED_BRANCH; leaving bead untouched." >&2
+      RECOVERY_BLOCKED=true
+    fi
+  else
+    echo "Ambiguous orphan branch state for <bead>; refusing to reset or delete a ref." >&2
+    RECOVERY_BLOCKED=true
+  fi
+  if [ -n "$BRANCH" ]; then
+    gc bd update <bead> --set-metadata branch="$BRANCH" ||
+      RECOVERY_BLOCKED=true
+  fi
+fi
+if [ -n "$BRANCH" ] && ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
+  echo "Unsafe metadata.branch=$BRANCH for <bead>; leaving bead untouched." >&2
+  RECOVERY_BLOCKED=true
+fi
 ```
 
-Check the bead and worktree state, then act:
+If `RECOVERY_BLOCKED=true`, escalate and stop processing this bead. Do not run
+Cases A-E, cleanup, or workflow reset for it during this patrol.
+
+Only Cases B-D apply when `WORKTREE` is non-empty after this validation.
+Never `cd` to, scan, or remove the unvalidated candidate. Check the bead and
+validated worktree state, then act:
 
 **Case A: Branch exists on origin (work already published).**
-Worktree is disposable — canonical work is on the branch.
+The worktree is eligible for validated cleanup — canonical work is on the
+branch. The exact remote branch remains recovery evidence and is not deleted.
 ```bash
-git ls-remote --heads origin $BRANCH  # Verify branch exists on remote
+if [ -n "$BRANCH" ]; then
+  git ls-remote --exit-code --heads origin "refs/heads/$BRANCH"
+fi
 ```
-If branch exists on origin → skip to Step 3 (cleanup).
+Only an exit-0 exact-ref lookup proves that the branch exists on origin. An
+empty branch is never passed to `ls-remote` (empty would list every head). If
+the exact branch exists on origin → skip to Step 3 (cleanup).
 
 **Case B: Worktree exists, branch pushed but not on origin yet.**
 Branch is recorded in metadata but polecat may have crashed before push.
 ```bash
 cd "$WORKTREE"
-git ls-remote --heads origin $BRANCH
+git ls-remote --exit-code --heads origin "refs/heads/$BRANCH"
 ```
 If branch IS on origin → skip to Step 3.
 If branch is NOT on origin → fall through to Case C.
@@ -285,8 +483,18 @@ If branch is NOT on origin → fall through to Case C.
 **Case C: Worktree exists with unpushed commits.**
 Work is committed locally but never pushed. Branch is not yet canonical.
 ```bash
+confirm_orphan_still_unowned || {
+  echo "Orphan ownership changed before salvage; do not commit or push." >&2
+  gc runtime drain-ack
+  exit 1
+}
 cd "$WORKTREE"
 BRANCH=$(git branch --show-current)
+if [ -z "$BRANCH" ]; then
+  echo "Validated orphan worktree is detached; refusing an ambiguous push." >&2
+  gc runtime drain-ack
+  exit 1
+fi
 git log origin/main..HEAD --oneline  # Shows unpushed commits
 ```
 Commit any remaining uncommitted/untracked work first (safeguard):
@@ -298,7 +506,7 @@ git commit -m "witness: salvage uncommitted work (<bead>)"
 ```
 Publish the work to make branch canonical:
 ```bash
-git push origin HEAD
+git push origin "HEAD:refs/heads/$BRANCH"
 gc bd update <bead> --set-metadata branch=$BRANCH
 ```
 Skip to Step 3 (cleanup).
@@ -306,38 +514,56 @@ Skip to Step 3 (cleanup).
 **Case D: Worktree exists with ONLY uncommitted/untracked changes (no commits).**
 Same resolution as Case C. All work is useful work — never discard.
 ```bash
+confirm_orphan_still_unowned || {
+  echo "Orphan ownership changed before salvage; do not commit or push." >&2
+  gc runtime drain-ack
+  exit 1
+}
 cd "$WORKTREE"
 git add -A
 git commit -m "witness: salvage work from orphaned agent (<bead>)"
 BRANCH=$(git branch --show-current)
-git push origin HEAD
+if [ -z "$BRANCH" ]; then
+  echo "Validated orphan worktree is detached; refusing an ambiguous push." >&2
+  gc runtime drain-ack
+  exit 1
+fi
+git push origin "HEAD:refs/heads/$BRANCH"
 gc bd update <bead> --set-metadata branch=$BRANCH
 ```
 Skip to Step 3 (cleanup).
 
-**Case E: No worktree exists (`metadata.work_dir` missing or directory gone),
-no branch on origin.**
+**Case E: Canonical `metadata.artifact_dir` is absent, no validated legacy
+worktree exists, and no branch exists on origin.**
 Nothing to salvage. The bead goes back to pool and a new polecat
 starts fresh.
 
 **Step 3: Verify work on main before resetting.**
 
-Before resetting the bead to pool, check if the branch was already merged
-to main (polecat finished, pushed, but crashed before closing the bead):
+Run the existing merge-evidence check only for a validated, non-empty branch.
+An empty branch with no worktree is Case E and must skip this merge check
+entirely:
 ```bash
-git log main --oneline | grep -q "$BRANCH"
-# Or check if branch commits are reachable from main:
-git merge-base --is-ancestor origin/$BRANCH origin/main
+if [ -n "$BRANCH" ]; then
+  git log main --oneline | grep -q "$BRANCH"
+  # Or check if branch commits are reachable from main:
+  git merge-base --is-ancestor "origin/$BRANCH" origin/main
+fi
 ```
 
-If the work is already on main:
+If the non-empty branch is already on main:
 - **Close the bead** (work is done, don't re-dispatch). Use `--force`: the bead
   is still assigned to the crashed polecat, so this is a cross-actor close and
   bd's close-authority guard (gastownhall/beads#3734) would otherwise refuse it:
 ```bash
-gc bd close <bead> --force
-gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
-  -m "Branch $BRANCH already on main. Closed instead of resetting."
+if confirm_orphan_still_unowned; then
+  gc bd close <bead> --force
+  gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
+    -m "Branch $BRANCH already on main. Closed instead of resetting."
+else
+  echo "Orphan ownership changed before close; leaving bead untouched." >&2
+  RECOVERY_BLOCKED=true
+fi
 ```
 - Clean up worktree and skip to Step 4.
 
@@ -345,18 +571,131 @@ If the work is NOT on main, proceed with reset:
 
 **Step 3b: Clean up worktree and return bead to pool.**
 
-Once the branch is canonical (on origin), the worktree is disposable:
+Immediately before any removal or workflow reset, re-read ownership and
+revalidate the current canonical-first artifact path. A restarted agent or
+changed artifact path means the earlier orphan decision is stale; leave
+everything untouched for the next patrol:
 ```bash
-# Delete worktree if it exists
-cd <rig-root>
-git worktree remove <worktree-path> --force 2>/dev/null
-rm -rf <worktree-path> 2>/dev/null  # Fallback
-git worktree prune
-```
+CURRENT_BEAD=$(gc bd show <bead> --json) || {
+  echo "Cannot refresh <bead> before cleanup; preserving artifact and workflow." >&2
+  RECOVERY_BLOCKED=true
+  CURRENT_BEAD='[]'
+}
+CURRENT_RECORD=$(printf '%s' "$CURRENT_BEAD" | jq -ce '
+  if type == "array" and length == 1 and (.[0] | type) == "object" and
+     ((.[0].metadata // {}) | type) == "object"
+  then .[0]
+  else error("expected exactly one current work bead object")
+  end
+') || {
+  echo "Invalid refreshed metadata for <bead>; preserving artifact and workflow." >&2
+  RECOVERY_BLOCKED=true
+  CURRENT_RECORD='{"metadata":{}}'
+}
+CURRENT_STATUS=$(printf '%s' "$CURRENT_RECORD" | jq -r '.status // empty')
+CURRENT_ASSIGNEE=$(printf '%s' "$CURRENT_RECORD" | jq -r '.assignee // empty')
+CURRENT_META=$(printf '%s' "$CURRENT_RECORD" | jq '.metadata // {}')
+CURRENT_CANONICAL_ARTIFACT=$(printf '%s' "$CURRENT_META" |
+  jq -r '.artifact_dir // empty')
+CURRENT_ARTIFACT=$(printf '%s' "$CURRENT_META" | jq -r '
+  if ((.artifact_dir // "") | length) > 0
+  then .artifact_dir
+  else (.work_dir // empty)
+  end')
+OWNER_LIVE_COUNT=1
+if CURRENT_SESSIONS=$(gc session list --state=all --json); then
+  OWNER_LIVE_COUNT=$(printf '%s' "$CURRENT_SESSIONS" |
+    jq -r --arg owner "$CURRENT_ASSIGNEE" --arg original "$ASSIGNEE" '
+      def identities: [.id, .name, .session_name, .alias, .agent_name]
+        | map(select((. // "") | length > 0));
+      [.sessions[]
+       | select((identities | index($owner)) != null or
+                (identities | index($original)) != null)
+       | select(.state == "active" or .state == "awake" or
+                .state == "creating" or .state == "asleep" or
+                .state == "drained" or .state == "suspended" or
+                .state == "draining" or .state == "quarantined")]
+      | length') || OWNER_LIVE_COUNT=1
+fi
+RECOVERY_MODE=none
+if [ "$RECOVERY_BLOCKED" != true ] && [ "$OWNER_LIVE_COUNT" -eq 0 ]; then
+  if [ "$CURRENT_STATUS" = closed ]; then
+    RECOVERY_MODE=closed
+  elif { [ "$CURRENT_STATUS" = open ] || [ "$CURRENT_STATUS" = in_progress ]; } &&
+       [ "$CURRENT_ASSIGNEE" = "$ASSIGNEE" ]; then
+    RECOVERY_MODE=reset
+  fi
+fi
 
-Close any orphaned workflow subtree, then return the bead to pool:
-```bash
-gc workflow delete-source <bead> --apply && gc workflow reopen-source <bead>
+# BEGIN WITNESS_ARTIFACT_SAFETY_GATE
+ARTIFACT_SAFE=false
+if [ "$RECOVERY_MODE" != none ]; then
+  if [ -z "$WORKTREE" ]; then
+    if [ -z "$CURRENT_CANONICAL_ARTIFACT" ] &&
+       { [ -z "$CURRENT_ARTIFACT" ] ||
+       ! validate_recovery_artifact_worktree \
+         "$CURRENT_ARTIFACT" "$GC_CITY_PATH" "$GC_RIG" \
+         "$GC_RIG_ROOT" <bead> >/dev/null; }; then
+      ARTIFACT_SAFE=true
+    fi
+  elif REVALIDATED_WORKTREE=$(validate_recovery_artifact_worktree \
+      "$CURRENT_ARTIFACT" "$GC_CITY_PATH" "$GC_RIG" \
+      "$GC_RIG_ROOT" <bead>) &&
+       [ "$REVALIDATED_WORKTREE" = "$WORKTREE" ]; then
+    LOCAL_SHA=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || true)
+    REMOTE_SHA=$(git -C "$GC_RIG_ROOT" ls-remote --heads origin \
+      "refs/heads/$BRANCH" 2>/dev/null | cut -f1)
+    if [ -n "$BRANCH" ] && [ -n "$LOCAL_SHA" ] &&
+       [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
+      if WORKTREE_STATUS=$(git -C "$WORKTREE" status --porcelain); then
+        if [ -z "$WORKTREE_STATUS" ]; then
+          ARTIFACT_SAFE=true
+        fi
+      else
+        echo "Cannot inspect <bead> artifact status; blocking cleanup and escalating for manual recovery." >&2
+        RECOVERY_BLOCKED=true
+        if ! gc mail send mayor/ \
+          -s "RECOVERY_BLOCKED: artifact status unreadable for <bead>" \
+          -m "Witness could not run git status for validated artifact $WORKTREE. The worktree and workflow were preserved; inspect Git and retry recovery manually."; then
+          echo "Could not notify mayor about blocked recovery for <bead>; artifact remains preserved." >&2
+        fi
+      fi
+    fi
+  fi
+fi
+# END WITNESS_ARTIFACT_SAFETY_GATE
+
+if [ "$ARTIFACT_SAFE" = true ]; then
+  cd "$GC_RIG_ROOT" || {
+    echo "Rig root disappeared before artifact removal; preserving bead state." >&2
+    ARTIFACT_SAFE=false
+  }
+fi
+
+if [ "$ARTIFACT_SAFE" = true ]; then
+  if [ -n "$WORKTREE" ] &&
+     ! git -C "$GC_RIG_ROOT" worktree remove "$WORKTREE"; then
+    echo "Validated artifact could not be removed cleanly; preserving bead state." >&2
+    ARTIFACT_SAFE=false
+  fi
+fi
+
+if [ "$ARTIFACT_SAFE" = true ]; then
+  if ! gc bd update <bead> \
+      --unset-metadata artifact_dir \
+      --unset-metadata work_dir; then
+    echo "Artifact removed but metadata cleanup failed; do not reopen this bead until the stale canonical path is cleared." >&2
+    ARTIFACT_SAFE=false
+  fi
+fi
+
+if [ "$ARTIFACT_SAFE" = true ] && [ "$RECOVERY_MODE" = reset ]; then
+  gc workflow delete-source <bead> --apply && gc workflow reopen-source <bead>
+elif [ "$ARTIFACT_SAFE" = true ] && [ "$RECOVERY_MODE" = closed ]; then
+  echo "Closed orphan artifact cleaned; leaving the closed bead closed."
+else
+  echo "Orphan ownership/artifact changed for <bead>; skipping cleanup and reset." >&2
+fi
 ```
 
 **Step 4: Assess and notify.**
