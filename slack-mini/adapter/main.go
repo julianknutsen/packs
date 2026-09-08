@@ -5,7 +5,12 @@
 //   - Inbound: a public HTTPS receiver for the Slack Events API. Only
 //     `app_mention` is handled. Each verified mention is bridged to gc by
 //     POSTing /v0/city/{city}/extmsg/inbound, addressed to the mayor
-//     session (override with SLACK_MINI_INBOUND_TARGET).
+//     session (override with SLACK_MINI_INBOUND_TARGET). The mention is
+//     spooled to disk before the first forward attempt and the POST is
+//     retried with backoff, because Slack has already been 200-acked and
+//     will never redeliver: a dropped forward is a lost message. Exhausted
+//     retries dead-letter the spool entry for manual replay; entries left
+//     mid-retry by a crash are re-delivered at startup.
 //
 //   - Outbound: a UDS endpoint (/post-message) that posts plain text to a
 //     Slack channel via chat.postMessage using the workspace bot token.
@@ -46,6 +51,10 @@
 //	ADAPTER_PROVIDER           extmsg provider name (default "slack").
 //	SLACK_MINI_INBOUND_TARGET  Session handle inbound mentions address (default "mayor").
 //	SLACK_API_BASE             Slack web API base (default https://slack.com/api).
+//	SLACK_MINI_SPOOL_DIR       Directory for the inbound persist-and-retry spool
+//	                           (default $GC_SERVICE_STATE_ROOT/data/inbound-spool
+//	                           in proxy_process mode; unset otherwise, which
+//	                           disables spooling but keeps in-memory retries).
 package main
 
 import (
@@ -64,9 +73,11 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -98,6 +109,16 @@ const defaultSlackAPIBase = "https://slack.com/api"
 // pin an inbound-bridge goroutine (or block startup registration) forever.
 const gcCallTimeout = 15 * time.Second
 
+// inboundRetryDelays spaces the forward retries after a failed inbound POST
+// to gc: 5 attempts total over ~2 minutes, then dead-letter (bug hq-1q1).
+// Package-level var so tests can compress the schedule.
+var inboundRetryDelays = []time.Duration{
+	5 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+}
+
 type config struct {
 	publicListen        string
 	internalListen      string
@@ -111,6 +132,7 @@ type config struct {
 	signingSecret       string
 	inboundTarget       string
 	slackAPIBase        string
+	spoolDir            string
 	registerOnStart     bool
 }
 
@@ -155,6 +177,10 @@ func main() {
 		log.Printf("registered with gc as provider=%s account=%s callback=%s/post-message",
 			cfg.provider, cfg.workspaceID, cfg.internalCallbackURL)
 	}
+
+	// Re-deliver any inbound events a previous run spooled but never
+	// confirmed forwarded (bug hq-1q1: Slack was already 200-acked).
+	replaySpool(cfg)
 
 	errCh := make(chan error, 2)
 	go func() {
@@ -222,7 +248,17 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		signingSecret:   getenv("SLACK_SIGNING_SECRET"),
 		inboundTarget:   envOr("SLACK_MINI_INBOUND_TARGET", defaultInboundTarget),
 		slackAPIBase:    strings.TrimRight(envOr("SLACK_API_BASE", defaultSlackAPIBase), "/"),
+		spoolDir:        getenv("SLACK_MINI_SPOOL_DIR"),
 		registerOnStart: envOr("REGISTER_ON_START", "true") == "true",
+	}
+
+	// Default the persist-and-retry spool into the controller-provided state
+	// root (proxy_process mode). Standalone runs without an explicit
+	// SLACK_MINI_SPOOL_DIR get in-memory retries only.
+	if cfg.spoolDir == "" {
+		if stateRoot := getenv("GC_SERVICE_STATE_ROOT"); stateRoot != "" {
+			cfg.spoolDir = filepath.Join(stateRoot, "data", "inbound-spool")
+		}
 	}
 
 	// proxy_process mode: gc reaches the adapter via GC_API_BASE_URL +
@@ -337,36 +373,75 @@ func handleSlackEvents(cfg config) http.HandlerFunc {
 			return
 		}
 
-		// Ack immediately so Slack does not retry, then bridge.
+		// Spool the decoded inbound BEFORE the 200 ack (codex P1):
+		// Slack never redelivers after a 200, and the old order —
+		// ack, then an async users.info lookup (up to 5s), then
+		// spool — left a window where a SIGTERM or crash during an
+		// ordinary restart silently lost an acked mention. The
+		// synchronous cost is one decode + one fsync'd file write,
+		// well inside Slack's 3s ack budget. Enrichment (users.info)
+		// and delivery stay async.
+		inbound, spoolPath, spoolErr, ok := prepareInbound(cfg, env)
+		if !ok {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if spoolErr != nil {
+			// Spooling is CONFIGURED but failed (full/unwritable disk):
+			// acking now would let a crash lose the mention with no
+			// replayable entry — answer 5xx so Slack redelivers (codex
+			// round 3 P1; duplicates dedupe by ts). Explicitly disabled
+			// spooling (empty spoolDir) still acks and rides the
+			// in-memory retries.
+			log.Printf("inbound spool failed; NACKing for Slack retry: %v", spoolErr)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
-		go bridgeEvent(cfg, env)
+		go finishInbound(cfg, inbound, spoolPath)
 	}
 }
 
-// bridgeEvent decodes an app_mention and POSTs it to gc's extmsg inbound.
-// Non-app_mention events, bot/system messages, and empty bodies are
-// dropped — Tier 1 handles only direct human mentions. It runs in its own
-// goroutine; the gc call is bounded by gcCallTimeout so a stalled gc
-// cannot leak goroutines under sustained traffic.
+// bridgeEvent runs the full bridge synchronously: prepare (decode,
+// filter, spool) then finish (enrich, deliver). Test seam — the HTTP
+// handler calls the two halves itself so the spool write lands before
+// the Slack ack.
 func bridgeEvent(cfg config, env slackEventEnvelope) {
+	if inbound, spoolPath, _, ok := prepareInbound(cfg, env); ok {
+		finishInbound(cfg, inbound, spoolPath)
+	}
+}
+
+// prepareInbound decodes and filters an event and, for a deliverable
+// app_mention, builds the inbound message and durably spools it.
+// ok=false means "nothing to bridge" (non-mention, bot/system message,
+// empty body). The Actor's DisplayName is left as the raw user id here
+// — the users.info lookup can take seconds and must not delay the
+// Slack ack; finishInbound resolves it before the forward.
+func prepareInbound(cfg config, env slackEventEnvelope) (externalInboundMessage, string, error, bool) {
 	if env.Type != "event_callback" || len(env.Event) == 0 {
-		return
+		return externalInboundMessage{}, "", nil, false
 	}
 	var msg slackMessageEvent
 	if err := json.Unmarshal(env.Event, &msg); err != nil {
 		log.Printf("decode slack event: %v", err)
-		return
+		return externalInboundMessage{}, "", nil, false
 	}
 	if msg.Type != "app_mention" {
-		return
+		return externalInboundMessage{}, "", nil, false
 	}
 	if msg.BotID != "" || msg.Subtype != "" || msg.User == "" {
-		return
+		return externalInboundMessage{}, "", nil, false
 	}
 	text := stripLeadingMention(msg.Text)
 	if text == "" {
-		return
+		return externalInboundMessage{}, "", nil, false
 	}
+
+	// Log receipt before the first forward attempt so a message that later
+	// fails every retry is still identifiable (and replayable from Slack).
+	log.Printf("inbound received: chan=%s user=%s ts=%s thread=%s target=%s text=%dch",
+		msg.Channel, msg.User, msg.TS, msg.ThreadTS, cfg.inboundTarget, len(text))
 
 	inbound := externalInboundMessage{
 		ProviderMessageID: msg.TS,
@@ -379,7 +454,7 @@ func bridgeEvent(cfg config, env slackEventEnvelope) {
 		},
 		Actor: externalActor{
 			ID:          msg.User,
-			DisplayName: msg.User, // resolving a display name needs users.info — defer to Tier 2
+			DisplayName: msg.User,
 		},
 		Text:             text,
 		ExplicitTarget:   cfg.inboundTarget,
@@ -387,14 +462,396 @@ func bridgeEvent(cfg config, env slackEventEnvelope) {
 		DedupKey:         "slack-" + msg.TS,
 		ReceivedAt:       time.Now().UTC(),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), gcCallTimeout)
-	defer cancel()
-	if err := postInbound(ctx, cfg, inbound); err != nil {
-		log.Printf("inbound POST failed: %v", err)
+	spoolPath, spoolErr := spoolInbound(cfg.spoolDir, inbound)
+	return inbound, spoolPath, spoolErr, true
+}
+
+// finishInbound runs the async half of the bridge: display-name
+// enrichment (bounded by userInfoTimeout) and the retried forward.
+// Each gc call is bounded by gcCallTimeout and the retry schedule
+// bounds the goroutine's total lifetime to ~2 minutes.
+// finishInboundSem bounds concurrent live deliveries (codex round 3):
+// each finishInbound can run users.info plus ~3 minutes of gc retries,
+// and an unbounded burst would exhaust sockets or hammer a recovering
+// gc. Waiters are accepted Slack events (rate-bounded upstream) parked
+// on a cheap channel; startup replay has its own 4-worker bound.
+var finishInboundSem = make(chan struct{}, 8)
+
+func finishInbound(cfg config, inbound externalInboundMessage, spoolPath string) {
+	finishInboundSem <- struct{}{}
+	defer func() { <-finishInboundSem }()
+	inbound.Actor.DisplayName = resolveUserDisplayName(context.Background(), userNames, cfg, inbound.Actor.ID)
+	deliverInbound(cfg, inbound, spoolPath)
+}
+
+// spoolInbound persists a decoded inbound event before the first forward
+// attempt, so a crash mid-retry cannot silently lose a Slack-acked message.
+// Returns the spool file path, or "" when spooling is disabled (no spool
+// dir) or the write fails — persistence is best-effort and never blocks
+// the bridge.
+func spoolInbound(spoolDir string, msg externalInboundMessage) (string, error) {
+	if spoolDir == "" {
+		return "", nil
+	}
+	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
+		return "", fmt.Errorf("spool: mkdir %s: %w", spoolDir, err)
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return "", fmt.Errorf("spool: marshal: %w", err)
+	}
+	name := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), sanitizeSpoolName(msg.DedupKey))
+	path := filepath.Join(spoolDir, name)
+	if err := writeSpoolFileAtomic(path, data); err != nil {
+		return "", fmt.Errorf("spool: write %s: %w", path, err)
+	}
+	return path, nil
+}
+
+// writeSpoolFileAtomic writes data to path via a same-dir temp file +
+// fsync + rename (codex P2): a direct write to the replay-visible
+// .json path could be torn by a crash or short write AFTER Slack was
+// acked, and startup replay would then dead-letter the truncated
+// entry with no valid payload left to retry. The temp file is removed
+// on every error path.
+func writeSpoolFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp in %q: %w", dir, err)
+	}
+	tmpName := f.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("chmod %q: %w", tmpName, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("write %q: %w", tmpName, err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("sync %q: %w", tmpName, err)
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("close %q: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return fmt.Errorf("rename %q -> %q: %w", tmpName, path, err)
+	}
+	// Fsync the parent directory so the rename itself survives a host
+	// crash (codex round 3): the file contents were synced above, but
+	// the directory entry was not — and a spool entry that vanishes on
+	// reboot silently loses an acked Slack event.
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open dir %q for sync: %w", dir, err)
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return fmt.Errorf("sync dir %q: %w", dir, err)
+	}
+	return d.Close()
+}
+
+// spoolNameRE matches characters unsafe in a spool filename.
+var spoolNameRE = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+
+func sanitizeSpoolName(s string) string {
+	return spoolNameRE.ReplaceAllString(s, "_")
+}
+
+// deliverInbound forwards one inbound message to gc, retrying failures per
+// inboundRetryDelays. On success the spool entry is removed; when every
+// attempt fails the entry moves to the dead-letter directory. The final
+// failure line deliberately contains "inbound POST failed" — external
+// log-watchers (slack-nudge-bridge) key on that exact substring.
+func deliverInbound(cfg config, msg externalInboundMessage, spoolPath string) {
+	attempts := len(inboundRetryDelays) + 1
+	var lastErr error
+	for i := range attempts {
+		if i > 0 {
+			time.Sleep(inboundRetryDelays[i-1])
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), gcCallTimeout)
+		err := postInbound(ctx, cfg, msg)
+		cancel()
+		if err == nil {
+			if spoolPath != "" {
+				_ = os.Remove(spoolPath)
+			}
+			log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%s text=%dch",
+				msg.Conversation.ConversationID, msg.Actor.ID, msg.ProviderMessageID,
+				msg.ReplyToMessageID, msg.ExplicitTarget, len(msg.Text))
+			return
+		}
+		lastErr = err
+		if i < attempts-1 {
+			log.Printf("inbound forward attempt %d/%d failed (retry in %s): %v",
+				i+1, attempts, inboundRetryDelays[i], err)
+		}
+	}
+	log.Printf("inbound POST failed after %d attempts (dead-letter=%s) chan=%s ts=%s: %v",
+		attempts, moveToDeadLetter(spoolPath), msg.Conversation.ConversationID,
+		msg.ProviderMessageID, lastErr)
+}
+
+// moveToDeadLetter quarantines an exhausted spool entry in the sibling
+// "dead" directory so it can be replayed by hand; returns the new path, or
+// "none" when spooling was disabled for this message. If the move fails the
+// entry stays in the spool, where startup replay will retry it.
+func moveToDeadLetter(spoolPath string) string {
+	if spoolPath == "" {
+		return "none"
+	}
+	deadDir := filepath.Join(filepath.Dir(spoolPath), "dead")
+	if err := os.MkdirAll(deadDir, 0o700); err != nil {
+		log.Printf("dead-letter: mkdir: %v", err)
+		return spoolPath
+	}
+	dest := filepath.Join(deadDir, filepath.Base(spoolPath))
+	if err := os.Rename(spoolPath, dest); err != nil {
+		log.Printf("dead-letter: rename: %v", err)
+		return spoolPath
+	}
+	return dest
+}
+
+// replaySpool re-delivers inbound events a previous run persisted but never
+// confirmed forwarded (crash mid-retry). Redelivery may duplicate an event
+// gc already accepted — the message DedupKey makes that safe. Dead-lettered
+// entries are NOT replayed automatically; they stay under spool/dead for
+// manual replay.
+func replaySpool(cfg config) {
+	if cfg.spoolDir == "" {
 		return
 	}
-	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%s text=%dch",
-		msg.Channel, msg.User, msg.TS, msg.ThreadTS, cfg.inboundTarget, len(text))
+	entries, err := os.ReadDir(cfg.spoolDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("spool replay: %v", err)
+		}
+		return
+	}
+	var paths []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		paths = append(paths, filepath.Join(cfg.spoolDir, e.Name()))
+	}
+	if len(paths) == 0 {
+		return
+	}
+	// Bounded worker pool (codex round 2): one goroutine per entry
+	// would run users.info + several timed gc retries for every
+	// backlog entry at once — a large crash backlog could exhaust
+	// sockets or rate-limit Slack and the recovering gc. Workers read
+	// and decode their own entries so payload memory is bounded too.
+	work := make(chan string)
+	for range replaySpoolWorkers {
+		go func() {
+			for path := range work {
+				replayPath(cfg, path)
+			}
+		}()
+	}
+	go func() {
+		for _, p := range paths {
+			work <- p
+		}
+		close(work)
+	}()
+}
+
+// replaySpoolWorkers bounds concurrent startup replay deliveries.
+const replaySpoolWorkers = 4
+
+// replayPath reads and decodes one spool entry (quarantining
+// undecodable files) and re-delivers it. Entries are spooled before
+// display-name enrichment; finishInbound completes it so a replayed
+// mention carries the same name a live delivery would.
+func replayPath(cfg config, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("spool replay: read %s: %v", path, err)
+		return
+	}
+	var msg externalInboundMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		log.Printf("spool replay: decode %s: %v (dead-letter=%s)", path, err, moveToDeadLetter(path))
+		return
+	}
+	log.Printf("spool replay: re-delivering %s (chan=%s ts=%s)",
+		filepath.Base(path), msg.Conversation.ConversationID, msg.ProviderMessageID)
+	finishInbound(cfg, msg, path)
+}
+
+// --- inbound: Slack user display-name resolution ---------------------------
+
+// userNameCacheTTL bounds how long a resolved display name is reused before
+// users.info is consulted again. Names change rarely; an hour keeps the
+// per-mention lookup cost near zero without pinning stale names forever.
+const userNameCacheTTL = time.Hour
+
+// userNameFailureTTL negative-caches a failed lookup (missing_scope on a
+// bot token without users:read, transient Slack errors) so a burst of
+// mentions does not hammer users.info, while healing quickly once the
+// scope is granted or the outage passes.
+const userNameFailureTTL = 5 * time.Minute
+
+// userInfoTimeout bounds the users.info call on the inbound bridge path.
+const userInfoTimeout = 5 * time.Second
+
+type cachedUserName struct {
+	name      string
+	expiresAt time.Time
+}
+
+// userNameCache is an in-memory users.info result cache. Tier 1 keeps no
+// on-disk registries by design, so entries live for the process lifetime.
+type userNameCache struct {
+	mu       sync.Mutex
+	entries  map[string]cachedUserName
+	inflight map[string]*userNameProbe
+}
+
+// userNameProbe coalesces concurrent users.info lookups for one user
+// (codex round 3): a burst of mentions from an uncached user — or the
+// four replay workers — would otherwise each fire users.info, tripping
+// rate limits and letting a late failure overwrite a success. done is
+// closed after name is populated; waiters read it only after <-done.
+type userNameProbe struct {
+	done chan struct{}
+	name string
+}
+
+func newUserNameCache() *userNameCache {
+	return &userNameCache{
+		entries:  make(map[string]cachedUserName),
+		inflight: make(map[string]*userNameProbe),
+	}
+}
+
+func (c *userNameCache) get(userID string, now time.Time) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[userID]
+	if !ok || now.After(entry.expiresAt) {
+		return "", false
+	}
+	return entry.name, true
+}
+
+func (c *userNameCache) put(userID, name string, now time.Time, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[userID] = cachedUserName{name: name, expiresAt: now.Add(ttl)}
+}
+
+// userNames caches users.info lookups across inbound mentions.
+var userNames = newUserNameCache()
+
+// slackUserInfoResp is the subset of a users.info response Tier 1 reads.
+type slackUserInfoResp struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	User  struct {
+		Name     string `json:"name"`
+		RealName string `json:"real_name"`
+		Profile  struct {
+			DisplayName string `json:"display_name"`
+			RealName    string `json:"real_name"`
+		} `json:"profile"`
+	} `json:"user"`
+}
+
+// resolveUserDisplayName resolves a Slack user id to a human-readable name
+// via users.info so the injected gc reminder shows "Afik Cohen (human)"
+// instead of a raw "U0AN32RPBFT" (hq-fh9). Successes are cached for
+// userNameCacheTTL; failures fall back to the raw id and are
+// negative-cached for userNameFailureTTL (a bot token without users:read
+// fails on every mention — see manifest/app.json, which grants the scope
+// for fresh installs; existing installs must re-approve it).
+func resolveUserDisplayName(ctx context.Context, cache *userNameCache, cfg config, userID string) string {
+	if userID == "" {
+		return userID
+	}
+	now := time.Now()
+	if name, ok := cache.get(userID, now); ok {
+		return name
+	}
+	// Coalesce concurrent misses onto one users.info call (codex round
+	// 3): later callers wait on the winner's probe (bounded by its
+	// userInfoTimeout-scoped request) and adopt its answer.
+	cache.mu.Lock()
+	if p, ok := cache.inflight[userID]; ok {
+		cache.mu.Unlock()
+		<-p.done
+		return p.name
+	}
+	probe := &userNameProbe{done: make(chan struct{})}
+	cache.inflight[userID] = probe
+	cache.mu.Unlock()
+
+	name := fetchUserDisplayName(ctx, cfg, userID)
+	if name == "" {
+		cache.put(userID, userID, now, userNameFailureTTL)
+		probe.name = userID
+	} else {
+		cache.put(userID, name, now, userNameCacheTTL)
+		probe.name = name
+	}
+	cache.mu.Lock()
+	delete(cache.inflight, userID)
+	cache.mu.Unlock()
+	close(probe.done)
+	return probe.name
+}
+
+// fetchUserDisplayName performs the users.info call, returning "" on any
+// failure (logged with the reason).
+func fetchUserDisplayName(ctx context.Context, cfg config, userID string) string {
+	ctx, cancel := context.WithTimeout(ctx, userInfoTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		cfg.slackAPIBase+"/users.info?user="+url.QueryEscape(userID), nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.botToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("users.info %s failed (using raw id): %v", userID, err)
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("users.info %s: http %d (using raw id)", userID, resp.StatusCode)
+		return ""
+	}
+	var info slackUserInfoResp
+	if err := json.Unmarshal(respBody, &info); err != nil || !info.OK {
+		log.Printf("users.info %s: ok=false error=%q (using raw id)", userID, info.Error)
+		return ""
+	}
+	return firstNonEmpty(info.User.Profile.DisplayName, info.User.Profile.RealName, info.User.RealName, info.User.Name)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // leadingMentionRE matches one or more leading Slack user-mention tokens
@@ -491,12 +948,27 @@ type adapterCapabilities struct {
 }
 
 type adapterRegisterRequest struct {
-	Provider     string              `json:"provider"`
-	AccountID    string              `json:"account_id"`
-	Name         string              `json:"name,omitempty"`
-	CallbackURL  string              `json:"callback_url,omitempty"`
-	Capabilities adapterCapabilities `json:"capabilities,omitempty"`
+	Provider          string              `json:"provider"`
+	AccountID         string              `json:"account_id"`
+	Name              string              `json:"name,omitempty"`
+	CallbackURL       string              `json:"callback_url,omitempty"`
+	Capabilities      adapterCapabilities `json:"capabilities,omitempty"`
+	ReplyInstructions string              `json:"reply_instructions,omitempty"`
 }
+
+// replyInstructionsTemplate is the Tier-1 reply instruction block gc renders
+// into the inbound-message <system-reminder> nudge in place of its generic
+// "gc slack reply-current ..." fallback, which does not exist at Tier 1
+// (hq-fh9). gc substitutes {conversation_id}, {message_ts}, and {thread_ts}
+// (the inbound message's thread, falling back to the message itself); the
+// [bracketed segment] is dropped when no thread id is available. Agents
+// write standard Markdown — handlePostMessage converts it to Slack mrkdwn
+// on the way out. No handle prefix: the bot posts under its own Slack
+// identity, so a "**{handle}:**" prefix would be redundant (hq-dy6).
+const replyInstructionsTemplate = "To reply in Slack, run:\n" +
+	"  gc slack-mini post-message --channel {conversation_id}[ --thread-ts {thread_ts}] --text '<your reply>'\n" +
+	"Keep --thread-ts so the reply lands in the thread. Write the reply in standard Markdown " +
+	"(it is converted to Slack formatting on post)."
 
 // postInbound bridges a verified Slack mention into gc.
 func postInbound(ctx context.Context, cfg config, msg externalInboundMessage) error {
@@ -524,6 +996,7 @@ func registerAdapter(ctx context.Context, cfg config) error {
 			SupportsAttachments:        false,
 			MaxMessageLength:           40000, // Slack's chat.postMessage limit
 		},
+		ReplyInstructions: replyInstructionsTemplate,
 	})
 	if err != nil {
 		return err
@@ -587,6 +1060,7 @@ func handlePostMessage(cfg config) http.HandlerFunc {
 			writeJSONError(w, http.StatusBadRequest, "text is required")
 			return
 		}
+		req.Text = slackifyMarkdown(req.Text)
 		resp, err := postToSlack(r.Context(), cfg.slackAPIBase, cfg.botToken, req)
 		if err != nil {
 			writeJSONError(w, http.StatusBadGateway, err.Error())
@@ -609,6 +1083,286 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": msg})
+}
+
+// --- outbound: GitHub Markdown → Slack mrkdwn -------------------------------
+
+var (
+	boldStarsRE = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	strikeRE    = regexp.MustCompile(`~~(.+?)~~`)
+	// Closing heading hashes count only when whitespace-separated
+	// (codex round 2): GFM keeps the final '#' of `# C#` as content,
+	// so the optional closer requires a preceding blank.
+	headingRE = regexp.MustCompile(`(?m)^#{1,6}[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$`)
+	bareURLRE = regexp.MustCompile(`https?://[^\s<>|]+`)
+)
+
+// slackifyMarkdown converts the GitHub-flavored Markdown constructs agents
+// habitually write into Slack mrkdwn, which renders **bold** as literal
+// asterisks (hq-fh9). Conservative by design: fenced code blocks and inline
+// code spans pass through verbatim; only **bold**/__bold__ → *bold*,
+// ~~strike~~ → ~strike~, [text](url) → <url|text>, and #-headings →
+// *bold lines* are rewritten. Single-asterisk/underscore emphasis is left
+// untouched so text already written as mrkdwn survives unchanged.
+//
+// Ordering matters (codex P2): links and bare URLs are converted and
+// protected BEFORE the emphasis passes, so a destination like
+// .../pkg/__init__.py or a URL with ** or ~~ in it can never be
+// rewritten into a broken href.
+func slackifyMarkdown(text string) string {
+	if text == "" {
+		return text
+	}
+	var protected []string
+	protect := func(s string) string {
+		protected = append(protected, s)
+		return fmt.Sprintf("\x00%d\x00", len(protected)-1)
+	}
+	out := protectFencedBlocks(text, protect)
+	out = protectCodeSpans(out, protect)
+	out = convertMarkdownLinks(out, protect)
+	// Bare URLs are protected sans any trailing emphasis delimiters
+	// (codex round 2): in `**see https://example.com**` the closing
+	// `**` belongs to the bold span, not the URL — swallowing it into
+	// the protected span would leave the bold pass without its closer.
+	out = bareURLRE.ReplaceAllStringFunc(out, func(m string) string {
+		// Sentence punctuation first, THEN emphasis delimiters (codex
+		// round 3): in `**see https://example.com**.` the trailing
+		// period hides the `**` from a delimiter-only trim.
+		trimmed := strings.TrimRight(m, ".,;:!?")
+		trimmed = strings.TrimRight(trimmed, "*_~")
+		trimmed = strings.TrimRight(trimmed, ".,;:!?")
+		if trimmed == "" {
+			return m
+		}
+		return protect(trimmed) + m[len(trimmed):]
+	})
+	out = headingRE.ReplaceAllString(out, "*$1*")
+	out = boldStarsRE.ReplaceAllString(out, "*$1*")
+	out = convertUnderscoreBold(out)
+	out = strikeRE.ReplaceAllString(out, "~$1~")
+	for i := len(protected) - 1; i >= 0; i-- {
+		out = strings.Replace(out, fmt.Sprintf("\x00%d\x00", i), protected[i], 1)
+	}
+	return out
+}
+
+// protectCodeSpans protects GFM inline code spans, including the
+// multi-backtick form (“span with ` inside“) the old single-backtick
+// regex missed (codex P2) — Go's RE2 has no backreferences, so equal
+// delimiter runs are matched by hand. A span opens with a run of N
+// backticks and closes at the next run of exactly N; runs of other
+// lengths are span content. Spans stay single-line, matching the prior
+// conservatism. An unclosed run passes through unprotected.
+func protectCodeSpans(s string, protect func(string) string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c != '`' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		j := i
+		for j < len(s) && s[j] == '`' {
+			j++
+		}
+		n := j - i
+		closed := -1
+		k := j
+		for k < len(s) && s[k] != '\n' {
+			if s[k] != '`' {
+				k++
+				continue
+			}
+			m := k
+			for m < len(s) && s[m] == '`' {
+				m++
+			}
+			if m-k == n {
+				closed = m
+				break
+			}
+			k = m
+		}
+		if closed >= 0 && closed > j {
+			b.WriteString(protect(s[i:closed]))
+			i = closed
+			continue
+		}
+		b.WriteString(s[i:j])
+		i = j
+	}
+	return b.String()
+}
+
+// protectFencedBlocks protects GFM fenced code blocks line-orientedly
+// (codex round 2): a fence opens at a line beginning with ``` and
+// closes only at a LINE that is nothing but ``` and whitespace — an
+// embedded sequence inside a code line (fmt.Println("```")) is block
+// content, not a closer, which the old (?s)```.*?``` regex got wrong.
+// An unterminated fence swallows the rest of the message: it is
+// protected whole rather than reformatting half a code block.
+func protectFencedBlocks(s string, protect func(string) string) string {
+	lines := strings.SplitAfter(s, "\n")
+	var b strings.Builder
+	i := 0
+	for i < len(lines) {
+		trimmed := strings.TrimLeft(lines[i], " \t")
+		if !strings.HasPrefix(trimmed, "```") {
+			b.WriteString(lines[i])
+			i++
+			continue
+		}
+		// GFM: the closing fence must be AT LEAST as long as the
+		// opener (codex round 3) — a ```` fence may contain ``` lines.
+		opener := 0
+		for opener < len(trimmed) && trimmed[opener] == '`' {
+			opener++
+		}
+		j := i + 1
+		closed := -1
+		for j < len(lines) {
+			body := strings.TrimSpace(lines[j])
+			if len(body) >= opener && strings.Count(body, "`") == len(body) {
+				closed = j
+				break
+			}
+			j++
+		}
+		if closed < 0 {
+			b.WriteString(protect(strings.Join(lines[i:], "")))
+			break
+		}
+		// Keep the block's trailing newline OUTSIDE the placeholder
+		// (codex round 3): swallowing it would glue the next line onto
+		// the placeholder and break line-anchored passes (headings).
+		block := strings.Join(lines[i:closed+1], "")
+		if strings.HasSuffix(block, "\n") {
+			b.WriteString(protect(block[:len(block)-1]))
+			b.WriteString("\n")
+		} else {
+			b.WriteString(protect(block))
+		}
+		i = closed + 1
+	}
+	return b.String()
+}
+
+// convertUnderscoreBold rewrites __bold__ → *bold* while honoring
+// GFM's intraword rule (codex round 2): an underscore run flanked by
+// word characters (foo__bar__baz) cannot open or close emphasis and
+// stays literal — the regex it replaces rewrote technical
+// identifiers. Hand-scanned because RE2 has no lookarounds.
+func convertUnderscoreBold(s string) string {
+	isWord := func(c byte) bool {
+		return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+	}
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		if !strings.HasPrefix(s[i:], "__") || (i > 0 && isWord(s[i-1])) {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		matched := false
+		j := i + 2
+		for {
+			k := strings.Index(s[j:], "__")
+			if k < 0 {
+				break
+			}
+			k += j
+			after := k + 2
+			if k > i+2 && (after >= len(s) || !isWord(s[after])) {
+				b.WriteString("*" + s[i+2:k] + "*")
+				i = after
+				matched = true
+				break
+			}
+			j = k + 1
+		}
+		if !matched {
+			b.WriteString(s[i : i+2])
+			i += 2
+		}
+	}
+	return b.String()
+}
+
+// convertMarkdownLinks rewrites [text](http…) into Slack's <url|text>
+// and protects the result. Hand-parsed rather than regex (codex P2):
+// the destination may contain balanced parentheses
+// ([docs](https://host/Function_(mathematics))), which a
+// stop-at-first-')' pattern truncated into a malformed link. The
+// destination ends at the ')' that balances the opener; whitespace or
+// a newline inside aborts the candidate and the text passes through
+// untouched.
+func convertMarkdownLinks(s string, protect func(string) string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] != '[' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		rel := strings.IndexAny(s[i+1:], "[]\n")
+		if rel < 0 || s[i+1+rel] != ']' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		textEnd := i + 1 + rel
+		if textEnd+1 >= len(s) || s[textEnd+1] != '(' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		j := textEnd + 2
+		depth := 1
+		var destB strings.Builder
+		for j < len(s) && depth > 0 {
+			c := s[j]
+			switch {
+			case c == '\\' && j+1 < len(s) && (s[j+1] == '(' || s[j+1] == ')'):
+				// Backslash-escaped parenthesis is URL data (codex
+				// round 2): unescape it into the destination instead
+				// of counting it toward balance.
+				destB.WriteByte(s[j+1])
+				j += 2
+				continue
+			case c == '(':
+				depth++
+			case c == ')':
+				depth--
+			case c == ' ' || c == '\t' || c == '\n':
+				depth = -1
+			}
+			if depth <= 0 {
+				break
+			}
+			destB.WriteByte(c)
+			j++
+		}
+		linkText := s[i+1 : textEnd]
+		dest := destB.String()
+		if depth == 0 && linkText != "" &&
+			(strings.HasPrefix(dest, "http://") || strings.HasPrefix(dest, "https://")) {
+			// Slack mrkdwn control characters in the label would
+			// terminate the <url|label> form early (codex round 3):
+			// `[x > y](…)` must not leak a raw '>' into the link.
+			label := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(linkText)
+			b.WriteString(protect("<" + dest + "|" + label + ">"))
+			i = j + 1
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // postToSlack posts a message via chat.postMessage using the bot token.

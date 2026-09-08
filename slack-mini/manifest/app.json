@@ -20,7 +20,8 @@
       "bot": [
         "app_mentions:read",
         "chat:write",
-        "chat:write.public"
+        "chat:write.public",
+        "users:read"
       ]
     }
   },

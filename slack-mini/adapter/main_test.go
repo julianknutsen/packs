@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -477,6 +479,223 @@ func TestListenUDS(t *testing.T) {
 	}
 }
 
+// compressRetries shrinks the inbound retry schedule so retry-path tests
+// run in milliseconds instead of the production ~2 minutes.
+func compressRetries(t *testing.T) {
+	t.Helper()
+	saved := inboundRetryDelays
+	inboundRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { inboundRetryDelays = saved })
+}
+
+func TestSpoolDirFromEnv(t *testing.T) {
+	base := map[string]string{
+		"SLACK_BOT_TOKEN":      "xoxb-1",
+		"SLACK_SIGNING_SECRET": "secret",
+		"SLACK_WORKSPACE_ID":   "T123",
+		"GC_CITY_NAME":         "mycity",
+	}
+	getenv := func(extra map[string]string) func(string) string {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return func(k string) string { return m[k] }
+	}
+
+	t.Run("explicit override wins", func(t *testing.T) {
+		cfg, err := loadConfigFromEnv(getenv(map[string]string{
+			"SLACK_MINI_SPOOL_DIR":  "/tmp/custom-spool",
+			"GC_SERVICE_STATE_ROOT": "/state/root",
+		}))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.spoolDir != "/tmp/custom-spool" {
+			t.Errorf("spoolDir = %q, want /tmp/custom-spool", cfg.spoolDir)
+		}
+	})
+
+	t.Run("derived from state root", func(t *testing.T) {
+		cfg, err := loadConfigFromEnv(getenv(map[string]string{
+			"GC_SERVICE_STATE_ROOT": "/state/root",
+		}))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := filepath.Join("/state/root", "data", "inbound-spool")
+		if cfg.spoolDir != want {
+			t.Errorf("spoolDir = %q, want %q", cfg.spoolDir, want)
+		}
+	})
+
+	t.Run("unset disables spooling", func(t *testing.T) {
+		cfg, err := loadConfigFromEnv(getenv(nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.spoolDir != "" {
+			t.Errorf("spoolDir = %q, want empty", cfg.spoolDir)
+		}
+	})
+}
+
+// TestDeliverInboundRetriesUntilSuccess confirms a transient gc failure is
+// retried and the spool entry is removed once the forward lands (bug hq-1q1:
+// the adapter has already 200-acked Slack, so it must not drop the event).
+func TestDeliverInboundRetriesUntilSuccess(t *testing.T) {
+	compressRetries(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) < 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	spool := t.TempDir()
+	cfg := config{gcAPIBase: srv.URL, cityName: "c", spoolDir: spool}
+	msg := externalInboundMessage{ProviderMessageID: "1700000000.0001", DedupKey: "slack-1700000000.0001"}
+	path, _ := spoolInbound(spool, msg)
+	if path == "" {
+		t.Fatal("spoolInbound returned no path")
+	}
+
+	deliverInbound(cfg, msg, path)
+
+	if got := calls.Load(); got != 3 {
+		t.Errorf("gc calls = %d, want 3 (two failures then success)", got)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("spool entry not removed after successful delivery: %v", err)
+	}
+}
+
+// TestDeliverInboundDeadLettersOnExhaustion confirms the spool entry
+// survives (in the dead-letter dir) when every forward attempt fails, and
+// that the final log line keeps the "inbound POST failed" marker external
+// log-watchers key on.
+func TestDeliverInboundDeadLettersOnExhaustion(t *testing.T) {
+	compressRetries(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	spool := t.TempDir()
+	cfg := config{gcAPIBase: srv.URL, cityName: "c", spoolDir: spool}
+	msg := externalInboundMessage{
+		ProviderMessageID: "1700000000.0002",
+		DedupKey:          "slack-1700000000.0002",
+		Text:              "lost mention",
+	}
+	path, _ := spoolInbound(spool, msg)
+	if path == "" {
+		t.Fatal("spoolInbound returned no path")
+	}
+
+	deliverInbound(cfg, msg, path)
+
+	wantCalls := int32(len(inboundRetryDelays) + 1)
+	if got := calls.Load(); got != wantCalls {
+		t.Errorf("gc calls = %d, want %d", got, wantCalls)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("spool entry should have moved to dead-letter: %v", err)
+	}
+	deadPath := filepath.Join(spool, "dead", filepath.Base(path))
+	data, err := os.ReadFile(deadPath)
+	if err != nil {
+		t.Fatalf("dead-letter file: %v", err)
+	}
+	var got externalInboundMessage
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("dead-letter decode: %v", err)
+	}
+	if got.Text != "lost mention" || got.DedupKey != msg.DedupKey {
+		t.Errorf("dead-letter content = %+v", got)
+	}
+}
+
+// TestReplaySpoolRedelivers confirms events left in the spool by a previous
+// run (crash mid-retry) are re-forwarded at startup.
+func TestReplaySpoolRedelivers(t *testing.T) {
+	compressRetries(t)
+	var gotText atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var wrap struct {
+			Message externalInboundMessage `json:"message"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&wrap)
+		gotText.Store(wrap.Message.Text)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	spool := t.TempDir()
+	msg := externalInboundMessage{
+		ProviderMessageID: "1700000000.0003",
+		DedupKey:          "slack-1700000000.0003",
+		Text:              "orphaned by crash",
+	}
+	path, _ := spoolInbound(spool, msg)
+	if path == "" {
+		t.Fatal("spoolInbound returned no path")
+	}
+
+	cfg := config{gcAPIBase: srv.URL, cityName: "c", spoolDir: spool}
+	replaySpool(cfg)
+
+	// Replay delivers asynchronously; wait for the spool entry to clear.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("spool entry not delivered within deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got, _ := gotText.Load().(string); got != "orphaned by crash" {
+		t.Errorf("replayed text = %q, want 'orphaned by crash'", got)
+	}
+}
+
+// TestReplaySpoolDeadLettersCorruptEntries confirms an undecodable spool
+// file is quarantined instead of blocking or crash-looping replay.
+func TestReplaySpoolDeadLettersCorruptEntries(t *testing.T) {
+	spool := t.TempDir()
+	corrupt := filepath.Join(spool, "1-corrupt.json")
+	if err := os.WriteFile(corrupt, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	replaySpool(config{gcAPIBase: "http://127.0.0.1:1", cityName: "c", spoolDir: spool})
+
+	// Replay decodes in worker goroutines now; poll for the quarantine.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(corrupt); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("corrupt entry should have moved to dead-letter")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(spool, "dead", "1-corrupt.json")); err != nil {
+		t.Errorf("corrupt entry missing from dead-letter dir: %v", err)
+	}
+}
+
 // TestPostJSONSurfacesErrorStatus confirms a >=400 from gc is an error.
 func TestPostJSONSurfacesErrorStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -487,5 +706,261 @@ func TestPostJSONSurfacesErrorStatus(t *testing.T) {
 	err := postJSON(context.Background(), srv.URL, []byte(`{}`))
 	if err == nil || !strings.Contains(err.Error(), "nope") {
 		t.Fatalf("expected error surfacing body, got %v", err)
+	}
+}
+
+func TestSlackifyMarkdown(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"bold stars", "deploy **now** please", "deploy *now* please"},
+		{"bold underscores", "deploy __now__ please", "deploy *now* please"},
+		{"multiple bolds", "**a** and **b**", "*a* and *b*"},
+		{"strike", "~~gone~~", "~gone~"},
+		{"link", "see [the PR](https://example.com/pr/42) here", "see <https://example.com/pr/42|the PR> here"},
+		{"heading", "# Status\nall green", "*Status*\nall green"},
+		{"mrkdwn bold untouched", "*mayor:* on it", "*mayor:* on it"},
+		{"italic untouched", "_soon_", "_soon_"},
+		{"inline code protected", "run `gc status --json **not bold**`", "run `gc status --json **not bold**`"},
+		{"fenced code protected", "```\n**not bold**\n# not a heading\n```", "```\n**not bold**\n# not a heading\n```"},
+		{"unterminated fence protected", "before **bold**\n```\n**raw**", "before *bold*\n```\n**raw**"},
+		{"handle prefix example", "**mayor:** build is green", "*mayor:* build is green"},
+		{"empty", "", ""},
+		{"plain multiplication untouched", "2 * 3 * 4 = 24", "2 * 3 * 4 = 24"},
+		// codex P2: link destinations must survive the emphasis passes.
+		{"underscores in link destination", "[init](https://host/pkg/__init__.py)", "<https://host/pkg/__init__.py|init>"},
+		{"stars in link destination", "[x](https://host/a**b**c)", "<https://host/a**b**c|x>"},
+		{"underscores in bare url", "see https://host/pkg/__init__.py now", "see https://host/pkg/__init__.py now"},
+		{"tildes in bare url", "https://host/~~archive~~/x", "https://host/~~archive~~/x"},
+		// codex P2: balanced parentheses in link destinations.
+		{"parens in link destination", "[docs](https://host/Function_(mathematics))", "<https://host/Function_(mathematics)|docs>"},
+		{"nested parens with trailing text", "[d](https://h/a_(b_(c))) end", "<https://h/a_(b_(c))|d> end"},
+		// codex P2: multi-backtick code spans protect their contents.
+		{"double backtick span protected", "x ``has `tick` and **raw**`` y", "x ``has `tick` and **raw**`` y"},
+		{"unbalanced backtick run passes through", "a `` b **bold**", "a `` b *bold*"},
+		// codex round 2: embedded ``` inside a code line is not a closer.
+		{"fence with embedded triple backticks", "```\nfmt.Println(\"```\")\n**raw**\n```\nafter **b**", "```\nfmt.Println(\"```\")\n**raw**\n```\nafter *b*"},
+		// codex round 2: escaped parens are URL data.
+		{"escaped paren in link destination", `[x](https://h/a\)b)`, "<https://h/a)b|x>"},
+		// codex round 2: heading hash glued to text is content.
+		{"heading ending in hash", "# C#\nbody", "*C#*\nbody"},
+		{"heading with spaced closer", "## Title ##\nbody", "*Title*\nbody"},
+		// codex round 2: intraword underscores stay literal.
+		{"intraword underscores untouched", "foo__bar__baz", "foo__bar__baz"},
+		{"boundary underscore bold still converts", "say __hi__ now", "say *hi* now"},
+		// codex round 2: trailing emphasis delimiters are not URL bytes.
+		{"bold around bare url", "**see https://example.com**", "*see https://example.com*"},
+	}
+	for _, tc := range cases {
+		if got := slackifyMarkdown(tc.in); got != tc.want {
+			t.Errorf("%s: slackifyMarkdown(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestHandlePostMessageConvertsMarkdown(t *testing.T) {
+	var gotBody slackPostMessageReq
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"ts":"1","channel":"C1"}`))
+	}))
+	defer slack.Close()
+
+	cfg := config{slackAPIBase: slack.URL, botToken: "xoxb-test"}
+	reqBody := `{"channel":"C1","text":"**mayor:** deploy [PR](https://example.com/42) done"}`
+	req := httptest.NewRequest(http.MethodPost, "/post-message", strings.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	handlePostMessage(cfg)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	want := "*mayor:* deploy <https://example.com/42|PR> done"
+	if gotBody.Text != want {
+		t.Errorf("posted text = %q, want %q", gotBody.Text, want)
+	}
+}
+
+func TestResolveUserDisplayNameCachesSuccesses(t *testing.T) {
+	calls := 0
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/users.info" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("user"); got != "U123" {
+			t.Errorf("user param = %q", got)
+		}
+		if auth := r.Header.Get("Authorization"); auth != "Bearer xoxb-test" {
+			t.Errorf("auth = %q", auth)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"user":{"name":"afik","real_name":"Afik Cohen","profile":{"display_name":"Afik","real_name":"Afik Cohen"}}}`))
+	}))
+	defer slack.Close()
+
+	cfg := config{slackAPIBase: slack.URL, botToken: "xoxb-test"}
+	cache := newUserNameCache()
+	if got := resolveUserDisplayName(context.Background(), cache, cfg, "U123"); got != "Afik" {
+		t.Fatalf("resolved = %q, want Afik (profile.display_name preferred)", got)
+	}
+	if got := resolveUserDisplayName(context.Background(), cache, cfg, "U123"); got != "Afik" {
+		t.Fatalf("second resolve = %q", got)
+	}
+	if calls != 1 {
+		t.Errorf("users.info calls = %d, want 1 (cached)", calls)
+	}
+}
+
+func TestResolveUserDisplayNameFallsBackToRawID(t *testing.T) {
+	calls := 0
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error":"missing_scope"}`))
+	}))
+	defer slack.Close()
+
+	cfg := config{slackAPIBase: slack.URL, botToken: "xoxb-test"}
+	cache := newUserNameCache()
+	if got := resolveUserDisplayName(context.Background(), cache, cfg, "U404"); got != "U404" {
+		t.Fatalf("resolved = %q, want raw id fallback", got)
+	}
+	// Failures are negative-cached (a token without users:read fails on
+	// every mention) but expire on the shorter failure TTL, so the fix
+	// heals without a restart once the scope is granted.
+	if got := resolveUserDisplayName(context.Background(), cache, cfg, "U404"); got != "U404" {
+		t.Fatalf("second resolve = %q, want raw id fallback", got)
+	}
+	if calls != 1 {
+		t.Errorf("users.info calls = %d, want 1 (failure negative-cached)", calls)
+	}
+	if _, ok := cache.get("U404", time.Now().Add(userNameFailureTTL+time.Second)); ok {
+		t.Error("negative cache entry should expire after userNameFailureTTL")
+	}
+}
+
+func TestBridgeEventResolvesDisplayName(t *testing.T) {
+	var got externalInboundMessage
+	gc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var wrap struct {
+			Message externalInboundMessage `json:"message"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&wrap)
+		got = wrap.Message
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer gc.Close()
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"user":{"name":"afik","profile":{"display_name":"Afik"}}}`))
+	}))
+	defer slack.Close()
+
+	cfg := config{
+		gcAPIBase:     gc.URL,
+		slackAPIBase:  slack.URL,
+		botToken:      "xoxb-test",
+		cityName:      "mycity",
+		provider:      "slack",
+		workspaceID:   "T123",
+		inboundTarget: "mayor",
+	}
+	event := slackMessageEvent{
+		Type: "app_mention", User: "U777", Text: "<@U0BOT> hello",
+		Channel: "C42", TS: "1700000000.0001", ChannelType: "channel",
+	}
+	raw, _ := json.Marshal(event)
+	bridgeEvent(cfg, slackEventEnvelope{Type: "event_callback", Event: raw})
+
+	if got.Actor.DisplayName != "Afik" {
+		t.Errorf("DisplayName = %q, want resolved 'Afik'", got.Actor.DisplayName)
+	}
+	if got.Actor.ID != "U777" {
+		t.Errorf("Actor.ID = %q, want raw id preserved", got.Actor.ID)
+	}
+}
+
+func TestRegisterAdapterSendsReplyInstructions(t *testing.T) {
+	var got adapterRegisterRequest
+	gc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/extmsg/adapters") {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer gc.Close()
+
+	cfg := config{
+		gcAPIBase:           gc.URL,
+		cityName:            "mycity",
+		provider:            "slack",
+		workspaceID:         "T123",
+		internalCallbackURL: "http://127.0.0.1:1/cb",
+	}
+	if err := registerAdapter(context.Background(), cfg); err != nil {
+		t.Fatalf("registerAdapter: %v", err)
+	}
+	if !strings.Contains(got.ReplyInstructions, "gc slack-mini post-message --channel {conversation_id}[ --thread-ts {thread_ts}]") {
+		t.Errorf("reply_instructions missing Tier-1 reply command: %q", got.ReplyInstructions)
+	}
+	if strings.Contains(strings.ToLower(got.ReplyInstructions), "prefix") {
+		t.Errorf("reply_instructions must not mandate a handle prefix (hq-dy6): %q", got.ReplyInstructions)
+	}
+}
+
+// codex P1: the decoded mention must be durably spooled BEFORE the
+// handler writes the 200 ack — Slack never redelivers after a 200, so
+// an ack-then-async-spool order loses the message to a crash in the
+// enrichment window. The gc stub never answers successfully, so the
+// entry present right after the handler returns proves the write was
+// synchronous with the request, not the delivery goroutine.
+func TestHandleSlackEventsSpoolsBeforeAck(t *testing.T) {
+	spool := t.TempDir()
+	cfg := config{
+		signingSecret: "s3cr3t",
+		gcAPIBase:     "http://127.0.0.1:1", // refused: delivery cannot win the race
+		cityName:      "test-city",
+		provider:      "slack",
+		workspaceID:   "T1",
+		inboundTarget: "mayor",
+		spoolDir:      spool,
+	}
+	raw, _ := json.Marshal(slackMessageEvent{
+		Type: "app_mention", Channel: "C1", User: "U1", TS: "1.0",
+		Text: "<@BOT> hello",
+	})
+	env, _ := json.Marshal(slackEventEnvelope{Type: "event_callback", Event: raw})
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(string(env)))
+	req.Header.Set("X-Slack-Request-Timestamp", ts)
+	req.Header.Set("X-Slack-Signature", signSlack(cfg.signingSecret, ts, env))
+	rec := httptest.NewRecorder()
+	handleSlackEvents(cfg)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	entries, err := os.ReadDir(spool)
+	if err != nil {
+		t.Fatalf("read spool: %v", err)
+	}
+	var jsons, tmps int
+	for _, e := range entries {
+		switch {
+		case strings.HasSuffix(e.Name(), ".json"):
+			jsons++
+		case strings.Contains(e.Name(), ".tmp"):
+			tmps++
+		}
+	}
+	if jsons != 1 {
+		t.Errorf("spool entries at ack time = %d, want 1 (spool must precede the 200)", jsons)
+	}
+	if tmps != 0 {
+		t.Errorf("atomic spool write left %d tmp files behind", tmps)
 	}
 }
