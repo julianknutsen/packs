@@ -164,7 +164,10 @@ nothing).
 # Step 1: Reconcile your patrol wisps to exactly one (town ledger, via gc bd).
 # Collect every open/in_progress patrol wisp assigned to you, keep one, and
 # burn the surplus so restarts never accumulate duplicates. Wisp roots are
-# molecules — filter --type=molecule, never --type=wisp.
+# molecules — filter --type=molecule, never --type=wisp. They are also
+# ephemeral, so they live in the wisps tier that gc bd list hides without
+# --include-infra; drop that flag and these queries return [] even when a
+# wisp is assigned, and you pour a duplicate.
 WISP_IDS=$(
   gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=0 --json | jq -r '.[].id'
   gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id'
@@ -209,7 +212,8 @@ fi
 # poured a next wisp without burning, or a restart may have raced — keep the
 # first and burn the surplus so wisps never accumulate. Wisp roots are
 # molecules (never --type=wisp, which is not a valid gc bd type and matches
-# nothing).
+# nothing), and they are ephemeral, so --include-infra is required here too —
+# gc bd list hides the wisps tier without it.
 OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
 ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
