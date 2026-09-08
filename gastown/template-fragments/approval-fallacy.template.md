@@ -72,8 +72,13 @@ fi
 The push gate is handled inside submit-and-exit itself, and it fails closed:
 `auto_push=false` halts at branch-ready (no push, no refinery handoff); an
 ABSENT `auto_push` on a bead whose DESCRIPTION or NOTES assert a no-push rail
-also halts, and escalates, because absent metadata is not consent; anything
-else pushes and reassigns to the refinery.
+also halts, and escalates, because absent metadata is not consent; metadata the
+gate cannot decode halts and escalates as well (`metadata_unreadable`), because
+unreadable metadata is not absent metadata — it is a recorded decision the gate
+failed to retrieve — as does an `auto_push` value outside the closed vocabulary
+(`false`/`no`/`0` halt, `true`/`yes`/`1` push, case-folded), because a decision
+the gate cannot understand is not consent either; consent pushes and reassigns
+to the refinery.
 
 Polecats do not push to main, close beads, create MR beads, or wait around. If
 work appears already merged, still let submit-and-exit reassign it to the

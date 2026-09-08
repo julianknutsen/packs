@@ -375,15 +375,22 @@ fails to read: `jq`'s `has()` errors on a string, so on a ledger that serves
 evaluate to the empty string and the bead was pushed (gci-to0l). Object, null
 and JSON-string payloads are all read; anything else halts.
 
+The `auto_push` VOCABULARY is closed and case-folded: `false`/`no`/`0` are the
+opt-out, `true`/`yes`/`1` are consent, a key present with a JSON `null` value is
+"nothing recorded". Anything else is an unreadable decision, not consent — the
+key is hand-written by humans following the mayor prompt, and reading `False`
+or `no` as "push" would fail open on exactly the beads that tried hardest to
+say no.
+
 Five outcomes, evaluated in order:
 
 | `auto_push` | Bead prose | Outcome |
 |---|---|---|
-| metadata unreadable | not read | halt at branch-ready **and escalate** — a payload that cannot be read cannot be shown to lack the opt-out |
-| `false` | not read | halt at branch-ready — the explicit opt-out |
-| absent | asserts a no-push rail | halt at branch-ready **and escalate** — ambiguous, a human owns the call |
-| absent | no rail | push + refinery handoff — the normal path |
-| any other value | not read | push + refinery handoff — explicit consent |
+| unreadable payload, or a value outside the vocabulary | not read | halt at branch-ready **and escalate** — a decision that cannot be read or understood cannot be shown to lack the opt-out |
+| `false`, `no`, `0` (any case) | not read | halt at branch-ready — the explicit opt-out |
+| absent, or present with a null value | asserts a no-push rail | halt at branch-ready **and escalate** — ambiguous, a human owns the call |
+| absent, or present with a null value | no rail | push + refinery handoff — the normal path |
+| `true`, `yes`, `1` (any case) | not read | push + refinery handoff — explicit consent |
 
 ```bash
 WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
@@ -405,10 +412,12 @@ BRANCH=$(git branch --show-current)
 # gas-city, flinders, arnotts, detmold) through this gate's own probe shape
 # (gc bd show <id> --json | jq of .[0].metadata | type): every one serves an
 # OBJECT when metadata is present and NULL when it is absent. No ledger serves
-# a string today, so this is a latent trap rather than a live hole — but
-# instruments/no-push-rail-detector.sh records that the shape varies by rig
-# (its META_JQ normalises object / string / null for the same reason), so the
-# normalisation is lifted here now rather than on the day it bites.
+# a string today, so this is a latent trap rather than a live hole — but the
+# shape is not a guarantee this gate owns: metadata is whatever the ledger
+# binding serialises, it varied by rig when the detector this arc grew out of
+# was written (that detector normalises object / string / null for exactly this
+# reason), and nothing pins it. The normalisation is lifted here now rather
+# than on the day it bites.
 #
 #   object -> read it.
 #   null   -> the bead carries no metadata. A legitimate live shape on every
@@ -416,8 +425,12 @@ BRANCH=$(git branch --show-current)
 #             beads across the six queryable ledgers), so it must fall through
 #             to (b) and never halt.
 #   string -> a JSON-encoded object. Parse it, then read it.
-#   anything else, a string that does not parse to an object, or a probe that
-#             fails outright -> UNREADABLE, handled at (a0) below. Note this is
+#   anything else, a string that does not parse to an object, an auto_push
+#             value outside the closed vocabulary, or a probe that fails
+#             outright -> UNREADABLE, handled at (a0) below. The vocabulary is
+#             closed on purpose: the key is hand-written by humans, and reading
+#             `False` or `no` as "any other value -> explicit consent" fails
+#             open on the beads that tried hardest to say no. Note this is
 #             the OPPOSITE default to the (b) prose scan's empty INPUT case:
 #             there, nothing said is a legitimate "no rail"; here, nothing read
 #             is a failure to retrieve a decision that may well exist.
@@ -434,7 +447,12 @@ elif ! AUTO_PUSH=$(printf '%s' "$WORK_JSON" | jq -r '
               elif type == "string" then (fromjson? // "unparseable")
               else "not-an-object" end)
            | if type != "object" then error("metadata is not an object")
-             elif has("auto_push") then (.auto_push | tostring)
+             elif has("auto_push") then (.auto_push | tostring | ascii_downcase
+                   | if   . == "false" or . == "no"  or . == "0" then "false"
+                     elif . == "true"  or . == "yes" or . == "1" then "true"
+                     elif . == "null" then ""
+                     else error("auto_push value is outside the vocabulary")
+                     end)
              else "" end
       end' 2>/dev/null); then
   META_UNREADABLE=1
@@ -454,17 +472,18 @@ if [ -n "$META_UNREADABLE" ]; then
     --set-metadata branch_ready=true \
     --set-metadata halt_reason=metadata_unreadable \
     --set-metadata gc.routed_to="" \
-    --append-notes "Branch ready: the push gate could not read this bead's metadata — the ledger read returned no bead record, or served metadata in a shape the probe cannot decode. An unreadable payload cannot be shown to lack auto_push=false, so the gate halted instead of pushing. Re-read the bead, record the push decision explicitly, then re-sling."
+    --append-notes "Branch ready: the push gate could not read this bead's push decision — the ledger read returned no bead record, the metadata came in a shape the probe cannot decode, or auto_push carried a value outside the vocabulary (false/no/0 to halt, true/yes/1 to push). A decision that cannot be read cannot be shown to lack auto_push=false, so the gate halted instead of pushing. Re-record the push decision in the vocabulary, then re-sling."
   gc mail send "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" \
     -s "HELP: push-gate metadata unreadable on $WORK_BEAD_ID [HIGH]" \
     -m "Halted at branch-ready instead of pushing.
 
 Bead:   $WORK_BEAD_ID
 Branch: $BRANCH (local only — NOT pushed)
-Reason: the ledger read returned no readable bead record, or served the
-        metadata in a shape the gate cannot decode (expected an object, a
-        JSON string, or null). The gate cannot tell 'halt' from 'go', so it
-        halted.
+Reason: the ledger read returned no readable bead record, served the metadata
+        in a shape the gate cannot decode (expected an object, a JSON string,
+        or null), or carried an auto_push value outside the vocabulary
+        (false/no/0 halt, true/yes/1 push, case-folded). The gate cannot tell
+        'halt' from 'go', so it halted.
 
 Resolve: check the ledger is healthy, then record the decision as metadata —
   gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt
@@ -493,20 +512,77 @@ fi
 
 # (b) No decision recorded. Scan DESCRIPTION + NOTES for a no-push rail.
 # Lines about pushing *to main* are a DIFFERENT rail — one every polecat
-# already obeys, since it pushes a feature branch and never main — so they are
-# dropped before matching. Without that filter every bead quoting the standing
-# "polecats do not push to main" rule would halt, and a gate that cries wolf
-# gets routed around. Comments are deliberately out of scope: they are
-# discussion, not standing instructions, and they self-match on any bead that
-# merely talks about no-push rails.
+# already obeys, since it pushes a feature branch and never main — so the
+# PHRASE that states it is stripped out and the REMAINDER is matched. Without
+# that every bead quoting the standing "polecats do not push to main" rule
+# would halt, and a gate that cries wolf gets routed around.
+#
+# Strip the PHRASE, not the LINE. A line-granular exclusion took any real rail
+# that shared a line with a push-to-main mention down with it, and its target
+# list included bare `origin` — the remote this gate is about to push to — so
+# "do not push to origin" was read as the standing rule. MEASURED 2026-09-08
+# against this gate's own shipped patterns: 7 real rail wordings scored zero
+# hits and the gate PUSHED, among them "never push to origin — the customer
+# tenant is frozen" and "Polecats do not push to main. HALT branch-ready for
+# this bead." Narrowing the destination alone closes only 5 of those 7; the
+# other 2 need the strip, because rail and quote share one line. All 15
+# rail-detection rows keep their verdicts under the strip.
+#
+# The destination must end on a word boundary, or "never push to
+# origin/main-line-customer" loses its rail to the `origin/main` prefix. `/` is
+# in the protected class for the same reason `-` and `_` are: "never push to
+# main/customer" names a branch UNDER main, not main, and no English sentence
+# continues "main/…". `.` cannot join them — "Polecats never push to main. Open
+# a PR." would keep its quote and cry wolf — so the dotted-branch case stays in
+# the residual below. The text is downcased first because the strip has to catch
+# "Do Not Push To Main" and sed's case-insensitive flag is GNU-only; the match
+# grep is already -i, so downcasing upstream costs nothing.
+#
+# KNOWN RESIDUAL, two shapes, both measured 2026-09-09 and both ended by
+# recording the rail as auto_push=false:
+#   1. A rail whose ONLY signal sits inside the stripped phrase still reads as
+#      the standing rule — "never push to main or anywhere else" pushes. So does
+#      the dotted-branch form "never push to main.customer, it is frozen", which
+#      is the same shape: `.` is unprotectable without sentence semantics.
+#      Separating these needs sentence semantics, not a regex, and the cheap cure
+#      (keep the line whenever the strip would remove every signal) halts every
+#      bead that quotes the standing rule, which is the cry-wolf failure this
+#      filter exists to prevent.
+#   2. A NORMATIVE sentence about some other system's pushing — "Establish why
+#      the sync should not push twice" — halts, because the match arms below
+#      cannot tell a requirement about the subject under repair from a rail about
+#      this branch. Over-halting is the recoverable direction (a human records
+#      auto_push and re-slings) where a missed rail is not, so this is left as a
+#      halt rather than narrowed.
+#
+# Comments are deliberately out of scope: they are discussion, not standing
+# instructions, and they self-match on any bead that merely talks about
+# no-push rails.
 if [ -z "$AUTO_PUSH" ]; then
-  RAIL_HIT=$(printf '%s' "$WORK_JSON" \
-    | jq -r '(.[0].description // ""), (.[0].notes // "")' \
-    | grep -Eiv 'push(ing|es)?[[:space:]]+(directly[[:space:]]+)?to[[:space:]]+(main|master|trunk|origin)' \
-    | grep -Eic 'no[- ]push([^e]|$)|do not push|don.t push|never push([^e]|$)|(mayor|operator|human) publishes|halt[- ]*(at[- ]+)?branch[- ]ready|branch[- ]ready[- ]+halt|auto_push[[:space:]]*=[[:space:]]*false')
-  # ${RAIL_HIT:-1} — grep -c always prints a count when it runs, so an EMPTY
-  # result means the scan itself broke. Fail closed on that too: an
-  # undetermined rail is treated as an asserted one.
+  # Extract, downcase and strip in CHECKED stages. grep -c prints a count
+  # whenever it runs, so a failure INSIDE one long pipe arrives at the match
+  # grep as an empty stream and scores 0 — a push. Each stage that can fail is
+  # its own command and any failure sets RAIL_HIT=1: an undetermined rail is
+  # treated as an asserted one. ${RAIL_HIT:-1} then covers the last stage,
+  # where an empty result can only mean grep itself never ran.
+  RAIL_HIT=""
+  if ! PROSE=$(printf '%s' "$WORK_JSON" | jq -r '(.[0].description // ""), (.[0].notes // "")' 2>/dev/null); then
+    RAIL_HIT=1
+  elif ! LOWER=$(printf '%s' "$PROSE" | tr '[:upper:]' '[:lower:]'); then
+    RAIL_HIT=1
+  elif ! SCAN=$(printf '%s' "$LOWER" | sed -E 's#push(ing|es)?[[:space:]]+(directly[[:space:]]+)?to[[:space:]]+(origin/)?(main|master|trunk)([^-[:alnum:]_/]|$)# #g'); then
+    RAIL_HIT=1
+  else
+    # The match arms mirror the vocabulary this gate blesses elsewhere, or the
+    # gate fails open on the prose channel for words it accepts in metadata.
+    # `must not push`/`should not push` carry the same ([^e]|$) guard as
+    # `never push` for consistency, though a modal cannot take the -es/-ed form
+    # that guard exists for, so on those two arms it only catches ungrammatical
+    # prose. The value arm takes the FULL closed vocabulary — `no` and `0` are
+    # the same word as `false` at :450-455, and reading them as consent here
+    # while halting on them there is the mismatch this gate is about.
+    RAIL_HIT=$(printf '%s' "$SCAN" | grep -Eic 'no[- ]push([^e]|$)|do not push|don.t push|never push([^e]|$)|(must|should) not push([^e]|$)|(mayor|operator|human) publishes|halt[- ]*(at[- ]+)?branch[- ]ready|branch[- ]ready[- ]+halt|auto_push[[:space:]]*=[[:space:]]*(false|no|0)')
+  fi
   if [ "${RAIL_HIT:-1}" -gt 0 ]; then
     echo "NO-PUSH RAIL IN PROSE + auto_push ABSENT — halting at branch-ready (fail closed) and escalating."
     # --append-notes, NEVER --notes. This halt cites a rail that is frequently

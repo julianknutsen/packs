@@ -149,17 +149,63 @@ judgement; the push gate is a shell test on `metadata.auto_push`.
 - WRONG: description says "branch + HALT branch-ready, mayor publishes" — and nothing else
 - RIGHT: that description, plus `gc bd update <id> --set-metadata auto_push=false`
 
+The vocabulary is closed and case-folded: `false`/`no`/`0` halt, `true`/`yes`/`1`
+push. Anything else is not read as consent — it halts and escalates, the same as
+metadata the gate cannot decode. A `null` value is the exception, because it is
+JSON's own spelling of "nothing recorded": it is treated as an ABSENT key, not as
+a halt, so it falls through to the prose scan and a rail-less bead still pushes.
+Record one of the six words; do not record `null` expecting a halt.
+
 `mol-polecat-work` fails closed on the mismatch — a bead whose prose asserts a
 no-push rail with no `auto_push` key halts at branch-ready and escalates rather
 than pushing. That is a backstop, not a substitute: it costs a round trip and a
-human read every time, and it can only see DESCRIPTION and NOTES, so a rail
-that lives in a comment is invisible to it.
+human read every time, it can only see DESCRIPTION and NOTES, so a rail that
+lives in a comment is invisible to it, and it only covers the polecat's own
+submit-and-exit. A polecat that DIES mid-work is recovered by the witness's
+orphan salvage, which pushes the branch without consulting `auto_push` or the
+prose at all — so on a bead that must not reach the remote, the metadata is the
+record that survives the crash, and even it is not enforced on that path.
 
 **Rule**: if a rail changes what the polecat DOES, it belongs in metadata. Use
 `--set-metadata` (never bare `--metadata`) so `branch` and `gc.routed_to`
-survive the write. Reading it back, prefer
-`if has("auto_push") then .auto_push else "absent" end` over `.auto_push // "-"`
-— the `//` idiom treats the legitimate value `false` as absent.
+survive the write. Read it back with the shape NORMALISED before the key test:
+
+```bash
+WORK_JSON=$(gc bd show <id> --json)
+if [ -z "$WORK_JSON" ]; then
+  echo "unreadable"   # the ledger read failed; retry. NOT the same as "absent".
+else
+  printf '%s' "$WORK_JSON" | jq -r '
+    if (type != "array") or (length == 0) or ((.[0] | type) != "object")
+    then "unreadable"
+    else (.[0].metadata
+          | if type == "string" then (fromjson? // "unreadable")
+            elif type == "null" then {}
+            else . end)
+         | if type != "object" then "unreadable"
+           elif has("auto_push")
+           then (if .auto_push == null then "absent" else (.auto_push | tostring) end)
+           else "absent" end
+    end'
+fi
+```
+
+`.auto_push // "-"` reports the legitimate value `false` as absent, and a bare
+`has("auto_push")` ERRORS on a `metadata` payload served as a JSON string — jq
+exits 5 printing nothing, so the read shows up as "no key" on the beads most
+worth checking. That is the same shape trap `mol-polecat-work`'s own probe
+normalises; the three answers above are its three outcomes.
+
+The guards around the jq are the rest of that mirror, and they exist because a
+FAILED READ must not be reportable as a settled answer. `jq` prints nothing and
+exits 0 on empty input, so an unguarded pipe answers a dead ledger with silence —
+indistinguishable from "the write did not land", which invites a re-write of a
+bead whose state you never actually read. `[]` is the same trap one level in: a
+payload with no bead record is not a bead without metadata. The gate halts on
+both (`[ -z "$WORK_JSON" ]` and `error("no bead record in the payload")` →
+`metadata_unreadable`), so this reads them the same way. A `null` VALUE is the
+one case that is not an error: it maps to `absent`, matching the gate, rather
+than printing the bare word `null` for you to misread as a recorded decision.
 
 ## Responsibilities
 
