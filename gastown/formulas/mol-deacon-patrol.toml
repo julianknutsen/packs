@@ -5,14 +5,14 @@ Deacon patrol loop. Poured as a root-only wisp on startup:
   gc bd update $WISP --assignee=$GC_AGENT
 
 Each wisp is ONE iteration: check inbox, run town-wide coordination
-tasks, pour the next iteration. On crash, re-read the formula steps
+tasks, prepare the next iteration. On crash, re-read the formula steps
 and determine where you left off from context.
 
 Formula steps are NOT materialized as child beads. Read the step
 descriptions below and work through them in order.
 
-The loop mechanism: every exit path (happy or early) pours the next
-wisp before burning this one. The prompt only bootstraps the first wisp.
+The loop mechanism: every exit path (happy or early) prepares one successor
+before burning this wisp. The prompt only bootstraps the first wisp.
 
 ## Deacon Role
 
@@ -510,12 +510,12 @@ Close this step after check."""
 
 [[steps]]
 id = "next-iteration"
-title = "Pour next iteration and loop"
+title = "Prepare next iteration and loop"
 needs = ["system-health"]
 description = """
 **Config: event_timeout = {{event_timeout}}**
 
-End of patrol cycle. Pour the next iteration, then wait or exit.
+End of patrol cycle. Reuse or pour the next iteration, then wait or exit.
 
 **1. Context check:**
 
@@ -532,40 +532,131 @@ gc mail inbox
 ```
 Handle any urgent messages that arrived during patrol. Archive the rest.
 
-**3. Resolve current wisp and pour next iteration BEFORE burning:**
-```bash
-CURRENT_WISP=${GC_BEAD_ID:-}
-if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
-fi
+**3. Reconcile current/queued roots, then pour only if needed:**
 
-NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
-if [ -z "$NEXT" ]; then
-  echo "Could not pour next deacon wisp; not burning."
-  gc runtime drain-ack
+Ephemeral patrol roots are invisible to `gc bd list`. Query both open and
+in-progress ephemeral rows, filter the exact formula title and either the
+canonical assignee or an unassigned open root, keep the active/current root
+plus at most one queued successor, and re-read every surplus before cleanup.
+An unassigned open match closes the crash window after pour commits but before
+assignment. Never burn surplus in-progress or materialized work.
+```bash
+PATROL_FORMULA=mol-deacon-patrol
+if [ -z "${GC_AGENT:-}" ]; then
+  echo "GC_AGENT is empty; refusing patrol-root reconciliation."
   exit 1
 fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-  echo "Could not assign next deacon wisp; not burning."
-  gc runtime drain-ack
+if ! PATROL_QUERY=$(gc bd ${GC_RIG:+--rig="$GC_RIG"} query --json \
+  'ephemeral=true AND (status=open OR status=in_progress)' --limit=0); then
+  echo "Could not query deacon patrol roots; not pouring or burning."
+  exit 1
+fi
+PATROL_ROOTS=$(printf '%s\n' "$PATROL_QUERY" | jq -c \
+  --arg agent "$GC_AGENT" --arg formula "$PATROL_FORMULA" '
+  [.[] | select(.ephemeral == true)
+    | select((.issue_type // .type // "") == "molecule")
+    | select((.title // "") == $formula)
+    | select((.assignee // "") == $agent
+        or ((.assignee // "") == "" and .status == "open"))]
+  | sort_by([
+      (if .status == "in_progress" then 0 else 1 end),
+      (if (.assignee // "") == $agent then 0 else 1 end),
+      (.created_at // ""), (.id // "")
+    ])') || { echo "Could not parse deacon patrol roots."; exit 1; }
+CURRENT_WISP=$(printf '%s\n' "$PATROL_ROOTS" | jq -r --arg current "${GC_BEAD_ID:-}" '
+  ([.[] | select($current != "" and .id == $current)][0].id //
+   [.[] | select(.status == "in_progress")][0].id // empty)')
+NEXT=$(printf '%s\n' "$PATROL_ROOTS" | jq -r --arg current "$CURRENT_WISP" '
+  [.[] | select(.status == "open" and .id != $current)][0].id // empty')
+for extra in $(printf '%s\n' "$PATROL_ROOTS" | jq -r \
+  --arg current "$CURRENT_WISP" --arg next "$NEXT" \
+  '.[] | select(.id != $current and .id != $next) | .id'); do
+  EXTRA_STATE=$(gc bd ${GC_RIG:+--rig="$GC_RIG"} show "$extra" --json 2>/dev/null || printf '[]')
+  if printf '%s\n' "$EXTRA_STATE" | jq -e --arg id "$extra" --arg agent "$GC_AGENT" \
+    --arg formula "$PATROL_FORMULA" '
+      (.[0] // {}) as $w
+      | $w.id == $id and $w.ephemeral == true
+        and ($w.issue_type // $w.type // "") == "molecule"
+        and ($w.title // "") == $formula
+        and (($w.assignee // "") == $agent or ($w.assignee // "") == "")
+        and $w.status == "open"
+        and ($w.dependency_count // -1) == 0
+        and ($w.dependent_count // -1) == 0' >/dev/null; then
+    gc bd ${GC_RIG:+--rig="$GC_RIG"} mol burn "$extra" --force ||
+      { echo "Could not burn empty surplus patrol root $extra."; exit 1; }
+  else
+    echo "Preserving non-empty or active surplus patrol root $extra for inspection."
+  fi
+done
+if [ -z "$NEXT" ]; then
+  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not create next deacon wisp; not burning."
+    exit 1
+  fi
+fi
+NEXT_STATE=$(gc bd ${GC_RIG:+--rig="$GC_RIG"} show "$NEXT" --json 2>/dev/null || printf '[]')
+if ! printf '%s\n' "$NEXT_STATE" | jq -e --arg id "$NEXT" --arg agent "$GC_AGENT" \
+  --arg formula "$PATROL_FORMULA" '
+    (.[0] // {}) as $w
+    | $w.id == $id and $w.ephemeral == true
+      and ($w.issue_type // $w.type // "") == "molecule"
+      and ($w.title // "") == $formula
+      and (($w.assignee // "") == $agent or ($w.assignee // "") == "")
+      and $w.status == "open"' >/dev/null; then
+  echo "Queued deacon successor changed during reconciliation; not burning."
   exit 1
 fi
 ```
 
 **4. Burn this wisp before waiting:**
 ```bash
-if [ -n "$CURRENT_WISP" ]; then
-  gc bd mol burn "$CURRENT_WISP" --force
-else
-  echo "Could not resolve current deacon wisp; not burning."
-  gc runtime drain-ack
+if [ -z "$CURRENT_WISP" ]; then
+  echo "Could not resolve current deacon wisp; preserving queued $NEXT."
+  exit 1
+fi
+CURRENT_STATE=$(gc bd ${GC_RIG:+--rig="$GC_RIG"} show "$CURRENT_WISP" --json 2>/dev/null || printf '[]')
+if ! printf '%s\n' "$CURRENT_STATE" | jq -e --arg id "$CURRENT_WISP" --arg agent "$GC_AGENT" \
+  --arg formula "$PATROL_FORMULA" '
+    (.[0] // {}) as $w
+    | $w.id == $id and $w.ephemeral == true
+      and ($w.issue_type // $w.type // "") == "molecule"
+      and ($w.assignee // "") == $agent and ($w.title // "") == $formula
+      and $w.status == "in_progress"
+      and ($w.dependency_count // -1) == 0
+      and ($w.dependent_count // -1) == 0' >/dev/null; then
+  echo "Current deacon root changed during reconciliation; not burning."
+  exit 1
+fi
+if ! gc bd ${GC_RIG:+--rig="$GC_RIG"} update "$NEXT" --assignee="$GC_AGENT"; then
+  echo "Could not assign deacon successor $NEXT; not burning."
+  exit 1
+fi
+NEXT_STATE=$(gc bd ${GC_RIG:+--rig="$GC_RIG"} show "$NEXT" --json 2>/dev/null || printf '[]')
+if ! printf '%s\n' "$NEXT_STATE" | jq -e --arg id "$NEXT" --arg agent "$GC_AGENT" \
+  --arg formula "$PATROL_FORMULA" '
+    (.[0] // {}) as $w
+    | $w.id == $id and $w.ephemeral == true
+      and ($w.issue_type // $w.type // "") == "molecule"
+      and ($w.assignee // "") == $agent and ($w.title // "") == $formula
+      and $w.status == "open"' >/dev/null; then
+  echo "Could not confirm assigned deacon successor $NEXT; not burning."
+  exit 1
+fi
+if ! gc bd mol burn "$CURRENT_WISP" --force; then
+  echo "Could not burn current deacon wisp; successor remains queued."
+  exit 1
+fi
+if ! gc bd ${GC_RIG:+--rig="$GC_RIG"} update "$NEXT" \
+  --status=in_progress --assignee="$GC_AGENT"; then
+  echo "Could not mark deacon successor $NEXT current; it remains recoverable."
   exit 1
 fi
 ```
 
 Do not sleep with the current wisp still open. The backoff belongs to the
 already-assigned successor wisp; if the session restarts during the sleep, the
-successor remains the single resumable patrol item.
+successor is promoted to the single durable current patrol item.
 
 **5. Exit this turn:**
 Write exactly:

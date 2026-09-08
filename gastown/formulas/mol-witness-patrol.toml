@@ -4,7 +4,7 @@ Witness patrol loop. Poured as a root-only wisp on startup:
   gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}'
   gc bd update $WISP --assignee=$GC_AGENT
 
-Each wisp is ONE iteration: check for work, patrol, pour the next
+Each wisp is ONE iteration: check for work, patrol, prepare the next
 iteration. On crash, re-read the formula steps and determine where
 you left off from context (bead state, mail state, last action).
 
@@ -503,16 +503,16 @@ polecats, systemic issue).
 **Exit criteria:** All active polecat work beads assessed. Warrants
 filed for stuck agents. Or no stuck polecats found. Continue to
 `next-iteration` — do NOT exit the wisp here. The `next-iteration` step
-is the only place that pours the next wisp and burns this one."""
+is the only place that prepares the next wisp and burns this one."""
 
 [[steps]]
 id = "next-iteration"
-title = "Pour next iteration and loop"
+title = "Prepare next iteration and loop"
 needs = ["check-polecat-health"]
 description = """
 **Config: event_timeout = {{event_timeout}}**
 
-End of patrol cycle. Pour the next iteration, then wait or exit.
+End of patrol cycle. Reuse or pour the next iteration, then wait or exit.
 
 **1. Context check:**
 
@@ -523,28 +523,126 @@ gc runtime request-restart
 This blocks forever. The controller restarts you. The next wisp
 is already assigned — the new session resumes from context.
 
-**2. Pour next iteration BEFORE burning (reconcile to exactly one):**
+**2. Reconcile current/queued roots, then pour only if needed:**
 
-Reuse an already-queued wisp instead of pouring a duplicate. A prior cycle
-may have poured a next wisp without burning, or a restart may have raced —
-keep one open patrol wisp and burn any surplus, so wisps never accumulate.
-Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
-valid gc bd type and matches nothing).
+Ephemeral patrol roots are invisible to `gc bd list`. Query both open and
+in-progress ephemeral rows, filter the exact formula title and either the
+canonical assignee or an unassigned open root, keep the active/current root
+plus at most one queued successor, and re-read every surplus before cleanup.
+An unassigned open match closes the crash window after pour commits but before
+assignment. Never burn surplus in-progress or materialized work.
 ```bash
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
-NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
-for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
-  gc bd mol burn "$extra" --force
+PATROL_FORMULA=mol-witness-patrol
+if [ -z "${GC_AGENT:-}" ]; then
+  echo "GC_AGENT is empty; refusing patrol-root reconciliation."
+  exit 1
+fi
+if ! PATROL_QUERY=$(gc bd ${GC_RIG:+--rig="$GC_RIG"} query --json \
+  'ephemeral=true AND (status=open OR status=in_progress)' --limit=0); then
+  echo "Could not query witness patrol roots; not pouring or burning."
+  exit 1
+fi
+PATROL_ROOTS=$(printf '%s\n' "$PATROL_QUERY" | jq -c \
+  --arg agent "$GC_AGENT" --arg formula "$PATROL_FORMULA" '
+  [.[] | select(.ephemeral == true)
+    | select((.issue_type // .type // "") == "molecule")
+    | select((.title // "") == $formula)
+    | select((.assignee // "") == $agent
+        or ((.assignee // "") == "" and .status == "open"))]
+  | sort_by([
+      (if .status == "in_progress" then 0 else 1 end),
+      (if (.assignee // "") == $agent then 0 else 1 end),
+      (.created_at // ""), (.id // "")
+    ])') || { echo "Could not parse witness patrol roots."; exit 1; }
+CURRENT_WISP=$(printf '%s\n' "$PATROL_ROOTS" | jq -r --arg current "${GC_BEAD_ID:-}" '
+  ([.[] | select($current != "" and .id == $current)][0].id //
+   [.[] | select(.status == "in_progress")][0].id // empty)')
+NEXT=$(printf '%s\n' "$PATROL_ROOTS" | jq -r --arg current "$CURRENT_WISP" '
+  [.[] | select(.status == "open" and .id != $current)][0].id // empty')
+for extra in $(printf '%s\n' "$PATROL_ROOTS" | jq -r \
+  --arg current "$CURRENT_WISP" --arg next "$NEXT" \
+  '.[] | select(.id != $current and .id != $next) | .id'); do
+  EXTRA_STATE=$(gc bd ${GC_RIG:+--rig="$GC_RIG"} show "$extra" --json 2>/dev/null || printf '[]')
+  if printf '%s\n' "$EXTRA_STATE" | jq -e --arg id "$extra" --arg agent "$GC_AGENT" \
+    --arg formula "$PATROL_FORMULA" '
+      (.[0] // {}) as $w
+      | $w.id == $id and $w.ephemeral == true
+        and ($w.issue_type // $w.type // "") == "molecule"
+        and ($w.title // "") == $formula
+        and (($w.assignee // "") == $agent or ($w.assignee // "") == "")
+        and $w.status == "open"
+        and ($w.dependency_count // -1) == 0
+        and ($w.dependent_count // -1) == 0' >/dev/null; then
+    gc bd ${GC_RIG:+--rig="$GC_RIG"} mol burn "$extra" --force ||
+      { echo "Could not burn empty surplus patrol root $extra."; exit 1; }
+  else
+    echo "Preserving non-empty or active surplus patrol root $extra for inspection."
+  fi
 done
 if [ -z "$NEXT" ]; then
-  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
-  gc bd update "$NEXT" --assignee="$GC_AGENT"
+  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not create next witness wisp; not burning."
+    exit 1
+  fi
+fi
+NEXT_STATE=$(gc bd ${GC_RIG:+--rig="$GC_RIG"} show "$NEXT" --json 2>/dev/null || printf '[]')
+if ! printf '%s\n' "$NEXT_STATE" | jq -e --arg id "$NEXT" --arg agent "$GC_AGENT" \
+  --arg formula "$PATROL_FORMULA" '
+    (.[0] // {}) as $w
+    | $w.id == $id and $w.ephemeral == true
+      and ($w.issue_type // $w.type // "") == "molecule"
+      and ($w.title // "") == $formula
+      and (($w.assignee // "") == $agent or ($w.assignee // "") == "")
+      and $w.status == "open"' >/dev/null; then
+  echo "Queued witness successor changed during reconciliation; not burning."
+  exit 1
 fi
 ```
 
 **3. Burn this wisp:**
 ```bash
-gc bd mol burn <this-wisp-id> --force
+if [ -z "$CURRENT_WISP" ]; then
+  echo "Could not resolve current witness wisp; preserving queued $NEXT."
+  exit 1
+fi
+CURRENT_STATE=$(gc bd ${GC_RIG:+--rig="$GC_RIG"} show "$CURRENT_WISP" --json 2>/dev/null || printf '[]')
+if ! printf '%s\n' "$CURRENT_STATE" | jq -e --arg id "$CURRENT_WISP" --arg agent "$GC_AGENT" \
+  --arg formula "$PATROL_FORMULA" '
+    (.[0] // {}) as $w
+    | $w.id == $id and $w.ephemeral == true
+      and ($w.issue_type // $w.type // "") == "molecule"
+      and ($w.assignee // "") == $agent and ($w.title // "") == $formula
+      and $w.status == "in_progress"
+      and ($w.dependency_count // -1) == 0
+      and ($w.dependent_count // -1) == 0' >/dev/null; then
+  echo "Current witness root changed during reconciliation; not burning."
+  exit 1
+fi
+if ! gc bd ${GC_RIG:+--rig="$GC_RIG"} update "$NEXT" --assignee="$GC_AGENT"; then
+  echo "Could not assign witness successor $NEXT; not burning."
+  exit 1
+fi
+NEXT_STATE=$(gc bd ${GC_RIG:+--rig="$GC_RIG"} show "$NEXT" --json 2>/dev/null || printf '[]')
+if ! printf '%s\n' "$NEXT_STATE" | jq -e --arg id "$NEXT" --arg agent "$GC_AGENT" \
+  --arg formula "$PATROL_FORMULA" '
+    (.[0] // {}) as $w
+    | $w.id == $id and $w.ephemeral == true
+      and ($w.issue_type // $w.type // "") == "molecule"
+      and ($w.assignee // "") == $agent and ($w.title // "") == $formula
+      and $w.status == "open"' >/dev/null; then
+  echo "Could not confirm assigned witness successor $NEXT; not burning."
+  exit 1
+fi
+if ! gc bd mol burn "$CURRENT_WISP" --force; then
+  echo "Could not burn current witness wisp; successor remains queued."
+  exit 1
+fi
+if ! gc bd ${GC_RIG:+--rig="$GC_RIG"} update "$NEXT" \
+  --status=in_progress --assignee="$GC_AGENT"; then
+  echo "Could not mark witness successor $NEXT current; it remains recoverable."
+  exit 1
+fi
 ```
 
 **4. Exit this turn:**
