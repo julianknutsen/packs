@@ -1553,7 +1553,7 @@ const (
 	// slackMaxMessageLength is Slack's chat.postMessage ceiling.
 	slackMaxMessageLength = 40000
 	// referenceMarkerOverhead is the two-newline separator plus the fixed-width
-	// marker appended by handlePublish for keyed messages.
+	// marker appended by stampReferenceMarker for keyed messages.
 	referenceMarkerOverhead = 2 + len("_ref:") + 12 + len("_")
 )
 
@@ -1564,16 +1564,16 @@ const (
 //
 // Readback contract, for whatever reads these markers back. This comment is
 // the normative statement of the scheme; the CHANGELOG entry and the stamp
-// guard in handlePublish point here rather than restating it, so there is one
-// place to edit when the contract changes:
+// guard in stampReferenceMarker point here rather than restating it, so there
+// is one place to edit when the contract changes:
 //
 //   - Marker absence means UNKNOWN, never undelivered. Everything posted
 //     before this change is unmarked; keyed publishes with empty text are not
 //     stamped; text that cannot fit the marker under Slack's ceiling is posted
-//     unstamped (see handlePublish); and keyed file publishes are outside the
-//     contract entirely — handlePublishFile ignores IdempotencyKey and uploads
-//     without a marker, so a reader sweeping "all keyed outbound" will not
-//     find file deliveries.
+//     unstamped (see stampReferenceMarker); and keyed file publishes are
+//     outside the contract entirely — handlePublishFile ignores IdempotencyKey
+//     and uploads without a marker, so a reader sweeping "all keyed outbound"
+//     will not find file deliveries.
 //   - The scan surface is not conversations.history alone. A keyed publish
 //     carrying reply_to_message_id is posted with thread_ts, and history does
 //     not return thread replies — the adapter reads its own threads back
@@ -1601,6 +1601,93 @@ const (
 //     deliberate follow-up work, not an oversight here.
 func referenceMarker(idempotencyKey string) string {
 	return "_ref:" + referenceSuffix(idempotencyKey) + "_"
+}
+
+// stampReferenceMarker returns the text handlePublish should post: rewrittenText
+// with the reference marker appended when the marker is both meaningful and
+// survivable, and rewrittenText unchanged otherwise. The two skip cases are why
+// the readback contract on referenceMarker treats marker absence as UNKNOWN.
+//
+// Empty text: a keyed publish carrying no text failed loudly at base — Slack
+// answers no_text, the receipt is Delivered:false with FailureKind "permanent".
+// Stamping unconditionally posts a marker-only message, which Slack accepts,
+// converting that visible failure into Delivered:true plus a real MessageID for
+// a payload that delivered nothing — and dedup then caches that receipt, so a
+// legitimate retry on the same key replays "delivered" instead of re-posting.
+// `gc slack publish --idempotency-key K --body-file <empty file>` arrives here
+// with exactly that shape, because _load_body tests the truthiness of the path,
+// not the file contents.
+//
+// Over the ceiling: Slack truncates text past slackMaxMessageLength from the end
+// rather than rejecting it, and the marker is the tail of the string, so
+// stamping an oversized message delivers a mangled partial marker that matches
+// nothing on readback. Skipping keeps the caller's text whole (trimming it to
+// make room would trade their content for our bookkeeping) and leaves an honest
+// absence, which the readback contract already requires readers to treat as
+// unknown. That contract is stated normatively on referenceMarker; this comment
+// only covers why the stamp is skipped, so the two cannot drift apart.
+//
+// Both are measured on the rewritten text because that is what is actually
+// posted: the alias rewrite can expand @handle into <@U…>, so a caller that
+// sized itself to the advertised capability can still land over the budget here.
+// len is bytes while Slack counts characters; for multibyte text that
+// over-counts, which can only make this skip a marker that would have fit, never
+// stamp one that will not.
+//
+// Only the fit check has a reachable input distinguishing the rewritten text
+// from the request text, and the alias-rewrite case in
+// TestHandlePublishSkipsReferenceMarkerWhenItCannotFitUnderSlackCeiling pins it.
+// The emptiness check cannot be told apart the same way today: rewrite returns
+// text unchanged when it is empty, and parseUserAliasMap rejects any target
+// slackMentionFor does not recognize, so no loadable alias map can rewrite
+// non-empty text to "". The rewritten text is still the right operand — it is
+// what gets posted — but that half is defensive, and a test asserting it would
+// have to hand-build a map the loader cannot produce, which would pin an
+// unreachable state rather than a behavior.
+func stampReferenceMarker(rewrittenText, idempotencyKey, conversationID string) string {
+	if idempotencyKey == "" || rewrittenText == "" {
+		return rewrittenText
+	}
+	if len(rewrittenText)+referenceMarkerOverhead <= slackMaxMessageLength {
+		return rewrittenText + "\n\n" + referenceMarker(idempotencyKey)
+	}
+	// rewritten=, not text=: this is the post-rewrite length the budget was
+	// measured against, while the main publish log in handlePublish reports the
+	// request length under text=. Two adjacent lines of one request carrying the
+	// same label with different quantities is what makes a grep on text=
+	// ambiguous.
+	log.Printf("publish: rewritten=%dch leaves no room for the reference marker (ceiling=%d overhead=%d) idem=%s conv=%s -> posting unstamped; this delivery is not readable back",
+		len(rewrittenText), slackMaxMessageLength, referenceMarkerOverhead,
+		idempotencyKey, conversationID)
+	return rewrittenText
+}
+
+// surfaceSlackTruncation records a delivered-but-truncated publish on the
+// receipt and in the log. postedLen is the length of the text that actually
+// reached Slack, after the alias rewrite and the marker stamp.
+//
+// A delivered-but-truncated message is still ok:true with a real message_id, so
+// none of the receipt's named fields can show it. On a keyed publish the marker
+// is the tail of the text, so truncation is precisely the case where delivery
+// succeeded but readback will not find it. Log it for the operator and put it on
+// the receipt for the caller: a log line cannot be observed by the reconciler
+// this scheme exists to serve, and it is the caller — not this process — that
+// knows whether the message was keyed. Routed through metadata because that is
+// the only additive channel gc actually carries through; see
+// publishReceipt.Metadata.
+func surfaceSlackTruncation(receipt *publishReceipt, req publishRequest, postedLen int, resp *slackPostMessageResp) {
+	for _, warning := range resp.ResponseMetadata.Warnings {
+		if warning != "message_truncated" {
+			continue
+		}
+		log.Printf("publish: slack truncated the posted text (posted=%dch ceiling=%d) idem=%s conv=%s ts=%s -> any reference marker did not survive",
+			postedLen, slackMaxMessageLength, req.IdempotencyKey,
+			req.Conversation.ConversationID, resp.TS)
+		if receipt.Metadata == nil {
+			receipt.Metadata = map[string]string{}
+		}
+		receipt.Metadata["truncated"] = "true"
+	}
 }
 
 func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap, dedup *publishDedupCache) http.HandlerFunc {
@@ -1647,65 +1734,13 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 		// and a nil/empty map leave the text untouched, so this is a no-op
 		// for installs that haven't curated slack-user-aliases.json.
 		rewrittenText := userAliases.rewrite(req.Text)
+		// stampReferenceMarker decides whether the marker is appended, and
+		// documents why each skip case is the right call; the readback contract
+		// those skips feed is stated normatively on referenceMarker.
 		post := slackPostMessageReq{
 			Channel:  req.Conversation.ConversationID,
-			Text:     rewrittenText,
+			Text:     stampReferenceMarker(rewrittenText, req.IdempotencyKey, req.Conversation.ConversationID),
 			ThreadTS: req.ReplyToMessageID,
-		}
-		// Stamp only when the marker is both meaningful and survivable.
-		//
-		// Empty text: a keyed publish carrying no text failed loudly at base —
-		// Slack answers no_text, the receipt is Delivered:false with
-		// FailureKind "permanent". Stamping unconditionally posts a
-		// marker-only message, which Slack accepts, converting that visible
-		// failure into Delivered:true plus a real MessageID for a payload that
-		// delivered nothing — and dedup then caches that receipt, so a
-		// legitimate retry on the same key replays "delivered" instead of
-		// re-posting. `gc slack publish --idempotency-key K --body-file <empty
-		// file>` arrives here with exactly that shape, because _load_body
-		// tests the truthiness of the path, not the file contents.
-		//
-		// Over the ceiling: Slack truncates text past slackMaxMessageLength
-		// from the end rather than rejecting it, and the marker is the tail of
-		// the string, so stamping an oversized message delivers a mangled
-		// partial marker that matches nothing on readback. Skipping keeps the
-		// caller's text whole (trimming it to make room would trade their
-		// content for our bookkeeping) and leaves an honest absence, which the
-		// readback contract already requires readers to treat as unknown. That
-		// contract is stated normatively on referenceMarker; this comment only
-		// covers why the stamp is skipped, so the two cannot drift apart.
-		//
-		// Both are measured on rewrittenText because that is what is actually
-		// posted: the alias rewrite can expand @handle into <@U…>, so a caller
-		// that sized itself to the advertised capability can still land over
-		// the budget here. len is bytes while Slack counts characters; for
-		// multibyte text that over-counts, which can only make this skip a
-		// marker that would have fit, never stamp one that will not.
-		//
-		// Only the fit check has a reachable input distinguishing rewrittenText
-		// from req.Text, and the alias-rewrite case in
-		// TestHandlePublishSkipsReferenceMarkerWhenItCannotFitUnderSlackCeiling
-		// pins it. The emptiness check cannot be told apart the same way today:
-		// rewrite returns text unchanged when it is empty, and parseUserAliasMap
-		// rejects any target slackMentionFor does not recognize, so no loadable
-		// alias map can rewrite non-empty text to "". rewrittenText is still the
-		// right operand — it is what gets posted — but that half is defensive,
-		// and a test asserting it would have to hand-build a map the loader
-		// cannot produce, which would pin an unreachable state rather than a
-		// behavior.
-		if req.IdempotencyKey != "" && rewrittenText != "" {
-			if len(rewrittenText)+referenceMarkerOverhead <= slackMaxMessageLength {
-				post.Text += "\n\n" + referenceMarker(req.IdempotencyKey)
-			} else {
-				// rewritten=, not text=: this is the post-rewrite length the
-				// budget was measured against, while the main publish log
-				// below reports the request length under text=. Two adjacent
-				// lines of one request carrying the same label with different
-				// quantities is what makes a grep on text= ambiguous.
-				log.Printf("publish: rewritten=%dch leaves no room for the reference marker (ceiling=%d overhead=%d) idem=%s conv=%s -> posting unstamped; this delivery is not readable back",
-					len(rewrittenText), slackMaxMessageLength, referenceMarkerOverhead,
-					req.IdempotencyKey, req.Conversation.ConversationID)
-			}
 		}
 		identityApplied := ""
 		if reg != nil {
@@ -1761,28 +1796,7 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 		default:
 			receipt.Delivered = true
 			receipt.MessageID = slackResp.TS
-			// A delivered-but-truncated message is still ok:true with a real
-			// message_id, so none of the receipt's named fields can show it. On
-			// a keyed publish the marker is the tail of the text, so truncation
-			// is precisely the case where delivery succeeded but readback will
-			// not find it. Log it for the operator and put it on the receipt
-			// for the caller: a log line cannot be observed by the reconciler
-			// this scheme exists to serve, and it is the caller — not this
-			// process — that knows whether the message was keyed. Routed
-			// through metadata because that is the only additive channel gc
-			// actually carries through; see publishReceipt.Metadata.
-			for _, warning := range slackResp.ResponseMetadata.Warnings {
-				if warning != "message_truncated" {
-					continue
-				}
-				log.Printf("publish: slack truncated the posted text (posted=%dch ceiling=%d) idem=%s conv=%s ts=%s -> any reference marker did not survive",
-					len(post.Text), slackMaxMessageLength, req.IdempotencyKey,
-					req.Conversation.ConversationID, slackResp.TS)
-				if receipt.Metadata == nil {
-					receipt.Metadata = map[string]string{}
-				}
-				receipt.Metadata["truncated"] = "true"
-			}
+			surfaceSlackTruncation(&receipt, req, len(post.Text), slackResp)
 		}
 		// Remember delivered receipts so a subsequent retry with the same
 		// idempotency key replays this receipt instead of re-posting. Put
