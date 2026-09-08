@@ -100,6 +100,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Busy-reaction lifecycle on targeted inbounds plus `reactions.remove`
+  support (`hq-xizo`). When an inbound message explicitly addresses an
+  agent (`@handle:` prefix or a mapped User Group mention) and is
+  successfully dispatched, the adapter now adds a busy reaction to the
+  inbound Slack message (`BUSY_REACTION`, default `hourglass`;
+  set-but-empty disables) instead of the previous `eyes`, and removes
+  it when the agent's reply is published back into the same
+  conversation/thread — the channel-native replacement for Slack
+  Assistant-mode `assistant.threads.setStatus`, which this adapter
+  deliberately does not use. Pending marks live in a bounded in-memory
+  registry keyed by (conversation, thread) and expire after 30 minutes.
+  The `/react` endpoint gains an optional `"remove": true` field that
+  issues `reactions.remove` instead of `reactions.add`
+  (backward-compatible; `no_reaction` is treated as benign delivery,
+  mirroring `already_reacted` on add). The ⚠️ alias-dispatch-failure
+  reaction is unchanged.
 - `gc slack retry-peer-fanout` — operational recovery for peer-fanout.
   Walks recent `extmsg.peer_fanout_failed` events (added in this change
   too), filters by `--since` / `--conversation` / `--max`, deduplicates
@@ -138,6 +154,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next restart with byte-identical functionality.
 - Build flow simplified to a single command:
   `cd examples/slack-pack/adapter && go build -o gc-slack-adapter`.
+
+### Fixed
+
+- DM inbounds now pass a fail-closed membership gate before any
+  processing (`hq-xizo`). Slack can deliver `message.im` events for DM
+  conversations the bot is not actually a member of — notably with
+  Assistant/Agent mode enabled — which would forward a private
+  human-to-human conversation to agents. The adapter now verifies the
+  bot can access the conversation via `conversations.info` and
+  silently drops the event otherwise (never revealing the bot saw it);
+  the drop log carries channel id and reason only, never the body.
+  Verdicts are cached per channel (allowed: 5 minutes,
+  `channel_not_found`: 30 seconds); transient API failures also drop
+  the event but are never cached, so the next event retries.
+  Channel/group/mpim inbounds skip the gate — they are governed by
+  explicit operator bindings.
+- The attachments block injected into the address-by-handle
+  system-reminder now instructs the receiving agent to Read a
+  `file://` path only if relevant and to never paste the paths into
+  its reply (`hq-xizo`). Bare or pasted local image paths trigger
+  Claude Code auto-attach, which re-reads the image every turn and
+  can wedge the session with Anthropic HTTP 400s. Count and per-file
+  lines are unchanged.
+- Inbound messages whose text carries the `*Sent using* <@USER_ID>`
+  trailer that Slack appends to user-token MCP-integration posts are
+  now dropped before the forward to gc (`hq-xizo`). Those posts arrive
+  with an empty `bot_id` and no subtype, so the existing bot/system
+  guard did not catch them; without this check a bound channel can
+  loop agent→Slack→adapter→agent (observed live 2026-07-16). The drop
+  is logged with channel, ts, and text length only — never the body.
+- Inbound Slack events are no longer lost when the forward to gc's
+  `extmsg/inbound` endpoint fails (`hq-xizo`). The adapter 200-acks
+  Slack before forwarding, so a failed POST used to drop the message
+  silently — Slack never redelivers after a 200. Each decoded inbound
+  is now persisted to a disk spool (`INBOUND_SPOOL_DIR`, defaulting to
+  `$GC_SERVICE_STATE_ROOT/data/inbound-spool` in proxy_process mode)
+  with atomic fsync'd writes before the first attempt, retried with
+  backoff (5 attempts over ~2 minutes), dead-lettered to the spool's
+  `dead/` subdirectory on exhaustion (the final log line keeps the
+  `inbound POST failed` substring external log-watchers key on), and
+  replayed at startup if a crash interrupted the retries. Duplicate
+  redelivery is safe — gc dedups on the message's `dedup_key`.
+- Codex review round 3 on this branch: the leaf no-follow defense is
+  real again — os.Root.OpenFile resolves an in-root leaf symlink
+  itself even with O_NOFOLLOW, so openBeneath now Lstat-rejects a
+  symlinked leaf and fstat-compares the opened file against that
+  Lstat via os.SameFile (same pattern as the root check); the busy
+  mark is recorded BEFORE the forward and cancelled on delivery
+  failure, closing the fast-reply window where gc hands the message
+  to the agent while deliverInbound is still returning; redelivery
+  admission is one locked operation — mark() itself rejects a
+  recently-cleared message and coalesces a concurrent copy of the
+  same event, so exactly one add lifecycle runs per message; startup
+  replay collects only paths and lets the bounded workers read and
+  decode entries, so a huge backlog cannot hold every payload in
+  memory at once. One finding is an ACCEPTED TRADEOFF, not a code
+  fix: retries/replays are at-least-once and can duplicate a turn on
+  an ambiguous failure, because gc core does not yet consume the
+  extmsg dedup_key (docs/phase5-ledger-readiness.md); the alternative
+  is losing acked Slack messages. Documented in the spool package
+  comment; disappears when core honors dedup_key.
+- Codex review round 2 on this branch (1 P1 + 5 P2, all fixed):
+  un-spooled retries (spooling disabled or the write failed) HOLD
+  their dispatch slot across the retry sleeps again — the semaphore
+  is the only bound on sleeping retry goroutines without a durable
+  entry, so the early release now applies only to spooled messages;
+  `INBOUND_SPOOL_DIR=` (set-but-empty) is honored as the documented
+  persistence opt-out instead of being replaced by the state-root
+  default; a threaded `/publish-file` reply clears the busy mark
+  exactly like a text publish; a failed alias dispatch removes the
+  busy emoji it added (takeExact — never touching a newer re-target's
+  mark); a Slack redelivery of an event whose reply already consumed
+  the mark no longer re-adds an hourglass nothing would ever clear
+  (5-minute cleared-message tombstones); and startup spool replay
+  runs through a bounded 4-worker pool instead of one goroutine per
+  entry.
+- Codex review round on this branch (8 findings, all fixed):
+  - The app manifest now grants `im:read` — the DM membership gate's
+    `conversations.info` probe requires it, and without it the gate
+    failed closed on `missing_scope` and dropped every legitimate DM.
+    The gate's drop log now names the missing scope and the fix.
+  - `openBeneath` rejects a symlinked upload root (Lstat + pinned-fd
+    `os.SameFile` identity check): `os.OpenRoot` follows a root-level
+    symlink, which would have re-anchored confinement at an
+    attacker-chosen directory and weakened the old walk's
+    O_NOFOLLOW-on-root TOCTOU defense.
+  - The spool entry now outlives forward success until the targeted
+    alias dispatch completes (removed on dispatch success,
+    dead-lettered on dispatch failure), and startup replay re-resolves
+    `ExplicitTarget` and redoes the dispatch — a crash between forward
+    and dispatch used to lose the targeted copy silently. Both legs
+    are at-least-once (forward deduped by `dedup_key`; a crash after
+    dispatch can duplicate the session message).
+  - Spooled retries no longer hold a dispatch-semaphore slot across
+    their ~2-minute sleep schedule: the slot is released before the
+    first retry sleep (release is now idempotent), so a gc outage
+    cannot pin all slots on sleeping goroutines and starve admission —
+    fresh events would have been dropped un-spooled.
+  - Busy-reaction lifecycle races: a thread-reply inbound registers
+    its mark under both the thread root and its own ts so either reply
+    threading shape clears the emoji; a reply landing while the async
+    `reactions.add` is still in flight defers the removal to the add's
+    completer instead of firing a remove that would lose the race and
+    strand the emoji; and re-tagging the same thread removes the
+    displaced mark's emoji instead of silently forgetting it.
+  - Concurrent DM-gate cache misses for the same channel coalesce onto
+    one in-flight `conversations.info` probe (waiters adopt the
+    winner's verdict) instead of fanning a DM burst into N identical
+    API calls.
 
 ### Security
 

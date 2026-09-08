@@ -357,5 +357,14 @@ func writeFile0600WithSync(path string, data []byte) error {
 		cleanup()
 		return fmt.Errorf("rename %q -> %q: %w", tmpName, path, err)
 	}
+	// Fsync the parent directory so the rename itself is durable
+	// (codex round 3): the temp file's contents were synced above, but
+	// on a host crash a filesystem may still lose the directory entry
+	// — and a spool entry that vanishes on reboot silently loses an
+	// already-acked Slack event. Same fsyncDir discipline as the
+	// ingress receipt store.
+	if err := fsyncDir(dir); err != nil {
+		return fmt.Errorf("fsync dir %q: %w", dir, err)
+	}
 	return nil
 }

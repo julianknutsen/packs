@@ -30,6 +30,7 @@
         "groups:history",
         "groups:read",
         "im:history",
+        "im:read",
         "mpim:history",
         "reactions:write",
         "users:read"

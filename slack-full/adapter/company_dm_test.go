@@ -87,6 +87,12 @@ func setupDM(t *testing.T) (*companyHarness, *fakeGC, *dmSpy) {
 	h.gw.secretsDir = writeTokenFile(t, "ollie", "xoxb-ollie", 0o700, 0o600)
 
 	spy := &dmSpy{}
+	// DM membership gate (codex round 3): default the probe to "member"
+	// so existing DM tests exercise their own concern without touching a
+	// real conversations.info endpoint; membership-gate tests override.
+	h.gw.mpimMemberProbe = func(token, channel string) mpimProbeOutcome {
+		return mpimProbeMember
+	}
 	h.gw.hydrateDM = func(token string, msg CompanyMessage) companyHydration {
 		spy.mu.Lock()
 		spy.hydrateTokens = append(spy.hydrateTokens, token)
@@ -523,6 +529,9 @@ func TestDMAllowedHumanPolicy(t *testing.T) {
 			h.gw.secretsDir = writeTokenFile(t, "ollie", "xoxb-ollie", 0o700, 0o600)
 			h.gw.hydrateDM = func(string, CompanyMessage) companyHydration {
 				return companyHydration{ContextStatus: companyContextUnavailable}
+			}
+			h.gw.mpimMemberProbe = func(string, string) mpimProbeOutcome {
+				return mpimProbeMember
 			}
 			h.openBarrier()
 
@@ -1077,4 +1086,63 @@ func readEnvFixture(t *testing.T, name string) slackEventEnvelope {
 		t.Fatalf("decode %s: %v", name, err)
 	}
 	return env
+}
+
+// DM membership gate (codex round 3): a message.im for a conversation
+// the owner app cannot access — the Assistant/Agent-mode foreign
+// human↔human DM — must terminalize with no session delivery, while a
+// probe transport error parks (sweep-recoverable) instead of leaking
+// or losing the DM.
+func TestDMMembershipGate(t *testing.T) {
+	t.Run("not a member terminalizes without delivery", func(t *testing.T) {
+		h, gc, _ := setupDM(t)
+		ts := "1700000000.000801"
+		h.gw.mpimMemberProbe = func(token, channel string) mpimProbeOutcome {
+			return mpimProbeNotMember
+		}
+		if _, handled := admitDMViaHandler(t, h, dmMessage("U0HUMAN01", ts, "private things"), ollieAppID, 0); !handled {
+			t.Fatal("not handled")
+		}
+		h.wait()
+
+		r := getReceipt(t, h, ts)
+		if r.Status != ingressStatusNoDelivery || r.Reason != wakeReasonDMNotMember {
+			t.Fatalf("receipt = (%s, %s), want (no_delivery, %s)", r.Status, r.Reason, wakeReasonDMNotMember)
+		}
+		if calls := gc.sessionCalls(); len(calls) != 0 {
+			t.Fatalf("session calls = %+v, want none (foreign DM must not reach the agent)", calls)
+		}
+	})
+	t.Run("probe error parks recoverably", func(t *testing.T) {
+		h, gc, _ := setupDM(t)
+		ts := "1700000000.000802"
+		h.gw.mpimMemberProbe = func(token, channel string) mpimProbeOutcome {
+			return mpimProbeError
+		}
+		if _, handled := admitDMViaHandler(t, h, dmMessage("U0HUMAN01", ts, "hello"), ollieAppID, 0); !handled {
+			t.Fatal("not handled")
+		}
+		h.wait()
+
+		r := getReceipt(t, h, ts)
+		if isTerminalStatus(r.Status) {
+			t.Fatalf("receipt terminalized on probe error: status=%q reason=%q", r.Status, r.Reason)
+		}
+		if r.Status != ingressStatusReceived || r.Reason != wakeReasonDMMemberUnknown {
+			t.Fatalf("status/reason = %q/%q, want received/%s", r.Status, r.Reason, wakeReasonDMMemberUnknown)
+		}
+		if calls := gc.sessionCalls(); len(calls) != 0 {
+			t.Fatalf("session calls = %+v, want none while parked", calls)
+		}
+
+		// Probe recovers; the same receipt delivers on the next drive.
+		h.gw.mpimMemberProbe = func(token, channel string) mpimProbeOutcome {
+			return mpimProbeMember
+		}
+		h.gw.triggerDelivery(dmOrigin(ts))
+		h.wait()
+		if calls := gc.sessionCalls(); len(calls) != 1 {
+			t.Fatalf("session calls after recovery = %+v, want exactly 1", calls)
+		}
+	})
 }

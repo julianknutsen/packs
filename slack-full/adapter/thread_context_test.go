@@ -170,7 +170,7 @@ func TestThreadContext_SecondMentionWithoutNewActivityNoPreamble(t *testing.T) {
 	}
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Only count conversations.replies; the adapter's eyes-react
+		// Only count conversations.replies; the adapter's busy-reaction
 		// path posts to /reactions.add and is out of scope here.
 		if strings.HasSuffix(r.URL.Path, "/conversations.replies") {
 			atomic.AddInt32(&calls, 1)
@@ -389,7 +389,7 @@ func TestThreadContext_NoPriorsAfterFilteringEmitsNoPreamble(t *testing.T) {
 func TestThreadContext_FetchFailureRetriesNextInbound(t *testing.T) {
 	var calls int32
 	failingSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Only count conversations.replies; the adapter's eyes-react
+		// Only count conversations.replies; the adapter's busy-reaction
 		// path posts to /reactions.add and is out of scope here.
 		if strings.HasSuffix(r.URL.Path, "/conversations.replies") {
 			atomic.AddInt32(&calls, 1)
@@ -465,7 +465,7 @@ func TestThreadContext_CrossAgentDeltaVisibility(t *testing.T) {
 	}
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Only count conversations.replies; the adapter's eyes-react
+		// Only count conversations.replies; the adapter's busy-reaction
 		// path posts to /reactions.add and is out of scope here.
 		if strings.HasSuffix(r.URL.Path, "/conversations.replies") {
 			atomic.AddInt32(&calls, 1)

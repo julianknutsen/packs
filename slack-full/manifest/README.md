@@ -42,6 +42,10 @@ Schema reference: <https://api.slack.com/reference/manifests>
   - `groups:read` — company rooms: verify switchboard membership of
     private directory rooms; no paired event subscription
   - `im:history` — read DM history (pairs with `message.im`)
+  - `im:read` — DM privacy gate: `conversations.info` membership probe
+    before a `message.im` inbound is processed (`adapter/dm_gate.go`);
+    without it the gate fails closed and every DM is dropped with
+    `missing_scope`
   - `mpim:history` — read multi-party DM messages (pairs with
     `message.mpim`)
   - `reactions:write` — `gc slack react` emoji ack

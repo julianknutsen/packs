@@ -147,6 +147,37 @@ func (g *companyGateway) deliverDMReceipt(r *IngressReceipt, origin ReceiptOrigi
 		case dmAuthorDeny:
 			return g.finalizeDMNoDelivery(r, wakeReasonDMAuthorNotAllowed)
 		}
+		// DM privacy membership gate (hq-xizo, codex round 3): the same
+		// Assistant/Agent-mode condition the switchboard's dm_gate.go
+		// handles can deliver a message.im for a conversation the AGENT
+		// app is not a member of — a foreign human↔human DM — and this
+		// path admitted on signature + author policy alone, so such a
+		// DM would leak to the agent session. Probe conversations.info
+		// with the owner token before freezing the route: a definitive
+		// not-a-member answer terminalizes with no delivery (silent
+		// toward Slack); a missing owner token or a transport error
+		// PARKS (sweep-recoverable) — for a privacy gate, advisory-
+		// proceed-on-error would leak, and terminalizing would lose a
+		// legitimate DM to a blip. Only first-route admission probes;
+		// a redrive of frozen targets already passed it once.
+		// A missing owner token is durable local state with an existing
+		// contract — delivery proceeds DEGRADED (no hydration, loud
+		// logs) — and there is nothing to probe with, so the gate is
+		// skipped rather than parking a deliverable DM forever. A
+		// transport error on a real probe parks (sweep-recoverable):
+		// for a privacy gate, advisory-proceed would leak on a blip.
+		if token, terr := g.ownerTokenFor(owner.Name); terr == nil {
+			switch g.mpimMemberProbe(token, origin.ChannelID) {
+			case mpimProbeNotMember:
+				return g.finalizeDMNoDelivery(r, wakeReasonDMNotMember)
+			case mpimProbeError:
+				g.parkWithReason(r, wakeReasonDMMemberUnknown)
+				return deliverParkedPreclaim
+			}
+		} else {
+			log.Printf("company dm: membership probe skipped (owner token unavailable): %v", terr)
+		}
+
 		// Freeze the single DM target from dm_bindings; an unbound owner is a
 		// recorded FAILED target (the rooms rule), company-redrive-recoverable.
 		now := g.now().UTC()

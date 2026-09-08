@@ -74,6 +74,8 @@ const (
 	wakeReasonDMSelfEcho         = "dm_self_echo"          // the owner app's own outbound post, echoed back
 	wakeReasonDMAuthorNotAllowed = "dm_author_not_allowed" // human author denied by the DM allowlist / team check
 	wakeReasonDMOwnerUnknown     = "dm_owner_unknown"      // owner app no longer joins a directory agent
+	wakeReasonDMNotMember        = "dm_membership_denied"  // owner app cannot access the DM conversation (foreign human↔human DM)
+	wakeReasonDMMemberUnknown    = "dm_membership_unknown" // membership probe could not answer (missing token / transport error)
 	// wakeReasonDMAppUnregistered parks (non-terminal, sweep-recoverable) a DM
 	// receipt whose agent-apps registry is unavailable at routing (nil snapshot,
 	// or the owner record missing) — a transient infra/reload failure, not a

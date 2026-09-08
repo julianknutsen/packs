@@ -234,6 +234,11 @@ func oauthBotScopes() []string {
 		"files:write",
 		"groups:history",
 		"im:history",
+		// DM privacy gate: conversations.info membership probe
+		// (adapter/dm_gate.go) — without it every OAuth-installed
+		// token fails the probe with missing_scope and the fail-closed
+		// gate drops all legitimate DMs.
+		"im:read",
 		"mpim:history",
 		"reactions:write",
 	}

@@ -323,6 +323,34 @@ func TestHandleReact(t *testing.T) {
 			wantSlackPath: "/reactions.add",
 		},
 		{
+			name:          "remove:true issues reactions.remove",
+			method:        http.MethodPost,
+			body:          `{"conversation":{"conversation_id":"C123"},"message_id":"1.2","emoji":"hourglass","remove":true}`,
+			slackResponse: `{"ok":true}`,
+			wantStatus:    http.StatusOK,
+			wantDelivered: true,
+			wantSlackPath: "/reactions.remove",
+		},
+		{
+			name:          "no_reaction on remove is benign success",
+			method:        http.MethodPost,
+			body:          `{"conversation":{"conversation_id":"C123"},"message_id":"1.2","emoji":"hourglass","remove":true}`,
+			slackResponse: `{"ok":false,"error":"no_reaction"}`,
+			wantStatus:    http.StatusOK,
+			wantDelivered: true,
+			wantSlackPath: "/reactions.remove",
+		},
+		{
+			name:          "channel_not_found on remove maps to not_found",
+			method:        http.MethodPost,
+			body:          `{"conversation":{"conversation_id":"C123"},"message_id":"1.2","emoji":"hourglass","remove":true}`,
+			slackResponse: `{"ok":false,"error":"channel_not_found"}`,
+			wantStatus:    http.StatusOK,
+			wantDelivered: false,
+			wantFailKind:  "not_found",
+			wantSlackPath: "/reactions.remove",
+		},
+		{
 			name:       "GET rejected",
 			method:     http.MethodGet,
 			body:       "",
@@ -1531,9 +1559,14 @@ func TestDispatchToAliasedSessionIncludesAttachments(t *testing.T) {
 	}
 	body := msg.Message
 
-	// (a) attachments header carries the count.
-	if !strings.Contains(body, "Attachments (2)") {
-		t.Errorf("body missing \"Attachments (2)\" header:\n%s", body)
+	// (a) attachments header carries the count and the auto-attach guard
+	//     wording: Read only if relevant, never paste the paths into the
+	//     reply — bare local image paths trigger Claude Code auto-attach,
+	//     which re-reads the image every turn and can wedge the session
+	//     with Anthropic HTTP 400s.
+	wantHeader := "Attachments (2) — saved to local disk. Read a file:// path only if relevant; never paste these paths into your reply:"
+	if !strings.Contains(body, wantHeader) {
+		t.Errorf("body missing attachments header %q:\n%s", wantHeader, body)
 	}
 	// (b) the clean attachment's file:// path, basename and both MIME types
 	//     surface verbatim (no '<' so neutralization is a no-op for them).
@@ -2236,7 +2269,13 @@ func TestHandlePublishFile(t *testing.T) {
 // reading a regular file inside the upload root must succeed and return
 // the file's bytes verbatim.
 func TestReadConfinedFileReadsRealFile(t *testing.T) {
-	dir := t.TempDir()
+	// Canonicalize: readConfinedFile's contract is an EvalSymlinks-resolved
+	// path, and on darwin t.TempDir() sits under the /var -> /private/var
+	// symlink.
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
 	path := filepath.Join(dir, "real.txt")
 	want := []byte("hello world")
 	if err := os.WriteFile(path, want, 0o600); err != nil {
@@ -2256,12 +2295,18 @@ func TestReadConfinedFileReadsRealFile(t *testing.T) {
 // In production the call site has already EvalSymlinks-resolved the path
 // to a canonical target with no symlinks; if a symlink appears at the leaf
 // between the confinement re-check and the read, an attacker would have
-// swapped the inode in the race window. O_NOFOLLOW makes that swap visible
-// as ELOOP rather than silent arbitrary-read. Both Linux and macOS return
-// ELOOP from open(2) with O_NOFOLLOW on a symlink — errors.Is unwraps
-// through *os.PathError to the underlying syscall.Errno.
+// swapped the inode in the race window. The open must fail rather than
+// silently read through the link. The exact error depends on which layer
+// trips first: O_NOFOLLOW on the leaf yields ELOOP, while os.Root's
+// resolution reports an absolute-target symlink as escaping the root
+// before the leaf open happens. Either way the swap is detected.
 func TestReadConfinedFileRejectsSymlink(t *testing.T) {
-	dir := t.TempDir()
+	// Canonical dir, non-canonical leaf: the symlink at the leaf is the
+	// simulated race-window inode swap and must stay unresolved.
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
 	target := filepath.Join(dir, "target.txt")
 	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
 		t.Fatalf("write target: %v", err)
@@ -2271,12 +2316,13 @@ func TestReadConfinedFileRejectsSymlink(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	_, err := readConfinedFile(dir, link)
+	_, err = readConfinedFile(dir, link)
 	if err == nil {
 		t.Fatal("readConfinedFile(symlink): want error, got nil — TOCTOU window unclosed")
 	}
-	if !errors.Is(err, syscall.ELOOP) {
-		t.Errorf("readConfinedFile(symlink) error = %v, want ELOOP", err)
+	if !errors.Is(err, syscall.ELOOP) && !strings.Contains(err.Error(), "escapes") &&
+		!strings.Contains(err.Error(), "is a symlink") {
+		t.Errorf("readConfinedFile(symlink) error = %v, want symlink/ELOOP/root-escape rejection", err)
 	}
 }
 
@@ -4172,6 +4218,58 @@ func TestProcessSlackEventReleasesSlotOnNoAliasPath(t *testing.T) {
 
 	if got := atomic.LoadInt32(&releases); got != 1 {
 		t.Errorf("release fired %d times on no-alias path; want exactly 1", got)
+	}
+}
+
+// TestProcessSlackEventDropsMCPEchoSignature verifies the echo/loop
+// guard (hq-xizo): a message whose text carries the "*Sent using* <@"
+// trailer that Slack appends to user-token MCP-integration posts must
+// be dropped before the forward to gc — such messages have an empty
+// bot_id and no subtype, so only this text check prevents a bound
+// channel from looping agent→Slack→adapter→agent. A normal message
+// through the same harness must still be forwarded, proving the stub
+// detects forwards.
+func TestProcessSlackEventDropsMCPEchoSignature(t *testing.T) {
+	var inboundPosts int32
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		if strings.Contains(r.URL.Path, "/extmsg/inbound") {
+			atomic.AddInt32(&inboundPosts, 1)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{
+		gcAPIBase:    gcStub.URL,
+		cityName:     "test-city",
+		provider:     "slack",
+		accountID:    "T1",
+		handlePrefix: "@",
+		dispatchSem:  defaultTestDispatchSem,
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+
+	mk := func(ts, text string) slackEventEnvelope {
+		raw, _ := json.Marshal(slackMessageEvent{
+			Type: "message", Channel: "C1", User: "U1", TS: ts,
+			Text: text,
+		})
+		return slackEventEnvelope{Type: "event_callback", Event: raw}
+	}
+
+	// Marker anywhere in the text → dropped, no POST to gc.
+	processSlackEvent(cfg, aliasReg, nil, nil, nil, nil,
+		mk("1.0", "deploy done!\n\n*Sent using* <@U099LNBUAML|mcp-user>"), func() {})
+	if got := atomic.LoadInt32(&inboundPosts); got != 0 {
+		t.Fatalf("marker message forwarded to gc %d times; want 0", got)
+	}
+
+	// Normal message through the identical harness → forwarded exactly once.
+	processSlackEvent(cfg, aliasReg, nil, nil, nil, nil,
+		mk("2.0", "deploy done, no marker here"), func() {})
+	if got := atomic.LoadInt32(&inboundPosts); got != 1 {
+		t.Fatalf("normal message forwarded to gc %d times; want exactly 1", got)
 	}
 }
 

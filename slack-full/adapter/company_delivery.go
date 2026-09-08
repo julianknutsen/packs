@@ -530,6 +530,18 @@ func (g *companyGateway) tryHandleEvent(w http.ResponseWriter, r *http.Request, 
 		// exactly as before rather than 5xx an unkeyable body.
 		return false
 	}
+	// MCP-echo drop precedes EVERY company admission branch (codex round
+	// 3): user-token MCP posts arrive with an empty bot_id and no
+	// subtype, so an imported company room or registered-agent DM would
+	// otherwise admit the echo and preserve the agent→Slack→adapter→
+	// agent loop the legacy path already blocks (processSlackEvent has
+	// the same check for non-company events). Acked 200, no receipt.
+	if strings.Contains(ev.Text, mcpEchoSignature) {
+		log.Printf("company: dropping inbound bearing MCP echo signature chan=%s ts=%s text=%dch",
+			ev.Channel, ev.TS, len(ev.Text))
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
 	switch ev.Type {
 	case "message":
 		// Fall through to company admission below.

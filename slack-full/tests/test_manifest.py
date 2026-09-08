@@ -87,6 +87,11 @@ def test_manifest_declares_bot_scopes(manifest: dict) -> None:
         # company rooms: same membership check for private rooms
         "groups:read",
         "im:history",
+        # DM privacy gate: conversations.info membership probe on every
+        # message.im inbound (adapter/dm_gate.go). Without im:read the
+        # probe returns missing_scope, the gate fails closed, and every
+        # legitimate DM is dropped.
+        "im:read",
         "mpim:history",
         "reactions:write",
         # company rooms: bots.info author resolution for peer trust
@@ -94,13 +99,6 @@ def test_manifest_declares_bot_scopes(manifest: dict) -> None:
     }
     missing = required - set(scopes)
     assert not missing, f"manifest missing required bot scopes: {sorted(missing)}"
-    # im:read was historically declared but no adapter code path uses
-    # it (DMs flow through im:history events). Guard against re-adding
-    # an over-broad scope without a justifying call site.
-    assert "im:read" not in scopes, (
-        "im:read is over-broad — adapter has no im.list / conversations.open "
-        "call site. Remove it or open a bead documenting the planned use."
-    )
 
 
 def test_manifest_scopes_unique_and_sorted(manifest: dict) -> None:

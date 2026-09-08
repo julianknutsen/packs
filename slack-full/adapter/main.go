@@ -78,6 +78,15 @@
 //     recognized on inbound messages for
 //     keyword routing (e.g. "@name: text").
 //     Empty string disables routing.
+//   - BUSY_REACTION                Default "hourglass". Emoji name (no
+//     colons) added to a targeted inbound
+//     message when it is dispatched and removed
+//     when the agent's reply is published back
+//     into the same conversation/thread — the
+//     channel-native replacement for Slack
+//     Assistant-mode assistant.threads.setStatus
+//     (hq-xizo). Set-but-empty (BUSY_REACTION=)
+//     disables the lifecycle entirely.
 //   - IDENTITY_STORE_PATH          Default "/tmp/gc-slack-adapter/identities.json".
 //     JSON file backing the per-session
 //     chat:write.customize identity registry.
@@ -98,6 +107,16 @@
 //   - INBOUND_FILE_SWEEP_INTERVAL  Default "1h". How often the janitor
 //     wakes to scan INBOUND_FILE_STORE. "0"
 //     disables the janitor.
+//   - INBOUND_SPOOL_DIR            Default "<GC_SERVICE_STATE_ROOT>/data/inbound-spool"
+//     when GC_SERVICE_STATE_ROOT is set,
+//     otherwise unset. Directory where decoded
+//     inbound events are persisted before the
+//     first forward attempt to gc, retried with
+//     backoff on failure, dead-lettered to
+//     <dir>/dead on exhaustion, and replayed at
+//     startup (hq-xizo). Empty disables
+//     spooling; forward retries still happen
+//     in-memory.
 //   - SLACK_CHANNEL_MAPPING_PATH    Default "<GC_CITY_PATH>/.gc/slack/channel_mappings.json"
 //     when GC_CITY_PATH is set, otherwise
 //     "/tmp/gc-slack-adapter/channel_mappings.json".
@@ -259,7 +278,12 @@ func (c config) tryAcquireDispatchSlot() (release func(), capacity int, ok bool)
 	semCap := cap(sem)
 	select {
 	case sem <- struct{}{}:
-		return func() { <-sem }, semCap, true
+		// Idempotent: the slot may be released early (deliverInbound
+		// frees it before its first retry sleep so a gc outage cannot
+		// starve admission) and then again by the owner's normal
+		// defer/transfer path. Only the first call returns the slot.
+		var once sync.Once
+		return func() { once.Do(func() { <-sem }) }, semCap, true
 	default:
 		return nil, semCap, false
 	}
@@ -323,6 +347,17 @@ type config struct {
 	// (no bot-token leak). Files are organized as
 	// <store>/<channel>/<ts>-<safe-filename>.
 	inboundFileStore string
+	// inboundSpoolDir is the directory where decoded inbound events are
+	// persisted before the first forward attempt to gc (hq-xizo).
+	// handleSlackEvents 200-acks Slack before processSlackEvent runs,
+	// so without the spool a forward that failed every retry silently
+	// lost the event. Entries are removed on successful forward,
+	// dead-lettered to <dir>/dead on retry exhaustion, and replayed at
+	// startup by replaySpool. Sourced from INBOUND_SPOOL_DIR,
+	// defaulting to <GC_SERVICE_STATE_ROOT>/data/inbound-spool when
+	// GC_SERVICE_STATE_ROOT is set (proxy_process mode). Empty
+	// disables spooling; forward retries still happen in-memory.
+	inboundSpoolDir string
 	// inboundFileTTL is the maximum age (mtime-based) of files in
 	// inboundFileStore before the in-process janitor deletes them.
 	// Empty or zero disables the janitor entirely.
@@ -512,10 +547,38 @@ type config struct {
 	// every inbound then flows through the legacy path byte-for-byte.
 	// Wired in main() before any handler closes over the cfg value.
 	companyGateway *companyGateway
+	// dmGate is the DM privacy gate (hq-xizo): before processing a
+	// kind=="dm" inbound, processSlackEvent verifies via
+	// conversations.info that the bot can actually access the
+	// conversation, because Slack (notably with Assistant/Agent mode
+	// enabled) can deliver message.im events for DMs between two
+	// humans that the bot is not a member of. NOT nil-safe in the
+	// permissive sense: a nil gate fails closed and drops every DM,
+	// so tests exercising DM inbounds must construct one (newDMGate).
+	// Initialized in main().
+	dmGate *dmGate
+	// busyReaction is the emoji name (no colons) added to a targeted
+	// inbound message when it is dispatched and removed when the
+	// agent's reply is published back into the same conversation/
+	// thread — the channel-native busy affordance replacing Slack
+	// Assistant-mode assistant.threads.setStatus (hq-xizo). Sourced
+	// from BUSY_REACTION, defaulting to busyReactionDefault
+	// ("hourglass"); the set-but-empty form (BUSY_REACTION=) yields ""
+	// here and disables the lifecycle entirely — no reaction is added
+	// and no mark is recorded. Replaces the previous unconditional
+	// "eyes" reaction on targeted inbounds.
+	busyReaction string
+	// busyMarks is the in-memory registry of pending busy reactions,
+	// keyed by (conversation id, thread key). processSlackEvent
+	// records a mark when it adds the busy reaction; handlePublish
+	// consumes it (and removes the reaction) when the reply lands.
+	// Nil-safe: mark/take on a nil registry are no-ops reporting no
+	// pending mark. Initialized in main(). hq-xizo.
+	busyMarks *busyReactionRegistry
 }
 
 func loadConfig() (config, error) {
-	return loadConfigFromEnv(os.Getenv)
+	return loadConfigFromLookup(os.LookupEnv)
 }
 
 // companyStateDirDefault resolves a Phase 2 shared-state directory default:
@@ -530,13 +593,31 @@ func companyStateDirDefault(cityPath, leaf string) string {
 	return filepath.Join("/tmp/gc-slack-adapter", leaf)
 }
 
-// loadConfigFromEnv reads adapter configuration from a getenv function. When
-// $GC_SERVICE_SOCKET is set, the adapter switches to proxy_process mode: it
-// binds a Unix domain socket for /publish (and /healthz) instead of an
-// internal TCP listener, and registers the callback URL gc routes through
-// its /svc/{name} mount. This keeps a single binary serving both the legacy
-// nohup-managed deployment and the proxy_process deployment.
+// loadConfigFromEnv reads adapter configuration from a plain getenv
+// function (os.Getenv shape: missing keys read as ""). It cannot
+// distinguish set-but-empty from unset, so vars whose empty form is
+// meaningful (BUSY_REACTION=) behave as unset through this entry
+// point; callers that need presence information use
+// loadConfigFromLookup directly.
 func loadConfigFromEnv(getenv func(string) string) (config, error) {
+	return loadConfigFromLookup(func(key string) (string, bool) {
+		v := getenv(key)
+		return v, v != ""
+	})
+}
+
+// loadConfigFromLookup reads adapter configuration from a lookup function
+// (os.LookupEnv shape). When $GC_SERVICE_SOCKET is set, the adapter switches
+// to proxy_process mode: it binds a Unix domain socket for /publish (and
+// /healthz) instead of an internal TCP listener, and registers the callback
+// URL gc routes through its /svc/{name} mount. This keeps a single binary
+// serving both the legacy nohup-managed deployment and the proxy_process
+// deployment.
+func loadConfigFromLookup(lookup func(string) (string, bool)) (config, error) {
+	getenv := func(key string) string {
+		v, _ := lookup(key)
+		return v
+	}
 	envOrFn := func(key, fallback string) string {
 		if v := getenv(key); v != "" {
 			return v
@@ -560,7 +641,34 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		handlePrefix:         envOrFn("HANDLE_PREFIX", "@"),
 		handleAliasStorePath: envOrFn("HANDLE_ALIAS_STORE_PATH", "/tmp/gc-slack-adapter/handle-aliases.json"),
 		inboundFileStore:     envOrFn("INBOUND_FILE_STORE", "/tmp/gc-slack-adapter/inbound"),
+		inboundSpoolDir:      getenv("INBOUND_SPOOL_DIR"),
 		fileUploadRoot:       getenv("FILE_UPLOAD_ROOT"),
+	}
+
+	// Default the inbound persist-and-retry spool into the
+	// controller-provided state root (proxy_process mode). Standalone
+	// runs without an explicit INBOUND_SPOOL_DIR get in-memory retries
+	// only (hq-xizo). Set-but-empty (INBOUND_SPOOL_DIR=) is the
+	// documented opt-out — message bodies must not be written to disk —
+	// so the state-root default applies only when the variable is
+	// ABSENT, mirroring BUSY_REACTION's lookup-presence handling.
+	if _, spoolSet := lookup("INBOUND_SPOOL_DIR"); !spoolSet && cfg.inboundSpoolDir == "" {
+		if stateRoot := getenv("GC_SERVICE_STATE_ROOT"); stateRoot != "" {
+			cfg.inboundSpoolDir = filepath.Join(stateRoot, "data", "inbound-spool")
+		}
+	}
+
+	// BUSY_REACTION: emoji added to a targeted inbound while the agent
+	// works, removed when the reply publishes back (hq-xizo). Read
+	// through lookup (not envOrFn) because the set-but-empty form
+	// (BUSY_REACTION=) means "disable the lifecycle" and must not fall
+	// back to the default. Surrounding colons are stripped so operators
+	// can write ":hourglass:" or "hourglass" interchangeably, matching
+	// /react's emoji handling.
+	if v, ok := lookup("BUSY_REACTION"); ok {
+		cfg.busyReaction = strings.Trim(v, ":")
+	} else {
+		cfg.busyReaction = busyReactionDefault
 	}
 
 	// channelMappingPath default: prefer the city-rooted path when
@@ -947,6 +1055,10 @@ type reactRequest struct {
 	Conversation conversationRef `json:"conversation"`
 	MessageID    string          `json:"message_id"`
 	Emoji        string          `json:"emoji"`
+	// Remove selects reactions.remove instead of reactions.add
+	// (hq-xizo). Absent or false preserves the historical add-only
+	// behavior, so existing callers are unaffected.
+	Remove bool `json:"remove,omitempty"`
 }
 
 type reactReceipt struct {
@@ -1082,6 +1194,15 @@ func main() {
 	// Wire the process-wide thread-context cache. Nil-safe consumer
 	// path; only the production main() initializes it. gc-px8.5.
 	cfg.threadContextCache = newThreadContextCache()
+	// Wire the DM privacy gate. Unlike threadContextCache, a nil gate
+	// is fail-closed (drops every DM), so production wiring is
+	// mandatory here, before any handler closes over cfg. hq-xizo.
+	cfg.dmGate = newDMGate()
+	// Wire the busy-reaction registry before the event and publish
+	// handlers close over cfg — both sides of the add-on-dispatch /
+	// remove-on-reply lifecycle must see the same map. Nil-safe
+	// consumer path (a nil registry just disables removal). hq-xizo.
+	cfg.busyMarks = newBusyReactionRegistry()
 	internalDescr := cfg.internalListen
 	if cfg.serviceSocket != "" {
 		internalDescr = "uds:" + cfg.serviceSocket
@@ -1279,6 +1400,14 @@ func main() {
 		log.Printf("registered with gc as provider=%s account=%s callback=%s/publish (%s)",
 			cfg.provider, cfg.accountID, cfg.internalCallbackURL, mode)
 	}
+
+	// Re-deliver any inbound events a previous run spooled but never
+	// confirmed done (hq-xizo: Slack was already 200-acked, so
+	// dropping them on crash would lose messages). Runs before the
+	// listeners start serving; delivery itself is async per entry.
+	// aliasReg lets replay redo the targeted alias dispatch a crash
+	// may have cut off after the forward succeeded.
+	replaySpool(cfg, aliasReg)
 
 	janitorCtx, janitorCancel := context.WithCancel(context.Background())
 	defer janitorCancel()
@@ -1589,6 +1718,23 @@ func handlePublish(cfg config, reg *identityRegistry, userAliases *userAliasMap,
 			receipt.Delivered = true
 			receipt.MessageID = slackResp.TS
 		}
+		// Busy-reaction lifecycle, remove side (hq-xizo): a delivered
+		// publish into a conversation/thread carrying a pending busy mark
+		// means the agent's reply has landed — clear the busy emoji from
+		// the inbound message it was added to. ReplyToMessageID is the
+		// publish's thread ts and matches the registry thread key in both
+		// inbound shapes: a thread-reply inbound was marked under its
+		// thread_ts, and a channel-root inbound was marked under its own
+		// ts, which is exactly what a threaded reply to it carries here.
+		// A publish with no ReplyToMessageID posts at channel root and
+		// identifies no thread, so there is nothing to look up; publishes
+		// with no registry hit are untouched. Best-effort and async —
+		// removal failures are logged and never affect the receipt. The
+		// dedup-replay path above returns earlier without re-checking:
+		// the original delivery already consumed the mark.
+		if receipt.Delivered {
+			clearBusyMark(cfg, req.Conversation.ConversationID, req.ReplyToMessageID)
+		}
 		// Remember delivered receipts so a subsequent retry with the same
 		// idempotency key replays this receipt instead of re-posting. Put
 		// ignores empty keys and non-delivered receipts.
@@ -1752,6 +1898,9 @@ func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
 
 		receipt.Delivered = true
 		receipt.FileID = urlResp.FileID
+		// A threaded file reply is the agent's answer too — clear the
+		// busy mark exactly like a text publish (codex round 2).
+		clearBusyMark(cfg, req.Conversation.ConversationID, req.ReplyToMessageID)
 		writeJSON(w, receipt)
 	}
 }
@@ -2007,8 +2156,9 @@ func slackCompleteUpload(token string, req slackCompleteUploadReq) (*slackComple
 }
 
 // handleReact serves POST /react. It maps reactRequest → Slack
-// reactions.add. Emoji name is forwarded verbatim minus surrounding
-// colons (clients can send "eyes" or ":eyes:").
+// reactions.add, or reactions.remove when the request sets
+// remove:true (hq-xizo). Emoji name is forwarded verbatim minus
+// surrounding colons (clients can send "eyes" or ":eyes:").
 func handleReact(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -2025,9 +2175,18 @@ func handleReact(cfg config) http.HandlerFunc {
 			http.Error(w, "conversation.conversation_id, message_id, and emoji are required", http.StatusBadRequest)
 			return
 		}
-		log.Printf("react: conv=%s ts=%s emoji=%s", req.Conversation.ConversationID, req.MessageID, emoji)
+		// Benign no-op errors mirror each other across the two ops:
+		// adding an emoji that is already on the message
+		// ("already_reacted") and removing one that is not there
+		// ("no_reaction") both leave the message in the requested
+		// state, so both count as delivered.
+		method, benignErr := "reactions.add", "already_reacted"
+		if req.Remove {
+			method, benignErr = "reactions.remove", "no_reaction"
+		}
+		log.Printf("react: op=%s conv=%s ts=%s emoji=%s", method, req.Conversation.ConversationID, req.MessageID, emoji)
 
-		slackResp, err := postReactionToSlack(cfg.slackBotToken, slackReactionsAddReq{
+		slackResp, err := postReactionMethod(http.DefaultClient, cfg.slackBotToken, method, slackReactionsAddReq{
 			Channel:   req.Conversation.ConversationID,
 			Name:      emoji,
 			Timestamp: req.MessageID,
@@ -2035,14 +2194,13 @@ func handleReact(cfg config) http.HandlerFunc {
 		receipt := reactReceipt{}
 		switch {
 		case err != nil:
-			log.Printf("slack reactions.add error: %v", err)
+			log.Printf("slack %s error: %v", method, err)
 			receipt.FailureKind = "transient"
 		case !slackResp.OK:
-			// "already_reacted" is benign: the emoji is already on the message.
-			if slackResp.Error == "already_reacted" {
+			if slackResp.Error == benignErr {
 				receipt.Delivered = true
 			} else {
-				log.Printf("slack reactions.add returned error: %s", slackResp.Error)
+				log.Printf("slack %s returned error: %s", method, slackResp.Error)
 				switch slackResp.Error {
 				case "channel_not_found", "not_in_channel", "message_not_found":
 					receipt.FailureKind = "not_found"
@@ -2062,15 +2220,59 @@ func handleReact(cfg config) http.HandlerFunc {
 	}
 }
 
+// clearBusyMark consumes the pending busy mark for a delivered reply
+// into (conversationID, threadKey) and removes the busy emoji from
+// the marked message. Shared by handlePublish and handlePublishFile —
+// either reply shape (text or file) is the agent's answer, so a
+// file-only reply must clear the hourglass exactly like a text one
+// (codex round 2). take() defers to an in-flight reactions.add (the
+// add's completer then owns the removal); an expired or absent mark
+// is a no-op.
+func clearBusyMark(cfg config, conversationID, threadKey string) {
+	if cfg.busyReaction == "" || conversationID == "" || threadKey == "" {
+		return
+	}
+	if markedTS, ok := cfg.busyMarks.take(conversationID, threadKey); ok {
+		go removeBusyEmoji(cfg, conversationID, markedTS, "remove")
+	}
+}
+
+// removeBusyEmoji fires one best-effort reactions.remove for the busy
+// emoji on (channel, ts). tag distinguishes the log lines per removal
+// path. "no_reaction" is benign: the emoji already came off (human
+// removed it, or the add never landed).
+func removeBusyEmoji(cfg config, channel, ts, tag string) {
+	resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
+		Channel:   channel,
+		Name:      cfg.busyReaction,
+		Timestamp: ts,
+	})
+	if err != nil {
+		log.Printf("busy reaction %s failed: chan=%s ts=%s emoji=%s: %v", tag, channel, ts, cfg.busyReaction, err)
+		return
+	}
+	if !resp.OK && resp.Error != "no_reaction" {
+		log.Printf("busy reaction %s: chan=%s ts=%s emoji=%s: slack error=%s", tag, channel, ts, cfg.busyReaction, resp.Error)
+	}
+}
+
+// postReactionToSlack calls reactions.add for req.
 func postReactionToSlack(token string, req slackReactionsAddReq) (*slackReactionsAddResp, error) {
 	return postReactionMethod(http.DefaultClient, token, "reactions.add", req)
 }
 
+// removeReactionFromSlack calls reactions.remove for req — same
+// request shape, auth, and slackAPIBase as reactions.add (hq-xizo).
+func removeReactionFromSlack(token string, req slackReactionsAddReq) (*slackReactionsAddResp, error) {
+	return postReactionMethod(http.DefaultClient, token, "reactions.remove", req)
+}
+
 // postReactionMethod is the single Slack reactions POST path, parameterized by
 // method ("reactions.add" | "reactions.remove") and HTTP client. handleReact
-// (add, DefaultClient) and the company visible-ack path (add/remove over the
-// gateway's timeout-bounded client) both route through here, so there is no
-// second reactions POST implementation.
+// (add, DefaultClient), the busy-reaction lifecycle (add/remove, hq-xizo), and
+// the company visible-ack path (add/remove over the gateway's timeout-bounded
+// client) all route through here, so there is no second reactions POST
+// implementation.
 func postReactionMethod(client *http.Client, token, method string, req slackReactionsAddReq) (*slackReactionsAddResp, error) {
 	if client == nil {
 		client = http.DefaultClient
@@ -2408,6 +2610,12 @@ func slackKindFromChannelType(channelType, channelID string) string {
 	return "dm"
 }
 
+// mcpEchoSignature is the trailer Slack appends to messages posted by
+// user-token MCP integrations ("*Sent using* <@USER_ID>"). Single
+// asterisks — Slack mrkdwn bold — exactly as delivered in event text.
+// processSlackEvent drops any inbound whose text contains it (hq-xizo).
+const mcpEchoSignature = "*Sent using* <@"
+
 // processSlackEvent runs the per-inbound-event work (signature parse,
 // postInbound to gc, optional alias dispatch). It owns the dispatch
 // slot supplied by handleSlackEvents: the slot is released either on
@@ -2441,8 +2649,43 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	if msg.BotID != "" || msg.Subtype != "" || msg.User == "" {
 		return
 	}
+	// Skip messages bearing the MCP-integration echo signature. Other
+	// Slack MCP integrations post via user tokens, and Slack appends
+	// "*Sent using* <@USER_ID>" (mrkdwn, single asterisks) to those
+	// messages — they arrive with an empty bot_id and no subtype, so
+	// the guard above does not catch them. Without this check a bound
+	// channel can loop agent→Slack→adapter→agent (observed live
+	// 2026-07-16 in this workspace).
+	if strings.Contains(msg.Text, mcpEchoSignature) {
+		log.Printf("dropping inbound bearing MCP echo signature chan=%s ts=%s text=%dch",
+			msg.Channel, msg.TS, len(msg.Text))
+		return
+	}
 	if strings.TrimSpace(msg.Text) == "" {
 		return
+	}
+
+	// DM privacy gate (hq-xizo). Slack can deliver message.im events
+	// for DM conversations the bot is not actually a member of —
+	// notably with Assistant/Agent mode enabled, the events feed
+	// includes DMs between two humans. Forwarding those would leak a
+	// private human↔human conversation to agents, so before ANY real
+	// processing (launcher dispatch, thread-context fetch, file
+	// download, forward) a kind=="dm" inbound must pass the
+	// conversations.info membership check. Drops are silent toward
+	// Slack — no reaction, no reply, nothing that reveals the bot saw
+	// the message — and the log line carries channel id + reason
+	// only, never the body. Fail closed: API errors also drop (the
+	// gate does not cache those, so the next event retries). Non-DM
+	// kinds skip the gate entirely — channels/groups/mpims are
+	// governed by explicit operator bindings.
+	kind := slackKindFromChannelType(msg.ChannelType, msg.Channel)
+	if kind == "dm" {
+		if allowed, reason := cfg.dmGate.allow(cfg.slackBotToken, msg.Channel); !allowed {
+			log.Printf("dropping dm inbound: membership gate chan=%s ts=%s reason=%s",
+				msg.Channel, msg.TS, reason)
+			return
+		}
 	}
 
 	// Launcher-mode address parser runs FIRST (cby.5.b). A `@@<handle>`
@@ -2570,7 +2813,7 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 			Provider:       cfg.provider,
 			AccountID:      cfg.accountID,
 			ConversationID: msg.Channel,
-			Kind:           slackKindFromChannelType(msg.ChannelType, msg.Channel),
+			Kind:           kind,
 		},
 		Actor: externalActor{
 			ID:          msg.User,
@@ -2584,36 +2827,143 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		DedupKey:         "slack-" + msg.TS,
 		ReceivedAt:       time.Now().UTC(),
 	}
-	if err := postInbound(cfg, inbound); err != nil {
-		log.Printf("inbound POST failed: %v", err)
+	// Persist-and-retry forward (hq-xizo): Slack was 200-acked before
+	// this goroutine ran, so a failed POST here would otherwise lose
+	// the event silently — Slack never redelivers after a 200. Spool
+	// first (best-effort; "" when disabled or the write fails), then
+	// forward with retries per inboundRetryDelays; on exhaustion the
+	// entry dead-letters under <spool>/dead and startup replay covers
+	// a crash mid-retry. deliverInbound logs the outcome either way,
+	// including the one-time success line.
+	//
+	// The dispatch slot (release) is handed to deliverInbound as its
+	// onFirstRetry hook: the retry schedule sleeps ~2 minutes, and
+	// holding the slot across those sleeps would let ~dispatchSem-cap
+	// concurrent failures starve admission for the whole gc outage —
+	// fresh events would be dropped UN-spooled, strictly worse than
+	// running the spooled stragglers outside the semaphore. release is
+	// idempotent, so the later transfer/defer paths stay correct.
+	//
+	// The spool entry stays on disk past forward success: it is
+	// removed only after the remaining durable work — the targeted
+	// alias dispatch below — has completed (or was never needed), so a
+	// crash in between replays the entry, alias dispatch included,
+	// instead of silently losing the targeted copy.
+	// Busy-reaction mark, recorded BEFORE the forward (codex round 2,
+	// mirroring the file-ingest branch's r4): gc can hand the inbound
+	// to the agent — and the agent can /publish a reply — before
+	// deliverInbound even returns, and a reply that finds no mark
+	// leaves the subsequently-added emoji stuck forever. mark() is one
+	// locked admission: it rejects a redelivery of a message whose
+	// reply already cleared (5-minute tombstone) and coalesces a
+	// concurrent copy of the same event, so only one add lifecycle
+	// ever runs per message. The reactions.add itself still fires only
+	// after the forward succeeds (an emoji on a message no agent
+	// received would be a lie); a failed forward cancels the mark.
+	busyAdmitted := false
+	var busyDisplaced []string
+	if target != "" && cfg.slackBotToken != "" && cfg.busyReaction != "" {
+		busyDisplaced, busyAdmitted = cfg.busyMarks.mark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+	}
+
+	spoolPath := spoolInbound(cfg.inboundSpoolDir, inbound)
+	if !deliverInbound(cfg, inbound, spoolPath, release) {
+		if busyAdmitted {
+			cfg.busyMarks.cancelMark(msg.Channel, busyThreadKey(msg.ThreadTS, msg.TS), msg.TS)
+			// Marks this admission displaced were already dropped from
+			// the registry at mark() time — their agents' replies can
+			// no longer find them — so their landed emojis must come
+			// off now or they stick forever (codex round 3).
+			for _, oldTS := range busyDisplaced {
+				go removeBusyEmoji(cfg, msg.Channel, oldTS, "displace-remove")
+			}
+		}
 		return
 	}
-	log.Printf("inbound: chan=%s user=%s ts=%s thread=%s target=%q files=%d text=%dch",
-		msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, len(attachments), len(text))
 
-	// "Eyes" reaction signals to the human that an agent was explicitly
-	// addressed (via `@handle:` prefix or a Slack User Group mention
-	// resolved via subteamAliasMap) and is processing the message. Only
-	// fires when a target was parsed — generic channel chatter that
-	// merely lands on the bound session via postInbound does NOT trigger
-	// the eye, because most channel messages aren't intentionally
-	// directed at an agent. Fires once per inbound (the alias-dispatch
-	// fanout below targets the same Slack TS, so a duplicate react would
-	// be a Slack no-op). If alias dispatch later fails, reactAliasDispatchFailure
-	// posts ⚠️ on the same TS — that is semantically distinct (transport-layer
-	// ack vs. delivery failure) and not a duplicate. Best-effort: errors are
-	// logged and don't block the dispatch path.
-	if target != "" && cfg.slackBotToken != "" {
-		go func(channel, ts string) {
-			_, err := postReactionToSlack(cfg.slackBotToken, slackReactionsAddReq{
+	// Busy-reaction lifecycle, add side (hq-xizo; replaces the earlier
+	// unconditional "eyes" reaction). The reaction signals to the human
+	// that an agent was explicitly addressed (via `@handle:` prefix or
+	// a Slack User Group mention resolved via subteamAliasMap) and is
+	// working on the message; handlePublish removes it when the agent's
+	// reply lands in the same conversation/thread — the channel-native
+	// replacement for Slack Assistant-mode assistant.threads.setStatus,
+	// which this adapter deliberately does not use. Only fires when a
+	// target was parsed — generic channel chatter that merely lands on
+	// the bound session via postInbound does NOT trigger it, because
+	// most channel messages aren't intentionally directed at an agent
+	// — and only after deliverInbound succeeded (a busy mark on a
+	// dropped inbound would never clear: nothing is coming). Fires once
+	// per inbound (the alias-dispatch fanout below targets the same
+	// Slack TS, so a duplicate react would be a Slack no-op). The mark
+	// is recorded synchronously before the async reactions.add so a
+	// fast reply cannot race the registry: take() defers to the
+	// in-flight add (confirmAdd reports the deferred removal) rather
+	// than firing a remove that would lose to the add. A re-mark of
+	// the same thread displaces the previous mark and its emoji is
+	// removed here (or by its own in-flight add completer). A mark
+	// whose reply never arrives expires after busyReactionTTL. If
+	// alias dispatch later fails, reactAliasDispatchFailure posts ⚠️
+	// on the same TS — that is semantically distinct (busy affordance
+	// vs. delivery failure) and not a duplicate. Best-effort: errors
+	// are logged and don't block the dispatch path. BUSY_REACTION=
+	// (set-but-empty) disables this block entirely — no reaction, no
+	// mark.
+	if busyAdmitted {
+		displaced := busyDisplaced
+		for _, oldTS := range displaced {
+			go func(channel, ts, emoji string) {
+				resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
+					Channel:   channel,
+					Name:      emoji,
+					Timestamp: ts,
+				})
+				if err != nil {
+					log.Printf("busy reaction displace-remove failed: chan=%s ts=%s emoji=%s: %v", channel, ts, emoji, err)
+					return
+				}
+				if !resp.OK && resp.Error != "no_reaction" {
+					log.Printf("busy reaction displace-remove: chan=%s ts=%s emoji=%s: slack error=%s", channel, ts, emoji, resp.Error)
+				}
+			}(msg.Channel, oldTS, cfg.busyReaction)
+		}
+		go func(channel, ts, emoji string) {
+			resp, err := postReactionToSlack(cfg.slackBotToken, slackReactionsAddReq{
 				Channel:   channel,
-				Name:      "eyes",
+				Name:      emoji,
 				Timestamp: ts,
 			})
-			if err != nil {
-				log.Printf("react eyes failed: chan=%s ts=%s: %v", channel, ts, err)
+			landed := err == nil && resp != nil && (resp.OK || resp.Error == "already_reacted")
+			if !landed {
+				// The emoji never made it onto the message: retire the
+				// in-flight add state so a later take() doesn't wait on
+				// a removal that will never be owed.
+				cfg.busyMarks.abandonAdd(channel, ts)
+				if err != nil {
+					log.Printf("react busy %s failed: chan=%s ts=%s: %v", emoji, channel, ts, err)
+				} else {
+					log.Printf("react busy %s failed: chan=%s ts=%s: slack error=%s", emoji, channel, ts, resp.Error)
+				}
+				return
 			}
-		}(msg.Channel, msg.TS)
+			if cfg.busyMarks.confirmAdd(channel, ts) {
+				// The reply (or a displacing re-mark) consumed the mark
+				// while this add was in flight — complete the deferred
+				// removal now that the emoji actually exists.
+				resp, err := removeReactionFromSlack(cfg.slackBotToken, slackReactionsAddReq{
+					Channel:   channel,
+					Name:      emoji,
+					Timestamp: ts,
+				})
+				if err != nil {
+					log.Printf("busy reaction deferred-remove failed: chan=%s ts=%s emoji=%s: %v", channel, ts, emoji, err)
+					return
+				}
+				if !resp.OK && resp.Error != "no_reaction" {
+					log.Printf("busy reaction deferred-remove: chan=%s ts=%s emoji=%s: slack error=%s", channel, ts, emoji, resp.Error)
+				}
+			}
+		}(msg.Channel, msg.TS, cfg.busyReaction)
 	}
 
 	// Cross-channel address-by-handle: if the parsed target matches a
@@ -2621,7 +2971,10 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// session via gc's session-message API, regardless of channel
 	// binding. The originating channel's bound session still sees the
 	// inbound (above) and is expected to stay silent (per its prompt)
-	// because target != its handle.
+	// because target != its handle. The dispatching goroutine owns the
+	// spool entry's retirement: removed on dispatch success,
+	// dead-lettered on failure (⚠️ already signals the human; leaving
+	// it in the live spool would re-⚠️ on every restart).
 	if target != "" && aliasReg != nil {
 		if aliasedSessionID, ok := aliasReg.Get(target); ok {
 			// Thread-stickiness bind: record (channel, msg.TS) -> target
@@ -2637,18 +2990,40 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 			// Transfer the slot we already hold to the alias goroutine.
 			// No new acquireDispatchSlot — that would double-count
 			// against dispatchSem (gc-cby.26 Phase 4 review fix).
+			// release is idempotent, so this stays correct when
+			// deliverInbound already freed the slot on its retry path.
 			released = true
 			dispatchInflightWG.Add(1)
 			go func() {
 				defer dispatchInflightWG.Done()
 				defer release()
-				if !dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target) {
+				if dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target) {
+					removeSpoolEntry(spoolPath)
+				} else {
 					reactAliasDispatchFailure(cfg.slackBotToken,
 						inbound.Conversation.ConversationID, inbound.ProviderMessageID)
+					// The addressed session never got the message — no
+					// reply is coming to clear the busy mark, and TTL
+					// expiry only forgets it without removing the
+					// Slack-side emoji (codex round 2). takeExact spares
+					// a newer re-target's mark; the in-flight-add case
+					// defers to the add's completer.
+					if cfg.busyMarks.takeExact(msg.Channel, msg.ThreadTS, msg.TS) {
+						go removeBusyEmoji(cfg, msg.Channel, msg.TS, "alias-failure remove")
+					}
+					if spoolPath != "" {
+						log.Printf("alias dispatch failed chan=%s ts=%s target=%q (dead-letter=%s)",
+							inbound.Conversation.ConversationID, inbound.ProviderMessageID,
+							target, moveToDeadLetter(spoolPath))
+					}
 				}
 			}()
+			return
 		}
 	}
+	// No alias dispatch fired: the confirmed forward was the only
+	// durable work, so the spool entry is done.
+	removeSpoolEntry(spoolPath)
 }
 
 // downloadSlackFiles fetches each file's bytes from Slack (Bearer-auth
@@ -3880,10 +4255,15 @@ func dispatchToAliasedSession(cfg config, sessionID string, msg externalInboundM
 	// path (cby.33) so a forged </system-reminder> in a filename cannot break
 	// out of the reminder envelope. Empty string when there are no
 	// attachments, leaving the body byte-identical to the text-only form.
+	// The attachments header carries the gt-slack guard semantics: Read
+	// only if relevant, and NEVER paste the paths into the reply. A bare
+	// or pasted local image path triggers Claude Code auto-attach, which
+	// re-reads the image every turn and can wedge the session with
+	// Anthropic HTTP 400s.
 	attachmentsBlock := ""
 	if len(msg.Attachments) > 0 {
 		var ab strings.Builder
-		fmt.Fprintf(&ab, "\nAttachments (%d) — saved to local disk; Read the file:// path to view:\n", len(msg.Attachments))
+		fmt.Fprintf(&ab, "\nAttachments (%d) — saved to local disk. Read a file:// path only if relevant; never paste these paths into your reply:\n", len(msg.Attachments))
 		for i, att := range msg.Attachments {
 			name := filepath.Base(strings.TrimPrefix(att.URL, "file://"))
 			fmt.Fprintf(&ab, "  %d. %s (%s): %s\n",
