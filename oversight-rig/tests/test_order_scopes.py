@@ -132,9 +132,32 @@ def test_oversight_orders_preserve_declared_scope_across_rig_imports(
 ) -> None:
     city = write_order_scope_city(tmp_path)
 
+    # Hermetic child env, matching tests/gc_live_city.py: an inherited GC_*/
+    # BEADS_*/XDG_* key can point the CLI at a live city's store or the
+    # developer's real dotfiles. `order list` is a pure config scan today, so
+    # this is preventive -- it keeps the first store-touching assertion added
+    # here from silently inheriting that failure mode.
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("GC_", "BEADS_", "XDG_"))
+    }
+    env.update(
+        {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_DATA_HOME": str(home / ".local" / "share"),
+            "XDG_STATE_HOME": str(home / ".local" / "state"),
+            "XDG_CACHE_HOME": str(home / ".cache"),
+        }
+    )
+
     result = subprocess.run(
         [str(gc_test_bin), "--city", str(city), "order", "list", "--json"],
         cwd=city,
+        env=env,
         text=True,
         capture_output=True,
         timeout=30,

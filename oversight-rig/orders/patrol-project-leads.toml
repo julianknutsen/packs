@@ -1,5 +1,13 @@
 [order]
 description = "Nudge every project-lead to run a triage tick. Cooldown sets the cadence."
+# City-scoped: nudge-project-leads.sh enumerates every active project-lead
+# session city-wide (`gc session list` filtered on template + state, no rig
+# filter), so it already covers the whole city in one run. Left unscoped, each
+# per-rig pack import registers its own instance, and every one of them fires
+# on its own independent cooldown -- N rigs means each lead is nudged N+1 times
+# per tick. Unlike gastown/orders/digest-generate.toml, whose per-rig instances
+# never fire, these do fire; the reason for `scope = "city"` is duplicate work,
+# not a stuck order.
 scope = "city"
 trigger = "cooldown"
 interval = "15m"
