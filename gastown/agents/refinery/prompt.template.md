@@ -69,14 +69,14 @@ external observers (witness, mayor) only catch on a slow patrol cycle.
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd query --json 'ephemeral=true AND status=in_progress' --limit=0 | jq -r --arg id "$GC_AGENT" --arg f mol-refinery-patrol '[.[] | select((.assignee // "") == $id and (.title // "") == $f)] | .[0].id // empty')
 fi
 NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
   echo "Could not pour next refinery wisp; not burning."
   exit 1
 fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+if ! gc bd update "$NEXT" --assignee="$GC_AGENT" --status=in_progress; then
   echo "Could not assign next refinery wisp; not burning."
   exit 1
 fi
@@ -114,14 +114,14 @@ assign the next wisp, burn the current wisp, THEN request restart**:
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd query --json 'ephemeral=true AND status=in_progress' --limit=0 | jq -r --arg id "$GC_AGENT" --arg f mol-refinery-patrol '[.[] | select((.assignee // "") == $id and (.title // "") == $f)] | .[0].id // empty')
 fi
 NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
   echo "Could not pour next refinery wisp; not requesting restart."
   exit 1
 fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+if ! gc bd update "$NEXT" --assignee="$GC_AGENT" --status=in_progress; then
   echo "Could not assign next refinery wisp; not requesting restart."
   exit 1
 fi
@@ -178,7 +178,7 @@ done
 
 # If none found, pour one (root-only — no child step beads) and assign it
 WISP=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$WISP" --assignee="$GC_AGENT"
+gc bd update "$WISP" --assignee="$GC_AGENT" --status=in_progress
 ```
 
 Then follow the formula. The step descriptions below are your instructions —

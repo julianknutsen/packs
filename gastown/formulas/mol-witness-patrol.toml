@@ -2,7 +2,18 @@ description = """
 Witness patrol loop. Poured as a root-only wisp on startup:
 
   gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}'
-  gc bd update $WISP --assignee=$GC_AGENT
+  gc bd update $WISP --assignee=$GC_AGENT --status=in_progress
+
+`--status=in_progress` is not optional. `gc bd mol wisp` pours at
+status=open and `--assignee` alone does not transition it, so a wisp
+poured without it is invisible to the startup resume check (which filters
+`status=in_progress`). A restarted session then finds nothing in progress,
+pours ANOTHER wisp, and orphans the previous one — open, assigned, never
+burned, never resumed. Silent duplication on every restart.
+
+Do not substitute `gc bd update <id> --claim`: it errors "already claimed"
+instead of repairing status when the assignee already matches, so it cannot
+recover a wisp left in the open+assigned partial state.
 
 Each wisp is ONE iteration: check for work, patrol, pour the next
 iteration. On crash, re-read the formula steps and determine where
@@ -527,24 +538,67 @@ is already assigned — the new session resumes from context.
 
 Reuse an already-queued wisp instead of pouring a duplicate. A prior cycle
 may have poured a next wisp without burning, or a restart may have raced —
-keep one open patrol wisp and burn any surplus, so wisps never accumulate.
-Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
-valid gc bd type and matches nothing).
+keep one patrol wisp and burn any surplus, so wisps never accumulate.
+
+Two rules make this reconcile work, and both are load-bearing:
+
+- **Enumerate with `gc bd query` on `ephemeral=true`.** Wisp roots are
+  ephemeral rows, and `gc bd list` hides those unless it is passed
+  `--include-infra` — the flagless scan this replaces returned zero rows even
+  when the wisps were sitting right there, so it found no surplus to burn and
+  no successor to reuse, and every cycle poured a fresh wisp. `gc bd list
+  --include-infra` does return them; `gc bd query` is used here because it
+  selects the ephemeral tier directly and leaves no flag to forget.
+  (`--type=wisp` is worse either way: `wisp` is not a valid gc bd type, so the
+  command hard-errors.)
+- **Exclude the wisp you are executing, by id.** It is never a reuse or a
+  burn candidate here — step 3 burns it. Resolve it first, and if nothing
+  resolves, pour nothing and burn nothing.
+
 ```bash
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
-NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
-for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
+CURRENT_WISP=${GC_BEAD_ID:-}
+if [ -z "$CURRENT_WISP" ]; then
+  CURRENT_WISP=$(gc bd query --json 'ephemeral=true AND status=in_progress' --limit=0 | jq -r --arg id "$GC_AGENT" '[.[] | select((.assignee // "") == $id)] | .[0].id // empty')
+fi
+if [ -z "$CURRENT_WISP" ]; then
+  # Repair path: a wisp poured before this fix is still status=open. Adopt the
+  # oldest one as the wisp you are executing and promote it.
+  CURRENT_WISP=$(gc bd query --json 'ephemeral=true AND status=open' --limit=0 | jq -r --arg id "$GC_AGENT" --arg f mol-witness-patrol '[.[] | select((.assignee // "") == $id and (.title // "") == $f)] | sort_by(.created_at) | .[0].id // empty')
+  [ -n "$CURRENT_WISP" ] && gc bd update "$CURRENT_WISP" --status=in_progress
+fi
+if [ -z "$CURRENT_WISP" ]; then
+  echo "Could not resolve current witness wisp; not pouring and not burning."
+  gc runtime drain-ack
+  exit 1
+fi
+
+SURPLUS=$(gc bd query --json 'ephemeral=true AND (status=open OR status=in_progress)' --limit=0 | jq -r --arg id "$GC_AGENT" --arg f mol-witness-patrol --arg self "$CURRENT_WISP" '[.[] | select((.assignee // "") == $id and (.title // "") == $f and .id != $self)] | sort_by(.created_at) | .[].id')
+NEXT=$(printf '%s\n' $SURPLUS | sed -n '1p')
+for extra in $(printf '%s\n' $SURPLUS | sed '1d'); do
   gc bd mol burn "$extra" --force
 done
 if [ -z "$NEXT" ]; then
-  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
-  gc bd update "$NEXT" --assignee="$GC_AGENT"
+  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ]; then
+    echo "Could not pour next witness wisp; not burning."
+    gc runtime drain-ack
+    exit 1
+  fi
+fi
+if ! gc bd update "$NEXT" --assignee="$GC_AGENT" --status=in_progress; then
+  echo "Could not assign next witness wisp; not burning."
+  gc runtime drain-ack
+  exit 1
 fi
 ```
 
+Assigning an adopted successor is idempotent, and re-running the update is
+what repairs a wisp stuck in the open+assigned partial state that
+`gc bd update --claim` refuses to touch.
+
 **3. Burn this wisp:**
 ```bash
-gc bd mol burn <this-wisp-id> --force
+gc bd mol burn "$CURRENT_WISP" --force
 ```
 
 **4. Exit this turn:**

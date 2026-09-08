@@ -61,8 +61,10 @@ Your formula: `mol-deacon-patrol`
 gc mail inbox
 
 # Step 3: Still nothing? Create patrol wisp (root-only — no child step beads)
+# --status=in_progress is load-bearing: a wisp poured at status=open is
+# invisible to the next restart's resume check, which pours a duplicate.
 NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"
+gc bd update "$NEW_WISP" --assignee="$GC_ALIAS" --status=in_progress
 
 # Step 4: Read the formula recipe — these are the steps to execute
 # (Use 'gc bd formula show' for the recipe on disk; 'gc bd mol show' is
@@ -87,18 +89,24 @@ without running `next-iteration` (crash recovery or formula misread).
 If `next-iteration` already ran, do not pour again; run `gc hook`.
 
 ```bash
+# Wisp roots are ephemeral rows, which `gc bd list` hides unless it is given
+# --include-infra; the flagless lookup below used to return zero rows even
+# with wisps open. `gc bd query` selects the ephemeral tier directly, so there
+# is no flag left to forget.
+# ASSIGNED_WISP excludes $CURRENT_WISP by id — the wisp you are executing is
+# burned below, never mistaken for an already-queued successor.
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd query --json 'ephemeral=true AND status=in_progress' --limit=0 | jq -r --arg id "$GC_AGENT" --arg f mol-deacon-patrol '[.[] | select((.assignee // "") == $id and (.title // "") == $f)] | .[0].id // empty')
 fi
-ASSIGNED_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+ASSIGNED_WISP=$(gc bd query --json 'ephemeral=true AND (status=open OR status=in_progress)' --limit=0 | jq -r --arg id "$GC_AGENT" --arg f mol-deacon-patrol --arg self "$CURRENT_WISP" '[.[] | select((.assignee // "") == $id and (.title // "") == $f and .id != $self)] | sort_by(.created_at) | .[0].id // empty')
 if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
   NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
   if [ -z "$NEXT" ]; then
     echo "Could not pour next deacon wisp; not burning."
     exit 1
   fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT" --status=in_progress; then
     echo "Could not assign next deacon wisp; not burning."
     exit 1
   fi
@@ -111,7 +119,7 @@ elif [ -z "$ASSIGNED_WISP" ]; then
     echo "Could not bootstrap next deacon wisp."
     exit 1
   fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+  if ! gc bd update "$NEXT" --assignee="$GC_AGENT" --status=in_progress; then
     echo "Could not assign bootstrap deacon wisp."
     exit 1
   fi

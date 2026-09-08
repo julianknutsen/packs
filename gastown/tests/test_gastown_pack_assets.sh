@@ -253,6 +253,66 @@ test_prime_prompts_are_city_generic_and_compact() {
         fail "operational awareness must fail closed when endpoint discovery fails"
 }
 
+assert_patrol_wisp_pour_is_resumable() {
+    local role="$1" asset="$2" pours assigns
+
+    # Every pour must be paired with an assign that also transitions the new
+    # wisp to in_progress. A wisp left at status=open is invisible to the
+    # startup resume check, so the next session pours a duplicate and orphans
+    # this one (open, assigned, never burned, never resumed).
+    # `|| true` on every count: grep -c exits 1 on zero matches, which under
+    # `set -e` would abort the script before the explanatory fail() ran.
+    pours=$(grep -c "gc bd mol wisp mol-$role-patrol --root-only" "$asset" || true)
+    [[ "$pours" -gt 0 ]] ||
+        fail "$role $(basename "$asset") should pour at least one patrol wisp"
+    assigns=$(grep -cE 'gc bd update "?\$(NEXT|WISP|NEW_WISP)"? --assignee=("?\$GC_(AGENT|ALIAS)"?) --status=in_progress' "$asset" || true)
+    [[ "$assigns" -gt 0 ]] ||
+        fail "$role $(basename "$asset") must assign poured wisps with --status=in_progress"
+    ! grep -E 'gc bd update "?\$(NEXT|WISP|NEW_WISP)"? --assignee=("?\$GC_(AGENT|ALIAS)"?)\s*(;|$)' "$asset" >/dev/null ||
+        fail "$role $(basename "$asset") must not assign a wisp without --status=in_progress"
+
+    # Wisp lookups must reach the ephemeral tier. `gc bd list` hides ephemeral
+    # beads unless it is passed --include-infra, so a flagless --type=molecule
+    # lookup silently resolves empty: no surplus is burned, no successor is
+    # reused, and every cycle pours a fresh wisp on top of the leaked one.
+    # A list that does pass --include-infra is not a defect, so only the
+    # flagless form fails here -- pinning the query form instead would make
+    # this a style rule and collide with #278, which fixes the same bug that
+    # way.
+    ! grep -E 'gc bd list[^`]*--type=molecule' "$asset" | grep -vq -- '--include-infra' ||
+        fail "$role $(basename "$asset") looks up wisps with gc bd list and no --include-infra (ephemeral beads are hidden)"
+    grep -F "gc bd query --json 'ephemeral=true" "$asset" >/dev/null ||
+        fail "$role $(basename "$asset") must resolve wisps via gc bd query on ephemeral=true"
+}
+
+test_patrol_wisp_pour_is_resumable() {
+    local role formula
+    for role in refinery witness deacon; do
+        assert_patrol_wisp_pour_is_resumable "$role" "$GASTOWN/formulas/mol-$role-patrol.toml"
+        assert_patrol_wisp_pour_is_resumable "$role" "$GASTOWN/agents/$role/prompt.template.md"
+    done
+
+    # The refinery formula repeats the pour/resolve pair at every exit path;
+    # each one needs its own current-wisp resolution or that path burns nothing.
+    formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
+    local pours resolves
+    pours=$(grep -c 'NEXT=\$(gc bd mol wisp mol-refinery-patrol --root-only' "$formula" || true)
+    resolves=$(grep -c "CURRENT_WISP=\$(gc bd query --json 'ephemeral=true AND status=in_progress'" "$formula" || true)
+    [[ "$resolves" -eq "$pours" ]] ||
+        fail "refinery pour sites ($pours) must each resolve the current wisp via gc bd query ($resolves)"
+
+    # The witness reconcile must exclude the wisp it is executing. Without the
+    # self-exclusion it reuses its own wisp as the successor, then burns it in
+    # the next step and the patrol is left holding nothing.
+    local witness_formula="$GASTOWN/formulas/mol-witness-patrol.toml"
+    grep -F -- '--arg self "$CURRENT_WISP"' "$witness_formula" >/dev/null ||
+        fail "witness wisp reconcile must pass the current wisp id into the surplus query"
+    grep -E '\.id != \$self\)\]' "$witness_formula" >/dev/null ||
+        fail "witness wisp reconcile must exclude the current wisp by id"
+    grep -F 'gc bd mol burn "$CURRENT_WISP" --force' "$GASTOWN/formulas/mol-witness-patrol.toml" >/dev/null ||
+        fail "witness must burn the resolved current wisp, not a placeholder id"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_shutdown_dance_contracts_are_executable
@@ -262,5 +322,6 @@ test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+test_patrol_wisp_pour_is_resumable
 
 echo "gastown pack asset tests passed"

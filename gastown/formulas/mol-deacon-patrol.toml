@@ -2,7 +2,18 @@ description = """
 Deacon patrol loop. Poured as a root-only wisp on startup:
 
   gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}'
-  gc bd update $WISP --assignee=$GC_AGENT
+  gc bd update $WISP --assignee=$GC_AGENT --status=in_progress
+
+`--status=in_progress` is not optional. `gc bd mol wisp` pours at
+status=open and `--assignee` alone does not transition it, so a wisp
+poured without it is invisible to the startup resume check (which filters
+`status=in_progress`). A restarted session then finds nothing in progress,
+pours ANOTHER wisp, and orphans the previous one — open, assigned, never
+burned, never resumed. Silent duplication on every restart.
+
+Do not substitute `gc bd update <id> --claim`: it errors "already claimed"
+instead of repairing status when the assignee already matches, so it cannot
+recover a wisp left in the open+assigned partial state.
 
 Each wisp is ONE iteration: check inbox, run town-wide coordination
 tasks, pour the next iteration. On crash, re-read the formula steps
@@ -533,10 +544,23 @@ gc mail inbox
 Handle any urgent messages that arrived during patrol. Archive the rest.
 
 **3. Resolve current wisp and pour next iteration BEFORE burning:**
+
+Wisp roots are ephemeral rows, and `gc bd list` hides those unless it is
+passed `--include-infra`. The flagless lookup this replaces silently resolved
+empty and the loop refused to burn. Resolve through `gc bd query` instead: it
+selects the ephemeral tier directly, so the correct result does not depend on
+remembering a flag. The second query repairs a
+wisp left at `status=open` by a session that predates this fix: adopt the
+oldest one as the wisp you are executing and promote it, so the burn below
+has a real id instead of draining the patrol.
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd query --json 'ephemeral=true AND status=in_progress' --limit=0 | jq -r --arg id "$GC_AGENT" '[.[] | select((.assignee // "") == $id)] | .[0].id // empty')
+fi
+if [ -z "$CURRENT_WISP" ]; then
+  CURRENT_WISP=$(gc bd query --json 'ephemeral=true AND status=open' --limit=0 | jq -r --arg id "$GC_AGENT" --arg f mol-deacon-patrol '[.[] | select((.assignee // "") == $id and (.title // "") == $f)] | sort_by(.created_at) | .[0].id // empty')
+  [ -n "$CURRENT_WISP" ] && gc bd update "$CURRENT_WISP" --status=in_progress
 fi
 
 NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id // empty')
@@ -545,7 +569,7 @@ if [ -z "$NEXT" ]; then
   gc runtime drain-ack
   exit 1
 fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+if ! gc bd update "$NEXT" --assignee="$GC_AGENT" --status=in_progress; then
   echo "Could not assign next deacon wisp; not burning."
   gc runtime drain-ack
   exit 1
