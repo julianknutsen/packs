@@ -28,8 +28,20 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: slack-full/adapter/go.mod
+          # Every go.sum in the repo, or the cache silently under-covers:
+          # slack-full/adapter's is new (it took its first dependency in #269)
+          # and slack-mini/adapter's was never listed, so both were re-fetched
+          # from the proxy on every run and neither would invalidate the cache
+          # on a future dependency bump. The other three modules
+          # (slack-channel/adapter, runtime-cloudflare/runtime, and the root
+          # module) have no external deps and so no go.sum — nothing to list,
+          # and nothing worth listing speculatively: setup-go hashes these
+          # paths as a set and throws "Some specified paths were not resolved"
+          # if the match comes back empty.
           cache-dependency-path: |
+            slack-full/adapter/go.sum
             slack-full/cli/go.sum
+            slack-mini/adapter/go.sum
 
       - name: Install Python test dependencies
         run: python3 -m pip install PyYAML pytest jsonschema
@@ -107,6 +119,27 @@ jobs:
       - name: Run Slack mini adapter tests
         working-directory: slack-mini/adapter
         run: go test ./...
+
+      # Recurrence guard for #269: the adapter reached main calling
+      # syscall.Openat, which does not exist on darwin, because every Go step
+      # above builds for linux only — a developer on a Mac was the first and
+      # only detector. confined_open.go is security-critical platform-syscall
+      # code, so that break has to surface here instead.
+      #
+      # `go vet` and not `go build`: vet type-checks _test.go files too, and
+      # two of #269's three repairs lived in test files. Refute with a
+      # darwin-only symbol referenced from a _test.go alone — `go build ./...`
+      # stays green, `go vet ./...` fails.
+      #
+      # Cross-compilation, so no macOS runner is needed. It catches the
+      # compile-break class only; darwin *runtime* behavior stays unverified.
+      - name: Cross-compile Go modules for darwin
+        run: |
+          for module in slack-full/adapter slack-full/cli \
+                        slack-channel/adapter slack-mini/adapter; do
+            echo "==> $module"
+            (cd "$module" && GOOS=darwin GOARCH=arm64 go vet ./...)
+          done
 
       - name: Run runtime-cloudflare module tests
         working-directory: runtime-cloudflare/runtime
