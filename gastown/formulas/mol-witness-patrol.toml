@@ -252,6 +252,84 @@ infrastructure agents (not pool instances) should be skipped — those
 agents have persistent identity and the controller manages their
 lifecycle directly.
 
+**Step 1b: PLAIN-rail halt gate — run BEFORE any salvage.**
+
+An orphan is a bead whose worker *vanished*. A bead whose worker *finished and
+deliberately stopped* is not an orphan, and it is the success path of the city's
+primary no-push rail: the polecat committed to its branch, wrote `branch_ready` /
+`halt_reason`, cleared its own assignee, and handed the bead to the mayor to
+publish. Step 1 cannot tell the two apart — both end with a dead session and an
+unmerged branch — so this gate reads the markers the polecat left behind.
+
+Classify each candidate bead `$BEAD` from Step 1 with the shared gate. The
+`def halt_gate:` block below is byte-identical to the one in
+`mol-refinery-patrol.find-work` — only the invocation after it differs (one bead
+here, a list there). Keep the two copies in sync; `test_halt_rail_gate.sh`
+fails if they drift:
+
+```bash
+HALT_GATE='def halt_gate:
+  def truthy: if type == "boolean" then .
+              elif type == "string" then (ascii_downcase == "true")
+              else false end;
+  (if type == "array" then (.[0] // {}) elif type == "object" then . else {} end) as $b
+  | ($b.metadata) as $raw
+  | (if ($raw | type) == "string" then ($raw | fromjson? // {})
+     elif ($raw | type) == "object" then $raw
+     else {} end) as $m
+  | (if ($m | has("halt_reason")) then
+         ((($m.halt_reason // "") | tostring | .[0:60]) as $v
+          | if $v == "" then "halt_reason" else "halt_reason=" + $v end)
+     elif ($m | has("branch_ready")) and ($m.branch_ready | truthy) then "branch_ready"
+     else "" end) as $fin
+  | (($m | has("auto_push")) and (($m.auto_push | truthy) | not)) as $nopush
+  | {finished: ($fin != ""),
+     publish_blocked: (($fin != "") or $nopush),
+     marker: (if $fin != "" then $fin
+              elif $nopush then "auto_push=" + ($m.auto_push | tostring)
+              else "" end)};
+
+halt_gate'
+
+GATE=$(gc bd show "$BEAD" --json 2>/dev/null | jq -c "$HALT_GATE" 2>/dev/null)
+FINISHED=$(printf '%s' "$GATE" | jq -r '.finished // false')
+PUBLISH_BLOCKED=$(printf '%s' "$GATE" | jq -r '.publish_blocked // false')
+MARKER=$(printf '%s' "$GATE" | jq -r '.marker // ""')
+```
+
+**If `FINISHED` is true → REPORT ONLY. Skip this bead entirely.**
+
+Do not push. Do not remove the worktree. Do not reset the bead to the pool. Do not
+close it. Do not set `recovered=true`. The bead is finished and held; its worktree
+is the operator's working copy, and its branch is unpublished *on purpose*. Record
+it and move to the next candidate:
+
+```bash
+echo "HALT-SKIP $BEAD ($MARKER) — finished-and-halted, not an orphan. Reporting only."
+```
+
+Roll every halted bead into ONE line of the Step 4 mayor mail (see the table there);
+do not mail per bead — a held bead is a normal steady state, and per-bead mail on a
+rig holding five of them trains the mayor to filter the witness out.
+
+**If `FINISHED` is false but `PUBLISH_BLOCKED` is true → recover, but never publish.**
+
+This is a genuinely dead worker on a bead the caller marked no-publish before
+dispatch (`auto_push` falsy, set at creation, before any work existed). The work
+must be preserved and the bead must become schedulable again, but nothing may leave
+this box. Carry `PUBLISH_BLOCKED` into Step 2 and obey the publish-authorisation
+rule at the top of the case list.
+
+**If both are false →** proceed to Step 2 unchanged.
+
+**Fail-open is deliberate.** An unreadable bead yields `finished=false /
+publish_blocked=false` and recovers exactly as it does today. A gate that failed
+closed would let one malformed bead freeze orphan recovery for the whole rig —
+the same trap the Step 1 empty-liveness-map fail-safe exists to avoid, in the
+opposite direction: that one refuses to *act* on missing evidence, this one
+refuses to *block* on it, because here "no marker" is the overwhelmingly common
+truthful answer rather than a symptom of schema drift.
+
 **Step 2: For each orphaned bead, salvage work from the worktree.**
 
 The canonical work chain: `worktree → (push) → branch → (merge) → target`.
@@ -264,7 +342,32 @@ WORKTREE=$(echo "$META" | jq -r '.worktree // empty')
 BRANCH=$(echo "$META" | jq -r '.branch // empty')
 ```
 
+**Publish authorisation (Step 1b's `PUBLISH_BLOCKED`) governs every case below.**
+
+`git push` from a witness is a publish. When `PUBLISH_BLOCKED` is true the witness
+has no authority to perform it for this bead, no matter which case matches:
+
+- **Never `git push`.** Not to make a branch canonical, not "just to be safe".
+- **Never remove the worktree.** The push is what makes a worktree disposable; with
+  the push withheld, the worktree is the ONLY copy of the work. Removing it here is
+  the data-loss path this rule exists to close.
+- **Do commit in place** if the tree is dirty (`git add -A && git commit`) — a local
+  commit publishes nothing and protects the work from the next reaper.
+- **Do return the bead to the pool** and leave `work_dir` / `branch` intact, so the
+  next polecat's `workspace-setup` resumes the existing worktree and branch rather
+  than starting over.
+- **Mail the mayor.** A no-publish bead whose worker died needs a human or the mayor
+  to decide how it lands; the witness cannot decide that.
+
 Check the bead and worktree state, then act:
+
+**Case H: Bead is finished-and-halted (Step 1b `FINISHED` true).**
+Report only — the bead never reaches this step. Listed here so the case table is
+complete and the next reader does not reconstruct the salvage path for it.
+A `branch_ready` / `halt_reason` bead has already run its done sequence; the absent
+push and the cleared assignee are the designed outcome, not a crash to repair.
+Publishing it overrides an operator hold, and merging it (which follows, once the
+branch is on origin and the refinery sees it) publishes work nobody approved.
 
 **Case A: Branch exists on origin (work already published).**
 Worktree is disposable — canonical work is on the branch.
@@ -366,6 +469,8 @@ recovery is unexpected or concerning — use your judgment:
 
 | Situation | Action |
 |-----------|--------|
+| Finished-and-halted bead skipped (Step 1b) | Log. ONE rolled-up line in the cycle's mayor mail, not one mail per bead. Steady state, not an incident. |
+| Dead worker on a no-publish bead (`PUBLISH_BLOCKED`) | Log + mail mayor. Work is committed locally and unpublished; the mayor decides how it lands. |
 | Pool resize / config change removed agent | Log only. Routine. |
 | Agent crashed mid-work, branch already on origin | Log + nudge mayor. Low urgency. |
 | Work salvaged from worktree (data was at risk) | Log + mail mayor. Work was nearly lost. |

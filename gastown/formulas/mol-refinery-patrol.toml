@@ -169,11 +169,70 @@ needs = ["check-inbox"]
 description = """
 **Config: event_timeout = {{event_timeout}}**
 
-Search for work beads assigned to you with branch metadata:
+Search for work beads assigned to you with branch metadata, then drop any the
+PLAIN rail has marked no-publish:
+
 ```bash
-WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \
-  --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
+HALT_GATE='def halt_gate:
+  def truthy: if type == "boolean" then .
+              elif type == "string" then (ascii_downcase == "true")
+              else false end;
+  (if type == "array" then (.[0] // {}) elif type == "object" then . else {} end) as $b
+  | ($b.metadata) as $raw
+  | (if ($raw | type) == "string" then ($raw | fromjson? // {})
+     elif ($raw | type) == "object" then $raw
+     else {} end) as $m
+  | (if ($m | has("halt_reason")) then
+         ((($m.halt_reason // "") | tostring | .[0:60]) as $v
+          | if $v == "" then "halt_reason" else "halt_reason=" + $v end)
+     elif ($m | has("branch_ready")) and ($m.branch_ready | truthy) then "branch_ready"
+     else "" end) as $fin
+  | (($m | has("auto_push")) and (($m.auto_push | truthy) | not)) as $nopush
+  | {finished: ($fin != ""),
+     publish_blocked: (($fin != "") or $nopush),
+     marker: (if $fin != "" then $fin
+              elif $nopush then "auto_push=" + ($m.auto_push | tostring)
+              else "" end)};
+
+map({id: .id, gate: halt_gate})'
+
+CANDIDATES=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \
+  --exclude-type=epic --has-metadata-key=branch --limit=25 --json)
+
+GATED=$(printf '%s' "$CANDIDATES" | jq -c "$HALT_GATE")
+WORK=$(printf '%s' "$GATED" | jq -r 'map(select(.gate.publish_blocked | not)) | .[0].id // empty')
+SKIPPED=$(printf '%s' "$GATED" | jq -r 'map(select(.gate.publish_blocked)) | .[] | .id + " (" + .gate.marker + ")"')
 ```
+
+**A merge is a publish.** A bead carrying `halt_reason`, a truthy `branch_ready`, or
+a falsy `auto_push` is on the no-push rail: an operator or the mayor publishes it, on
+their schedule, or not at all. The refinery must not merge it whatever its branch
+state — not when the branch is clean, and not after a rejected attempt has been
+re-slung and re-halted. `metadata.branch` records where the work *is*; it is not
+consent to land it.
+
+**`--limit=25`, not `--limit=1`, is load-bearing.** The gate is a client-side filter
+because `gc bd list` has no metadata-key negation — `--has-metadata-key` and
+`--metadata-field` are both positive-only. Filtering a `--limit=1` result would make
+one halted bead at the head of the queue mask every mergeable bead behind it: the
+refinery would report `IDLE` while real work waited, and a permanently-held bead
+would starve the queue permanently. Fetch a page, filter, take the first survivor.
+Raise the limit if a rig ever holds more than ~25 halted beads at once; that is
+itself worth telling the mayor about.
+
+Report what you skipped — a silent skip is indistinguishable from an empty queue,
+and the operator holding those beads is the one person who needs to know the
+refinery saw them and left them alone:
+
+```bash
+if [ -n "$SKIPPED" ]; then
+  echo "HALT-SKIP (no-publish rail, not merged):"
+  echo "$SKIPPED"
+fi
+```
+
+Carry the skip list into `patrol-summary` for this cycle. Do not mail per bead: a
+held bead is a steady state, not an incident.
 
 `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
 database. Without it, `gc bd list` routes to the HQ database and never
