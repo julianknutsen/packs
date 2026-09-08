@@ -816,3 +816,109 @@ def test_kind_room_does_not_hijack_non_company_session(
     rc_code = rc.main(["--conversation-id", "C0LEGACY", "--kind", "room", "--body", "hi"])
     assert rc_code == 0
     assert seen["kind"] == "room"  # honored as the legacy conversation kind
+
+
+# --------------------------------------------------------------------------
+# Accidental-mrkdwn guard (gp-o42) — tilde pairs must not strike through.
+# --------------------------------------------------------------------------
+
+_RUNWAY_LINE = "• Total out: ~$58.5k → *~$16.5k left on Sep 30* from a $75k start."
+
+
+def test_body_tildes_are_guarded_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    rc, common = _import_modules()
+    import slack_mrkdwn
+    captured: dict[str, Any] = {}
+
+    def fake_request(method, url, body=None, *, csrf=True, timeout=30.0):
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True, "MessageID": "1700000.000100"}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(common, "find_latest_inbound_for_session", lambda _sid: None)
+    monkeypatch.setattr(common, "find_latest_inbound_thread_for_session",
+                        lambda _sid: None, raising=False)
+    monkeypatch.setattr(common, "look_up_binding", lambda _sid: None)
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0BEZ3CQK5X",
+        "--body", _RUNWAY_LINE,
+    ])
+    assert exit_code == 0
+    text = captured["body"]["text"]
+    assert "~" not in text  # no pairable ASCII tildes reach Slack
+    assert text == _RUNWAY_LINE.replace("~", slack_mrkdwn.TILDE_SUBSTITUTE)
+
+
+def test_raw_flag_skips_the_mrkdwn_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    rc, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method, url, body=None, *, csrf=True, timeout=30.0):
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True, "MessageID": "1700000.000100"}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(common, "find_latest_inbound_for_session", lambda _sid: None)
+    monkeypatch.setattr(common, "find_latest_inbound_thread_for_session",
+                        lambda _sid: None, raising=False)
+    monkeypatch.setattr(common, "look_up_binding", lambda _sid: None)
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0BEZ3CQK5X",
+        "--body", _RUNWAY_LINE,
+        "--raw",
+    ])
+    assert exit_code == 0
+    assert captured["body"]["text"] == _RUNWAY_LINE
+
+
+def test_company_path_guards_tildes_too(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    # Acceptance case: the mayor's reply-current diverts into the company
+    # path; the exact runway body must land with zero pairable tildes and
+    # intentional *bold* intact — no caller changes.
+    rc, _common = _import_modules()
+    import slack_mrkdwn
+    outbound = _import_outbound()
+    _setup_company(outbound, tmp_path)
+    _write_turn(outbound, session="ollie-main", kind="ambient", agent="ollie",
+                ts="1700000000.000300")
+    monkeypatch.setenv("GC_SESSION_NAME", "ollie-main")
+
+    captured: list = []
+
+    def fake_post(method, token, payload, *, api_base, timeout):
+        captured.append({"token": token, "payload": payload})
+        return 200, {}, {"ok": True, "ts": "1700000000.000900"}
+    monkeypatch.setattr(outbound, "_slack_web_post", fake_post)
+
+    rc_code = rc.main(["--body", _RUNWAY_LINE])
+    assert rc_code == 0
+    text = captured[0]["payload"]["text"]
+    assert "~" not in text
+    assert "*" in text  # bold delimiters untouched
+    assert slack_mrkdwn.TILDE_SUBSTITUTE in text
+
+
+def test_company_path_raw_flag_passes_tildes(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    rc, _common = _import_modules()
+    outbound = _import_outbound()
+    _setup_company(outbound, tmp_path)
+    _write_turn(outbound, session="ollie-main", kind="ambient", agent="ollie",
+                ts="1700000000.000300")
+    monkeypatch.setenv("GC_SESSION_NAME", "ollie-main")
+
+    captured: list = []
+
+    def fake_post(method, token, payload, *, api_base, timeout):
+        captured.append({"token": token, "payload": payload})
+        return 200, {}, {"ok": True, "ts": "1700000000.000900"}
+    monkeypatch.setattr(outbound, "_slack_web_post", fake_post)
+
+    rc_code = rc.main(["--body", _RUNWAY_LINE, "--raw"])
+    assert rc_code == 0
+    assert captured[0]["payload"]["text"] == _RUNWAY_LINE

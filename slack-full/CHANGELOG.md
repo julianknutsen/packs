@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Accidental-mrkdwn guard on the send path (gp-o42): `gc slack
+  reply-current` (legacy and company paths), `publish`,
+  `publish-to-channel`, `upload --initial-comment`, and `delegate` now
+  neutralize tildes that would pair into unintended Slack strikethrough
+  ("~$58.5k … ~$16.5k" rendered half a runway summary struck through).
+  Slack mrkdwn has no escape sequence, so accidental delimiter tildes
+  are substituted with the visually identical U+223C TILDE OPERATOR —
+  but only on lines where a pair could actually form: lone tildes keep
+  their ASCII byte (`cd ~/repo` survives copy-paste), code spans are
+  never touched, a tilde before an optionally-signed digit/currency
+  (`~$5k`, `~-$13.5k`, `~9/2`) is never a delimiter, and deliberate
+  tight-wrapped `~word~` strikethrough still renders. `*bold*`,
+  `_italics_`, and bullets are unaffected. New `--raw` flag on all five
+  commands sends the body verbatim. Pure script-side change — no
+  adapter restart needed.
+
+  Two limits worth knowing. "Lone tilde" is per rendered line, so two
+  home-relative paths on one line (`rsync ~/a ~/b`) are a pairable pair
+  and both get substituted; wrap twin paths in a code span, or use
+  `--raw`, when the exact bytes matter. And `gc slack post-message` is
+  deliberately out of scope: its milestone summary, field values, and
+  rollup items are rendered as mrkdwn by the Go Block Kit renderer,
+  downstream of this Python guard, so a payload carrying
+  "~$58.5k … ~$16.5k" still strikes through (titles are `plain_text`
+  and unaffected). That surface predates this change and guarding it
+  would need a second implementation of the heuristic in Go plus a
+  `gc-slack-cli` rebuild; tracked as gp-x5bdy.
+
+  Scope is this pack only. The sibling packs `slack-channel` (same
+  `publish` / `publish-to-channel` / `reply-current` verbs) and
+  `slack-mini` (`post-message`) carry no guard, so the same `gc slack`
+  verb behaves differently depending on which pack a city installed.
+  Porting was left out deliberately to keep this change script-side
+  with no adapter rebuild; guard-port vs. documented exclusion is
+  tracked as gp-cbxzk.
+
 ### Fixed
 
 - Inbound files recorded inside Slack itself — voice clips (file subtype
@@ -100,6 +138,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Outbound publishes carrying an idempotency key are stamped with a
+  low-visibility reference marker (`_ref:<12 hex>_`) so a later reader can
+  find the exact message in Slack. The in-process dedup cache only lives
+  for its TTL and does not survive a restart, so it cannot provide durable
+  delivery evidence; the marker can. The readback contract — what a marker's
+  absence does and does not mean, and where a reader has to look — is stated
+  normatively in the `referenceMarker` doc comment in `adapter/main.go`, and
+  this entry deliberately does not restate it, so there is one place to edit.
+  Two properties worth knowing without opening the source: absence always
+  means UNKNOWN, never undelivered (all history predating this change is
+  unmarked); and a marker on a threaded reply is not reachable from
+  `conversations.history`, which does not return thread replies.
+
+  Note on Slack's ceiling, since the obvious assumption is wrong: Slack does
+  not reject text over 40,000 — it truncates from the end and still answers
+  `ok:true`. The marker is the tail of the text, so an oversized post would
+  deliver a mangled partial marker under a receipt that looks perfect. The
+  advertised `MaxMessageLength` therefore reserves the marker's 20 bytes, and
+  `handlePublish` enforces the same budget itself rather than trusting an
+  advertisement nothing in gc reads today. Over the budget the caller's text
+  is posted **unstamped** rather than trimmed: the message is the caller's,
+  the bookkeeping is ours, and an honest absence is already something the
+  contract requires readers to tolerate. When Slack reports a truncation
+  anyway, the publish receipt carries `metadata["truncated"]="true"`
+  (`dr-3msk6.3`).
 - `gc slack retry-peer-fanout` — operational recovery for peer-fanout.
   Walks recent `extmsg.peer_fanout_failed` events (added in this change
   too), filters by `--since` / `--conversation` / `--max`, deduplicates

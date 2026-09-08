@@ -1612,3 +1612,60 @@ def test_mpim_pointer_golden_fixture_parses_if_present(env) -> None:
     assert parsed["room"] == ""  # empty room permitted for kind mpim
     assert parsed["owner_app_id"]
     assert "delegation_key" not in json.loads(fx.read_text())  # mpim turns are keyless
+
+
+# --------------------------------------------------------------------------
+# 17. Accidental-mrkdwn guard (gp-o42) on the delegate verb — the body is
+#     posted as mrkdwn, so tilde pairs would strike it through.
+# --------------------------------------------------------------------------
+
+_RUNWAY_LINE = "• Total out: ~$58.5k → *~$16.5k left on Sep 30* from a $75k start."
+
+
+def _capture_delegate(env, monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Fake ``run_delegate`` so the test pins exactly the CLI plumbing:
+    argv → body load → guard → the body the delegation actually posts."""
+    captured: dict = {}
+
+    def fake_run_delegate(**kwargs):
+        captured.update(kwargs)
+        return {"status": "posted", "posted_ts": "1700000000.000900"}
+
+    monkeypatch.setattr(env, "run_delegate", fake_run_delegate)
+    monkeypatch.setenv("GC_SESSION_NAME", "ollie-main")
+    return captured
+
+
+def test_delegate_body_is_guarded_by_default(
+        env, monkeypatch: pytest.MonkeyPatch) -> None:
+    import slack_mrkdwn  # type: ignore
+    captured = _capture_delegate(env, monkeypatch)
+
+    assert env.cmd_delegate(["--to", "riley", "--body", _RUNWAY_LINE]) == 0
+    assert "~" not in captured["body"]  # no pairable ASCII tilde reaches Slack
+    assert captured["body"] == \
+        _RUNWAY_LINE.replace("~", slack_mrkdwn.TILDE_SUBSTITUTE)
+
+
+def test_delegate_raw_flag_skips_the_guard(
+        env, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _capture_delegate(env, monkeypatch)
+
+    assert env.cmd_delegate(
+        ["--to", "riley", "--body", _RUNWAY_LINE, "--raw"]) == 0
+    assert captured["body"] == _RUNWAY_LINE
+
+
+def test_delegate_body_file_is_guarded_too(
+        env, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    # --body-file is the documented shape in the agent prompt fragment, and
+    # it loads through the same _load_body_arg the guard sits after.
+    import slack_mrkdwn  # type: ignore
+    captured = _capture_delegate(env, monkeypatch)
+    body_file = tmp_path / "delegation.md"
+    body_file.write_text(_RUNWAY_LINE, encoding="utf-8")
+
+    assert env.cmd_delegate(
+        ["--to", "riley", "--body-file", str(body_file)]) == 0
+    assert captured["body"] == \
+        _RUNWAY_LINE.replace("~", slack_mrkdwn.TILDE_SUBSTITUTE)

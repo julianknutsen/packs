@@ -11,6 +11,9 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+GASCITY_CORE_SOURCE = (
+    "https://github.com/gastownhall/gascity.git//internal/bootstrap/packs/core"
+)
 
 
 @dataclass(frozen=True)
@@ -32,12 +35,20 @@ def gc_test_bin() -> Path:
     return binary
 
 
-def write_prompt_workspace(
+def _write_workspace_scaffold(
     root: Path,
     *,
-    city_binding: str,
-    city_pack: Path,
+    workspace_name: str,
+    pack_toml: str,
+    city_toml: str,
+    extra_env: dict[str, str] | None = None,
 ) -> PromptWorkspace:
+    """Build the hermetic fixture city every integration fixture here shares.
+
+    Fixtures differ only in their pack.toml/city.toml contents and in env
+    deltas; the directory layout, the site.toml rig registration, and the
+    isolating env base are identical, so they live here once.
+    """
     city_dir = root / "city"
     rig_dir = root / "fixture"
     gc_home = root / "gc-home"
@@ -47,43 +58,12 @@ def write_prompt_workspace(
     gc_home.mkdir()
     home.mkdir()
 
-    roles_source = (REPO_ROOT / "gascity" / "roles").resolve()
-    city_pack = city_pack.resolve()
-    city_dir.joinpath("pack.toml").write_text(
-        textwrap.dedent(
-            f"""\
-            [pack]
-            name = "prompt-integration"
-            schema = 2
-
-            [imports.{city_binding}]
-            source = {json.dumps(str(city_pack))}
-            """
-        ),
-        encoding="utf-8",
-    )
-    city_dir.joinpath("city.toml").write_text(
-        textwrap.dedent(
-            f"""\
-            [workspace]
-            provider = "codex"
-
-            [providers.codex]
-            base = "builtin:codex"
-
-            [[rigs]]
-            name = "fixture"
-
-            [rigs.imports.gc]
-            source = {json.dumps(str(roles_source))}
-            """
-        ),
-        encoding="utf-8",
-    )
+    city_dir.joinpath("pack.toml").write_text(pack_toml, encoding="utf-8")
+    city_dir.joinpath("city.toml").write_text(city_toml, encoding="utf-8")
     city_dir.joinpath(".gc", "site.toml").write_text(
         textwrap.dedent(
             f"""\
-            workspace_name = "prompt-integration"
+            workspace_name = {json.dumps(workspace_name)}
 
             [[rig]]
             name = "fixture"
@@ -101,8 +81,87 @@ def write_prompt_workspace(
         "GC_CITY_PATH": str(city_dir),
         "GC_CITY_ROOT": str(city_dir),
         "GC_RIG": "fixture",
+        **(extra_env or {}),
     }
     return PromptWorkspace(city_dir=city_dir, rig_dir=rig_dir, env=env)
+
+
+def write_prompt_workspace(
+    root: Path,
+    *,
+    city_binding: str,
+    city_pack: Path,
+) -> PromptWorkspace:
+    roles_source = (REPO_ROOT / "gascity" / "roles").resolve()
+    city_pack = city_pack.resolve()
+    return _write_workspace_scaffold(
+        root,
+        workspace_name="prompt-integration",
+        pack_toml=textwrap.dedent(
+            f"""\
+            [pack]
+            name = "prompt-integration"
+            schema = 2
+
+            [imports.{city_binding}]
+            source = {json.dumps(str(city_pack))}
+            """
+        ),
+        city_toml=textwrap.dedent(
+            f"""\
+            [workspace]
+            provider = "codex"
+
+            [providers.codex]
+            base = "builtin:codex"
+
+            [[rigs]]
+            name = "fixture"
+
+            [rigs.imports.gc]
+            source = {json.dumps(str(roles_source))}
+            """
+        ),
+    )
+
+
+def write_gastown_sling_workspace(root: Path) -> PromptWorkspace:
+    gastown_source = (REPO_ROOT / "gastown").resolve()
+    return _write_workspace_scaffold(
+        root,
+        workspace_name="gastown-sling-integration",
+        pack_toml=textwrap.dedent(
+            f"""\
+            [pack]
+            name = "gastown-sling-integration"
+            schema = 2
+
+            [imports.core]
+            source = {json.dumps(GASCITY_CORE_SOURCE)}
+            """
+        ),
+        city_toml=textwrap.dedent(
+            f"""\
+            [workspace]
+            provider = "opencode"
+
+            [providers.opencode]
+            base = "builtin:opencode"
+
+            [beads]
+            provider = "file"
+
+            [[rigs]]
+            name = "fixture"
+            prefix = "gc"
+            default_branch = "main"
+
+            [rigs.imports.gastown]
+            source = {json.dumps(str(gastown_source))}
+            """
+        ),
+        extra_env={"GC_BEADS": "file"},
+    )
 
 
 def run_gc(
@@ -149,6 +208,34 @@ def test_city_scoped_gascity_registers_claim_command_from_rig(
     assert "Atomically claim one routed workflow bead" in result.stdout
     assert "Usage:\n  gc gc claim" in result.stdout
     assert "Gas City CLI — orchestration-builder" not in result.stdout
+
+
+def test_plain_gastown_polecat_sling_starts_default_graph_workflow(
+    tmp_path: Path, gc_test_bin: Path
+) -> None:
+    workspace = write_gastown_sling_workspace(tmp_path)
+
+    result = run_gc(
+        gc_test_bin,
+        workspace,
+        "--city",
+        str(workspace.city_dir),
+        "--rig",
+        "fixture",
+        "sling",
+        "fixture/gastown.polecat",
+        "Exercise the default polecat workflow",
+        "--json",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["target"] == "fixture/gastown.polecat"
+    assert payload["method"] == "default-on-formula"
+    assert payload["formula"] == "mol-polecat-work"
+    assert payload["workflow_id"]
+    assert payload["bead_id"] == payload["workflow_id"]
+    assert "molecule_id" not in payload
 
 
 @pytest.mark.parametrize(

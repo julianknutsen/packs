@@ -21,4 +21,14 @@ Examples:
 Pass --update <ts> with a previously-returned message ts to edit the
 post in place (Slack chat.update).
 
+Not covered by the formatting guard: the text send commands
+(reply-current, publish, publish-to-channel, upload --initial-comment,
+delegate) neutralize tildes that would accidentally pair into Slack
+strikethrough. post-message does not — summary, field values, and
+rollup items are rendered as mrkdwn section text by the Go Block Kit
+renderer, downstream of the Python guard, so "~$58.5k … ~$16.5k" in a
+payload still strikes through. Titles are plain_text and unaffected.
+Until gp-x5bdy decides that surface, write "approx." or wrap the
+figures in a code span when a payload carries tilde-as-approximately.
+
 Routes to: gc-slack-cli post-message
