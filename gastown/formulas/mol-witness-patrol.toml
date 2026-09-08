@@ -257,11 +257,42 @@ lifecycle directly.
 The canonical work chain: `worktree → (push) → branch → (merge) → target`.
 Our job is to ensure work reaches the branch so it's schedulable.
 
+**"All work is useful work — never discard" does not mean "publish whatever is
+dirty."** A worktree can hold NEW work (salvage it) or SPENT work — an older
+base checked out, a half-applied rebase left staged, or a commit whose bead the
+refinery already squash-merged. Publishing spent content is not a rescue; it is
+a revert authored by the safety mechanism, and it loses work louder than
+discarding would. Classify BEFORE you commit anything.
+
 Read the bead metadata to find the worktree and branch:
 ```bash
 META=$(gc bd show <bead> --json | jq '.[0].metadata')
-WORKTREE=$(echo "$META" | jq -r '.worktree // empty')
+# The metadata contract field is work_dir, set by the polecat's branch-setup
+# step. `.worktree` is a legacy misspelling and reads null on every live bead —
+# keep it only as a fallback.
+WORKTREE=$(echo "$META" | jq -r '.work_dir // .worktree // empty')
 BRANCH=$(echo "$META" | jq -r '.branch // empty')
+```
+
+**Guard 0 — never let a salvage git command run outside a resolved worktree.**
+`cd ""` SUCCEEDS in bash and leaves you exactly where you already were. If
+WORKTREE does not resolve, an unguarded `cd "$WORKTREE"` silently no-ops and
+every following `git add -A` / `git commit` / `git push` runs against YOUR OWN
+checkout — and this prompt puts you in the canonical rig repo for repo work. The
+result is the wrong repo's dirt published under a rescue message. Fail closed,
+and address the worktree explicitly with `git -C` so a resolution failure can
+never inherit your cwd:
+
+```bash
+if [ -z "$WORKTREE" ] || [ ! -d "$WORKTREE" ]; then
+  echo "SALVAGE REFUSED (<bead>): no resolvable work_dir — treat as Case E."
+  # Go to Case E. Run NO git command.
+fi
+TOP=$(git -C "$WORKTREE" rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$TOP" ] || [ "$(readlink -f "$TOP")" != "$(readlink -f "$WORKTREE")" ]; then
+  echo "SALVAGE REFUSED (<bead>): work_dir is not a worktree root — Case E."
+  # Go to Case E. Run NO git command.
+fi
 ```
 
 Check the bead and worktree state, then act:
@@ -269,48 +300,151 @@ Check the bead and worktree state, then act:
 **Case A: Branch exists on origin (work already published).**
 Worktree is disposable — canonical work is on the branch.
 ```bash
-git ls-remote --heads origin $BRANCH  # Verify branch exists on remote
+git -C "$WORKTREE" ls-remote --heads origin $BRANCH  # Verify branch on remote
 ```
 If branch exists on origin → skip to Step 3 (cleanup).
 
-**Case B: Worktree exists, branch pushed but not on origin yet.**
-Branch is recorded in metadata but polecat may have crashed before push.
+**Case B: Worktree exists, branch recorded but not on origin yet.**
+Polecat may have crashed before push.
 ```bash
-cd "$WORKTREE"
-git ls-remote --heads origin $BRANCH
+git -C "$WORKTREE" ls-remote --heads origin $BRANCH
 ```
 If branch IS on origin → skip to Step 3.
-If branch is NOT on origin → fall through to Case C.
+If branch is NOT on origin → run the classification gate below.
 
-**Case C: Worktree exists with unpushed commits.**
+**THE CLASSIFICATION GATE — run BEFORE any Case C/D commit.**
+
+```bash
+git -C "$WORKTREE" fetch origin --quiet
+```
+
+*Gate 1 — PRIMARY: is the worktree's owning bead already closed?*
+
+This is the authoritative signal and it is the one to trust. A closed bead has
+nothing to rescue, whatever the worktree looks like. Resolve the worktree path
+back to the bead that owns it — which is not always the bead you are salvaging,
+because agent-home work_dirs are shared:
+
+```bash
+# `gc bd list` HIDES closed beads by default — the exact fail-open this gate
+# exists to prevent. --all is mandatory here, not optional.
+BEADS=$(gc bd list --all --include-infra --limit=0 --json 2>/dev/null)
+OWNERS=$(echo "$BEADS" | jq -r --arg wd "$WORKTREE" '.[] | select((.metadata.work_dir // "") == $wd) | .id + " " + .status')
+SPENT=0; SPENT_BY=""
+while IFS=' ' read -r OID OSTATUS; do
+  [ -n "$OID" ] || continue
+  [ "$OSTATUS" = "closed" ] && { SPENT=1; SPENT_BY="${SPENT_BY:+$SPENT_BY,}$OID"; }
+done <<EOF
+$OWNERS
+EOF
+# The salvage target counts too, even if its work_dir points somewhere else.
+BEAD_STATUS=$(gc bd show <bead> --json | jq -r '.[0].status')
+[ "$BEAD_STATUS" = "closed" ] && { SPENT=1; SPENT_BY="${SPENT_BY:+$SPENT_BY,}<bead>"; }
+```
+
+*Gate 2 — BACKSTOP: would publishing this DELETE lines that exist on main?*
+
+A rescue is additive. Measure against `origin/main`, and diff the WORKING TREE,
+not HEAD:
+
+```bash
+NUM=$(git -C "$WORKTREE" diff origin/main --numstat 2>/dev/null)
+ADD=$(echo "$NUM" | awk '$1 ~ /^[0-9]+$/ {a+=$1} END {print a+0}')
+DEL=$(echo "$NUM" | awk '$2 ~ /^[0-9]+$/ {d+=$2} END {print d+0}')
+NET_DELETION=0; [ "$DEL" -gt "$ADD" ] && NET_DELETION=1
+```
+
+`git diff origin/main` with no second commit compares main to the working tree,
+so it sees HEAD's commits AND uncommitted edits in one number. **Do not diff
+against HEAD instead.** A worktree can be perfectly clean and still hold a
+commit that reverts main; against HEAD that reads +0/-0 and the gate waves it
+through. (Untracked files are absent from this diff, but they are pure
+additions and cannot manufacture a deletion.) A genuine large refactor can trip
+this gate. That is acceptable — the response is to hold for human eyes, never
+to discard.
+
+*Advisory signals — report them, never gate on them.* Both of these FAIL OPEN
+on real instances, which is why neither may decide:
+
+```bash
+COMMITS_MERGED=0
+git -C "$WORKTREE" merge-base --is-ancestor HEAD origin/main 2>/dev/null && COMMITS_MERGED=1
+```
+
+- **Ancestry** (`--is-ancestor HEAD origin/main`) is false for a squash-merged
+  branch, so it reads a spent worktree as unpublished work. It is also TRUE for
+  an ordinary crashed polecat sitting at the tip of main with genuine
+  uncommitted work — so refusing on ancestry alone would discard exactly the
+  work this step exists to rescue. It answers "would pushing HEAD accomplish
+  anything for history?", nothing more.
+- **Blob-vs-ancestor matching** ("is every dirty blob an older version?") fails
+  open as soon as ONE path matches no commit in main's history, which is what a
+  stale doc file next to identical code files looks like.
+- `git cherry` / patch-id inherit the same weakness.
+
+*Decision table.* Gate 1 decides; Gate 2 is the backstop when Gate 1 cannot
+resolve an owner. Either one alone stops both known instances.
+
+| Gate 1 SPENT | NET_DELETION | Action |
+|---|---|---|
+| 1 | — | **Spent worktree.** The owning bead is closed; there is nothing to rescue. Capture non-destructively, push NOTHING, go to Step 3 cleanup. |
+| 0 | 1 | **Net-deletion rescue.** Capture non-destructively, escalate for human eyes, push NOTHING. |
+| 0 | 0 | **Ordinary salvage.** Proceed to Case C/D as written — this is the common crashed-polecat rescue and must stay automatic. |
+
+*Non-destructive capture.* Whenever a gate withholds content, preserve the bytes
+without putting them anywhere the refinery might merge:
+
+```bash
+STASH=$(git -C "$WORKTREE" stash create "witness: unsalvaged content (<bead>)")
+if [ -n "$STASH" ]; then
+  git -C "$WORKTREE" update-ref refs/witness/salvage/<bead> "$STASH"
+  # refs/witness/* — never a polecat/* branch the refinery may be about to merge
+  git -C "$WORKTREE" push origin refs/witness/salvage/<bead>
+fi
+```
+
+`git stash create` writes a commit object and touches neither the worktree nor
+any branch; if the tree is clean it prints nothing, which is correct — a clean
+spent worktree has no bytes needing preservation. Then report and go to Step 3:
+
+```bash
+SUBJ="SALVAGE_HELD: <bead> withheld from auto-push"
+gc mail send mayor/ -s "$SUBJ" -m "Worktree $WORKTREE
+Gate 1 SPENT=$SPENT (owning beads closed: ${SPENT_BY:-none})
+Gate 2 +$ADD/-$DEL NET_DELETION=$NET_DELETION
+Advisory COMMITS_MERGED=$COMMITS_MERGED
+Content preserved at refs/witness/salvage/<bead>; polecat branch untouched."
+```
+
+**Case C: Worktree has unpushed commits AND the gate returned Ordinary salvage.**
 Work is committed locally but never pushed. Branch is not yet canonical.
 ```bash
-cd "$WORKTREE"
-BRANCH=$(git branch --show-current)
-git log origin/main..HEAD --oneline  # Shows unpushed commits
+git -C "$WORKTREE" log origin/main..HEAD --oneline  # Shows unpushed commits
 ```
 Commit any remaining uncommitted/untracked work first (safeguard):
 ```bash
-git status --porcelain
-# If any output:
-git add -A
-git commit -m "witness: salvage uncommitted work (<bead>)"
+git -C "$WORKTREE" status --porcelain
+# If any output — and only if the decision table said Ordinary salvage:
+git -C "$WORKTREE" add -A
+git -C "$WORKTREE" commit -m "witness: salvage uncommitted work (<bead>)"
 ```
 Publish the work to make branch canonical:
 ```bash
-git push origin HEAD
+BRANCH=$(git -C "$WORKTREE" branch --show-current)
+git -C "$WORKTREE" push origin HEAD
 gc bd update <bead> --set-metadata branch=$BRANCH
 ```
 Skip to Step 3 (cleanup).
 
-**Case D: Worktree exists with ONLY uncommitted/untracked changes (no commits).**
-Same resolution as Case C. All work is useful work — never discard.
+**Case D: Worktree has ONLY uncommitted/untracked changes (no commits) AND the
+gate returned Ordinary salvage.**
+Same resolution as Case C. All work is useful work — but only content the gate
+cleared ever reaches a branch.
 ```bash
-cd "$WORKTREE"
-git add -A
-git commit -m "witness: salvage work from orphaned agent (<bead>)"
-BRANCH=$(git branch --show-current)
-git push origin HEAD
+git -C "$WORKTREE" add -A
+git -C "$WORKTREE" commit -m "witness: salvage work from orphaned agent (<bead>)"
+BRANCH=$(git -C "$WORKTREE" branch --show-current)
+git -C "$WORKTREE" push origin HEAD
 gc bd update <bead> --set-metadata branch=$BRANCH
 ```
 Skip to Step 3 (cleanup).
@@ -447,26 +581,91 @@ The controller detects dead agents and restarts them. But a polecat can
 be alive and stuck — infinite loop, blocked on something, or just not
 progressing. The controller can't detect this; it's a work-layer judgment.
 
-**Step 1: Find active polecat work beads:**
+**Step 1: Find active polecat work beads and map them to live sessions:**
 ```bash
 gc bd list --status=in_progress --json --limit=0
+gc session list --json | jq -r '.sessions[] | select(.template | test("polecat")) | [.rig, .agent_name, .id, .session_name, .state, .last_active, .work_dir] | @tsv'
 ```
-Filter for beads assigned to polecat-pattern agents in YOUR rig.
+Join the two on the bead's assignee. That assignee is the session NAME
+(for example `gastown__polecat-ga-nw1n`), not the agent alias, and it
+carries no rig — so you cannot filter by rig from the bead alone. The
+session row supplies `rig`, `agent_name` and `work_dir`; the bead's
+`metadata.gc.session_name` and `metadata.gc.session_id` are the same
+key. Keep only rows whose `rig` is YOURS.
 
-**Step 2: For each, assess progress:**
+An in_progress bead whose session_name matches no live session is NOT a
+stuck polecat — it is an orphan, and `recover-orphaned-beads` owns it.
 
-Check the work bead's `UpdatedAt` timestamp and the polecat's molecule
-wisp freshness. Consider:
+**Step 2: For each, assess liveness and progress — in this order:**
 
-- **Recently updated** → making progress, skip
-- **Stale but agent is in a long tool call** → might be fine, use judgment
-- **Very stale, no wisp progress** → likely stuck
+Do NOT look for "molecule wisp freshness" on a polecat. Polecats carry
+no wisps at all; only the witness and the refinery hold them. "No wisp
+progress" is therefore vacuously true of every polecat at every moment
+and is evidence of nothing (sy-p997, verified against a full ephemeral
+census).
+
+Signal 1 — session liveness. PRIMARY, cheap, structured.
+`last_active` from the Step 1 session query is real session output
+activity, not a heartbeat: idle agents go stale while working ones
+advance every few seconds. Compare it against now. Fresh means the
+agent is emitting, so it is alive. It does NOT mean the agent is
+progressing — a tight loop keeps `last_active` fresh too. That is what
+Signals 2 and 3 are for.
+
+Signal 2 — worktree edits. PRIMARY evidence of actual progress.
+The per-bead worktree is `<session work_dir>/worktrees/<bead-id>`, on
+branch `polecat/<bead-id>`. Derive it that way rather than trusting bead
+metadata: `metadata.gc.work_dir` records the shared pool home, which two
+polecats can occupy at once, and `metadata.work_dir` is frequently never
+written at all.
+```bash
+WT="<session work_dir>/worktrees/<bead-id>"
+test -d "$WT" || echo "NOTE: no per-bead worktree yet — weak evidence, never grounds for a warrant on its own"
+find "$WT/src" "$WT/web" "$WT/tests" -type f -name '*.cs' -o -type f -name '*.ts' -o -type f -name '*.tsx' 2>/dev/null | grep -Ev '/(obj|bin|node_modules)/' | xargs -r stat -c '%y %n' | sort -r | head -5
+test -d "$WT" && git -C "$WT" status --porcelain | head -5
+```
+Adjust the extensions to your rig's languages. Exclude obj/, bin/ and
+node_modules/ — build output moves without any agent progress. A recent
+source mtime is direct, second-precision evidence of work. Its absence
+is only weak evidence: an agent can legitimately spend a long stretch
+reading, building, or running a test suite without writing a file.
+
+Signal 3 — the live turn. DECISIVE, and required before any warrant.
+```bash
+gc session peek <agent-name> --lines 20
+```
+This shows what the agent is doing right now, how long the current turn
+has been running, and whether it is mid-tool-call. It is the only signal
+that separates "working hard on something slow" from "spinning".
+
+Weak hint — the work bead's `UpdatedAt`. A tiebreaker, never grounds on
+its own. It tracks bead MUTATIONS, not work: a polecat touches its bead
+at claim and again at handoff and can legitimately go an hour between.
+During the patrol that filed sy-p997, two polecats read 54 and 26
+minutes "stale" while both had edited source seconds earlier.
+
+Reaching a verdict:
+
+- Recent worktree edits, or a peek showing forward motion → progressing, skip
+- `last_active` fresh, no edits, peek shows one coherent long-running
+  action such as a build, a test suite or a large read → fine, note it and move on
+- `last_active` fresh, no edits, peek shows the same action repeating
+  with no forward motion across two checks → likely stuck
+- `last_active` stale AND no recent edits AND peek shows a dead or
+  wedged prompt → likely stuck
 
 There are no hardcoded thresholds. Consider the nature of the work, the
 time elapsed, and whether the agent shows any signs of activity. This is
 judgment work — exactly why an LLM does it, not Go code.
 
 **Step 3: For stuck polecats, file a warrant (deduped).**
+
+Fail-closed gate: file a warrant ONLY if you ran `gc session peek` on
+that agent during THIS cycle and it showed no forward motion. A warrant
+routes to the dog pool and runs `mol-shutdown-dance` against what may
+well be a healthy agent, and that costs a real interrogation. A stale
+`UpdatedAt`, a missing wisp, or a quiet worktree are each, alone, never
+sufficient.
 
 Do NOT kill the agent directly. File a warrant bead and let the dog pool
 handle the shutdown dance (multi-stage interrogation with due process).
@@ -485,17 +684,23 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
 else
   gc bd create --type=task \
     --title="Stuck: <session-name>" \
-    --metadata '{"target":"<session-name>","reason":"No progress on <bead> for <duration>","requester":"witness","gc.routed_to":"{{binding_prefix}}dog"}' \
+    --metadata '{"target":"<session-name>","reason":"<what peek showed, and what it still showed on recheck>","last_active":"<timestamp>","last_edit":"<timestamp or none>","requester":"witness","gc.routed_to":"{{binding_prefix}}dog"}' \
     --labels=warrant
 fi
 ```
+
+Put the evidence in the metadata. The dog runs the dance against a live
+agent and needs to know what you actually observed.
 
 The dog pool picks up the warrant and runs `mol-shutdown-dance`, which
 gives the polecat 3 chances to prove it's alive before killing it.
 
 **Step 4: Log assessment:**
 
-Note which polecats were checked and their status for observability.
+Note which polecats were checked and their status for observability. For
+each, record the three signals you read — `last_active`, the newest
+worktree edit, and what peek showed — so the next cycle can tell "quiet
+for one cycle" from "quiet for six".
 Don't escalate to mayor for individual stuck polecats — the warrant
 system handles it. Only escalate if you see a pattern (many stuck
 polecats, systemic issue).
@@ -531,7 +736,7 @@ keep one open patrol wisp and burn any surplus, so wisps never accumulate.
 Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
 valid gc bd type and matches nothing).
 ```bash
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --include-infra --json | jq -r '.[].id')
 NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force

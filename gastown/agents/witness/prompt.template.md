@@ -164,10 +164,12 @@ nothing).
 # Step 1: Reconcile your patrol wisps to exactly one (town ledger, via gc bd).
 # Collect every open/in_progress patrol wisp assigned to you, keep one, and
 # burn the surplus so restarts never accumulate duplicates. Wisp roots are
-# molecules — filter --type=molecule, never --type=wisp.
+# molecules — filter --type=molecule, never --type=wisp. Molecule roots are
+# infra beads, so --include-infra is REQUIRED: without it gc bd list returns
+# nothing and every restart pours a duplicate wisp.
 WISP_IDS=$(
-  gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=0 --json | jq -r '.[].id'
-  gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id'
+  gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=0 --include-infra --json | jq -r '.[].id'
+  gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --include-infra --json | jq -r '.[].id'
 )
 WISP=$(printf '%s\n' $WISP_IDS | sed -n '1p')           # keep one (prefers in_progress)
 for extra in $(printf '%s\n' $WISP_IDS | sed '1d'); do  # burn any surplus
@@ -203,14 +205,15 @@ If `next-iteration` already ran, do not pour again; run `gc hook`.
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --include-infra --json | jq -r '.[0].id // empty')
 fi
 # Reconcile queued (open) patrol wisps to exactly one. A prior cycle may have
 # poured a next wisp without burning, or a restart may have raced — keep the
 # first and burn the surplus so wisps never accumulate. Wisp roots are
 # molecules (never --type=wisp, which is not a valid gc bd type and matches
-# nothing).
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
+# nothing). Molecule roots are infra beads — --include-infra is REQUIRED, or
+# the query returns nothing and the reconcile silently no-ops.
+OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --include-infra --json | jq -r '.[].id')
 ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
   gc bd mol burn "$extra" --force
