@@ -213,7 +213,13 @@ a NEW session with a different ID — the old one never comes back.
    SESSION_COUNT=$(jq -r '(.sessions // []) | length' "$SESSIONS_FILE")
    MAP_COUNT=$(printf '%s' "$LIVENESS_MAP" | jq -r 'length')
    rm -f "$SESSIONS_FILE" "$SESSION_BEADS_FILE"
+   MAP_BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
    ```
+
+   `MAP_BUILT_AT` is this snapshot's timestamp — every bead the per-bead
+   loop below reaches was read from the store *after* this instant, but
+   its own `updated_at` may be newer still if something touched it mid-cycle.
+   Step 3b uses this to catch that case before it destroys anything.
 
    **Fail safe — never orphan on an empty map.** If the map is empty while
    sessions exist, the schema has drifted again (the exact failure in
@@ -323,14 +329,44 @@ starts fresh.
 **Step 3: Verify work on main before resetting.**
 
 Before resetting the bead to pool, check if the branch was already merged
-to main (polecat finished, pushed, but crashed before closing the bead):
+to main (polecat finished, pushed, but crashed before closing the bead).
+
+**Ancestry alone is not enough.** `git merge-base --is-ancestor` only holds
+when the branch's own commit objects are literally reachable from main —
+true for a plain fast-forward or a real merge commit. It false-negatives
+whenever the refinery lands the branch by *recreating* its commits
+(rebase-then-fast-forward onto a main that has moved since the branch was
+cut, or a squash) — main then carries a new commit with a different SHA
+that contains exactly the branch's changes, and ancestry can never see
+that. This is the normal case, not an edge case: any queue with 2+ beads
+produces it as soon as a second bead lands after the first was rebased.
+A false negative here re-dispatches already-merged work.
+
 ```bash
-git log main --oneline | grep -q "$BRANCH"
-# Or check if branch commits are reachable from main:
-git merge-base --is-ancestor origin/$BRANCH origin/main
+# Cheap first pass — catches the plain fast-forward/merge-commit case:
+if git merge-base --is-ancestor origin/$BRANCH origin/main; then
+  ON_MAIN=true
+else
+  # Rebase/squash recreates commits, so a "not an ancestor" result does
+  # NOT mean "not merged" -- fall back to a content test, scoped to the
+  # branch's own changed files, which holds regardless of how it landed.
+  MERGE_BASE=$(git merge-base origin/$BRANCH origin/main 2>/dev/null || true)
+  if [ -z "$MERGE_BASE" ]; then
+    ON_MAIN=false   # no shared history found; treat conservatively as not-yet-merged
+  else
+    CHANGED_FILES=$(git diff --name-only "$MERGE_BASE" origin/$BRANCH)
+    if [ -z "$CHANGED_FILES" ]; then
+      ON_MAIN=false   # branch introduced nothing beyond the merge-base; nothing to confirm
+    elif git diff --quiet origin/main origin/$BRANCH -- $CHANGED_FILES; then
+      ON_MAIN=true    # main's current content for exactly these files matches the branch
+    else
+      ON_MAIN=false
+    fi
+  fi
+fi
 ```
 
-If the work is already on main:
+If the work is already on main (`ON_MAIN=true`):
 - **Close the bead** (work is done, don't re-dispatch). Use `--force`: the bead
   is still assigned to the crashed polecat, so this is a cross-actor close and
   bd's close-authority guard (gastownhall/beads#3734) would otherwise refuse it:
@@ -341,11 +377,45 @@ gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
 ```
 - Clean up worktree and skip to Step 4.
 
-If the work is NOT on main, proceed with reset:
+If the work is NOT on main (`ON_MAIN=false`), proceed with reset:
 
-**Step 3b: Clean up worktree and return bead to pool.**
+**Step 3b: Re-verify liveness immediately before destroying anything.**
 
-Once the branch is canonical (on origin), the worktree is disposable:
+**This bead is about to have its worktree deleted and be reset to pool —
+the one truly destructive action in this recipe.** The liveness map built
+in Step 1 is a snapshot; an agent that spawned after it was built resolves
+to `absent` there even though it may be alive and mid-edit right now,
+minutes into the per-bead loop. Only `absent`/orphan candidates reaching
+this exact point need a fresh check — every bead classified `active`,
+`asleep`, or another do-not-touch state in Step 1 never gets here, so this
+adds one extra lookup per candidate orphan, not per bead:
+
+```bash
+FRESH_STATE=$(gc session list --state=all --json | jq -r --arg a "$ASSIGNEE" '
+  (.sessions // [])[] | select(.id == $a or .name == $a or .session_name == $a or .alias == $a or .agent_name == $a)
+  | (if (.closed // false) then "closed" else (.state // "") end)' | head -n1)
+FRESH_STATE=${FRESH_STATE:-absent}
+if [ "$FRESH_STATE" != "absent" ] && [ "$FRESH_STATE" != "closed" ] && [ "$FRESH_STATE" != "archived" ]; then
+  echo "SKIP: <bead> assignee $ASSIGNEE is now '$FRESH_STATE' -- spawned after the Step 1 snapshot. Not orphaned; leave it alone."
+  # Do not delete the worktree or reset this bead. Continue the per-bead loop.
+fi
+```
+
+Second, cheap guard: also skip if the bead itself changed after the
+Step 1 map was built — its `updated_at` (already read via `gc bd show
+<bead> --json` in Step 2) newer than `MAP_BUILT_AT` means something
+touched this bead mid-cycle and the Step 1 classification may already be
+stale:
+
+```bash
+BEAD_UPDATED_AT=$(echo "$META" | jq -r '.updated_at // empty')
+if [ -n "$BEAD_UPDATED_AT" ] && [[ "$BEAD_UPDATED_AT" > "$MAP_BUILT_AT" ]]; then
+  echo "SKIP: <bead> updated_at ($BEAD_UPDATED_AT) is newer than the liveness snapshot ($MAP_BUILT_AT) -- something touched it mid-cycle. Not destroying it on a stale classification."
+  # Do not delete the worktree or reset this bead. Continue the per-bead loop.
+fi
+```
+
+Once both fresh checks also say orphaned, the worktree is disposable:
 ```bash
 # Delete worktree if it exists
 cd <rig-root>
