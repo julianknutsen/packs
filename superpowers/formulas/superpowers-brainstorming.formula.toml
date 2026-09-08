@@ -9,7 +9,9 @@ and review guidance available through the provider skill directory.
 formula = "superpowers-brainstorming"
 type = "expansion"
 version = 1
-contract = "graph.v2"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.brainstorming_approval_mode]

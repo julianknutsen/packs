@@ -7,7 +7,9 @@ into explicit Gas City review lanes with synthesis and fix application.
 formula = "gstack-code-review"
 type = "expansion"
 version = 1
-contract = "graph.v2"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.implementation_target]

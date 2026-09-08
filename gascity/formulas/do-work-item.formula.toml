@@ -8,11 +8,13 @@ Launch inputs:
 """
 formula = "do-work-item"
 version = 1
-contract = "graph.v2"
 extends = ["implementation-item-base"]
 target_required = true
 internal = true
 single_lane = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.context_path]

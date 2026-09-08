@@ -8,7 +8,9 @@ and records a single build-base finalize result.
 formula = "compound-resolution"
 type = "expansion"
 version = 1
-contract = "graph.v2"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [[template]]
 id = "{target}.inventory-artifacts"

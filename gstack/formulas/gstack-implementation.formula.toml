@@ -3,10 +3,12 @@ gstack implementation of the public implement methodology contract.
 """
 formula = "gstack-implementation"
 version = 1
-contract = "graph.v2"
 extends = ["implement"]
 target_required = true
 internal = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.implementation_target]

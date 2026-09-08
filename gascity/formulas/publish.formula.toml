@@ -8,9 +8,11 @@ Launch inputs:
 """
 formula = "publish"
 version = 1
-contract = "graph.v2"
 target_required = false
 internal = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.final_report]

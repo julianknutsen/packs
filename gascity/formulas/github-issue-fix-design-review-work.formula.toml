@@ -10,7 +10,9 @@ contract for downstream bead creation.
 formula = "github-issue-fix-design-review-work"
 type = "expansion"
 version = 1
-contract = "graph.v2"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars.mode]
 description = "Issue-fix front-half mode, recorded in artifacts."

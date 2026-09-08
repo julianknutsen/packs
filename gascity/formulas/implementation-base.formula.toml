@@ -8,9 +8,11 @@ source-anchor close contract.
 """
 formula = "implementation-base"
 version = 1
-contract = "graph.v2"
 target_required = true
 internal = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.context_path]

@@ -8,9 +8,11 @@ selectors, routes, drains, or review expansions they need.
 """
 formula = "build-from-decompose"
 version = 1
-contract = "graph.v2"
 extends = ["build-from-decompose-base"]
 target_required = false
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [catalog]
 name = "build-from-decompose"

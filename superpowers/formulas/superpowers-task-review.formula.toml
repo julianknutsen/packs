@@ -8,7 +8,9 @@ implementation lane applies findings; provider-native subagents are not used.
 formula = "superpowers-task-review"
 type = "expansion"
 version = 1
-contract = "graph.v2"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.implementation_target]

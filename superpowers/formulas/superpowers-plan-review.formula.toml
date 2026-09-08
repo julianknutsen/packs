@@ -7,7 +7,9 @@ City-native review loop.
 formula = "superpowers-plan-review"
 type = "expansion"
 version = 1
-contract = "graph.v2"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [[template]]
 id = "{target}.setup-superpowers-plan-review"
