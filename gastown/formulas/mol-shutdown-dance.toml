@@ -13,6 +13,19 @@ gc bd create --type=task \
 The dog pool picks up the warrant and runs this formula against the
 claimed warrant bead. The claimed bead is the warrant id; use
 `$GC_BEAD_ID` for warrant verification, closure, and audit output.
+Some providers never export `GC_BEAD_ID`; there the id arrives as
+`GC_TRIGGER_WORK_BEAD_ID`, the bead that triggered this session. The trigger
+variable is fixed at spawn and is not advanced by `gc hook --claim`, so in a
+pool it can name a bead this session never claimed. This dance belongs to the
+warrant this session claimed, so the two warrant-metadata blocks — the preamble
+below and step 1 of `receive-warrant` — resolve the claim with
+`gc hook current --id-only` **first**, fall back to the trigger only when
+nothing is claimed, and fail loudly when neither is available. Order matters:
+appending the resolver after the trigger instead is inert, because
+`${A:-${B:-$(C)}}` never evaluates `$(C)` while `B` is non-empty, and a stale
+trigger would still win. Later blocks reuse the normalized value, so re-run the
+preamble first in any fresh shell: `$GC_BEAD_ID`, `$target`, `$reason`,
+`$requester`, and `$requester_endpoint` do not survive across shells.
 Existing warrant producers provide `target`, `reason`, and `requester`
 metadata, not a separate `warrant_id`. Each warrant is one shutdown dance
 for one target. On crash, re-read formula steps and resume from context
@@ -22,6 +35,8 @@ Before running command snippets in any step, load warrant metadata into quoted
 shell variables:
 
 ```bash
+GC_BEAD_ID="${GC_BEAD_ID:-$(gc hook current --id-only 2>/dev/null)}"
+GC_BEAD_ID="${GC_BEAD_ID:-${GC_TRIGGER_WORK_BEAD_ID:?no work bead id in env}}"
 warrant_json="$(gc bd show "$GC_BEAD_ID" --json)"
 target="$(printf '%s' "$warrant_json" | jq -r '.[0].metadata.target // empty')"
 reason="$(printf '%s' "$warrant_json" | jq -r '.[0].metadata.reason // empty')"
@@ -82,6 +97,8 @@ Entry point. Read the warrant metadata from the claimed warrant bead.
 
 **1. Read warrant details:**
 ```bash
+GC_BEAD_ID="${GC_BEAD_ID:-$(gc hook current --id-only 2>/dev/null)}"
+GC_BEAD_ID="${GC_BEAD_ID:-${GC_TRIGGER_WORK_BEAD_ID:?no work bead id in env}}"
 warrant_json="$(gc bd show "$GC_BEAD_ID" --json)"
 target="$(printf '%s' "$warrant_json" | jq -r '.[0].metadata.target // empty')"
 reason="$(printf '%s' "$warrant_json" | jq -r '.[0].metadata.reason // empty')"
