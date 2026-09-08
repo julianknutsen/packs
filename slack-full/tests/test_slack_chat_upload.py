@@ -199,3 +199,82 @@ def test_thread_current_unwraps_helper_tuple(
     # Critical: a plain string, NOT the (msg_id, conversation) tuple.
     assert body["reply_to_message_id"] == "1777779766.848799"
     assert isinstance(body["reply_to_message_id"], str)
+
+
+# --------------------------------------------------------------------------
+# Accidental-mrkdwn guard (gp-o42) — --initial-comment renders as mrkdwn
+# beside the file, so tilde pairs would strike it through.
+# --------------------------------------------------------------------------
+
+_RUNWAY_LINE = "• Total out: ~$58.5k → *~$16.5k left on Sep 30* from a $75k start."
+
+
+def _capture_upload(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    upload, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True, "FileID": "F7"}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(common, "look_up_binding", lambda _sid: _fake_binding())
+    captured["upload"] = upload
+    return captured
+
+
+def test_initial_comment_is_guarded_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    import slack_mrkdwn  # type: ignore
+    captured = _capture_upload(monkeypatch)
+
+    exit_code = captured["upload"].main([
+        "--file", str(_make_file(tmp_path)),
+        "--session", "gc-test-session",
+        "--initial-comment", _RUNWAY_LINE,
+    ])
+    assert exit_code == 0
+    comment = captured["body"]["initial_comment"]
+    assert "~" not in comment  # no pairable ASCII tilde reaches Slack
+    assert comment == _RUNWAY_LINE.replace("~", slack_mrkdwn.TILDE_SUBSTITUTE)
+
+
+def test_initial_comment_raw_flag_skips_the_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    captured = _capture_upload(monkeypatch)
+
+    exit_code = captured["upload"].main([
+        "--file", str(_make_file(tmp_path)),
+        "--session", "gc-test-session",
+        "--initial-comment", _RUNWAY_LINE,
+        "--raw",
+    ])
+    assert exit_code == 0
+    assert captured["body"]["initial_comment"] == _RUNWAY_LINE
+
+
+def test_via_adapter_branch_is_guarded_too(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    # Upload guards inline in main() rather than in a shared body loader,
+    # and both --via branches read the one guarded variable. Pin the
+    # adapter branch as well so a future refactor cannot guard only the
+    # default path while the suite stays green.
+    import slack_mrkdwn  # type: ignore
+    captured = _capture_upload(monkeypatch)
+
+    exit_code = captured["upload"].main([
+        "--file", str(_make_file(tmp_path)),
+        "--session", "gc-test-session",
+        "--via", "adapter",
+        "--initial-comment", _RUNWAY_LINE,
+    ])
+    assert exit_code == 0
+    assert captured["body"]["initial_comment"] == \
+        _RUNWAY_LINE.replace("~", slack_mrkdwn.TILDE_SUBSTITUTE)

@@ -131,3 +131,50 @@ def test_publish_to_channel_rejects_both_body_and_body_file() -> None:
             "--body-file", "/dev/null",
         ])
     assert "OR" in str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# Accidental-mrkdwn guard (gp-o42) — tilde pairs must not strike through.
+# --------------------------------------------------------------------------
+
+def test_publish_to_channel_guards_tildes_by_default(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    pub, common = _import_modules()
+    import slack_mrkdwn
+    captured: dict[str, Any] = {}
+
+    def fake_publish(**kwargs):
+        captured.update(kwargs)
+        return {"delivered": True, "message_id": "1700.001"}
+
+    monkeypatch.setattr(common, "publish_to_channel_via_adapter", fake_publish)
+
+    rc = pub.main([
+        "--conversation-id", "C0CHAN01",
+        "--session", "gc-1",
+        "--body", "~$58.5k out, ~$16.5k left",
+    ])
+    assert rc == 0
+    assert captured["text"] == \
+        "~$58.5k out, ~$16.5k left".replace("~", slack_mrkdwn.TILDE_SUBSTITUTE)
+
+
+def test_publish_to_channel_raw_flag_skips_guard(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    pub, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_publish(**kwargs):
+        captured.update(kwargs)
+        return {"delivered": True, "message_id": "1700.001"}
+
+    monkeypatch.setattr(common, "publish_to_channel_via_adapter", fake_publish)
+
+    rc = pub.main([
+        "--conversation-id", "C0CHAN01",
+        "--session", "gc-1",
+        "--body", "~$58.5k out, ~$16.5k left",
+        "--raw",
+    ])
+    assert rc == 0
+    assert captured["text"] == "~$58.5k out, ~$16.5k left"

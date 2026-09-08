@@ -48,4 +48,13 @@ Examples
   gc slack delegate --turn-ref gct-0123456789abcdef0123 --to riley --body-file /tmp/ask.txt
   gc slack delegate --turn-ref gct-0123456789abcdef0123 --cancel --to riley
 
+Formatting guard: tildes that would accidentally pair into Slack
+strikethrough (e.g. "~$58.5k … ~$16.5k" — tilde as "approximately") are
+neutralized by default with a visually identical substitute (U+223C).
+Deliberate tight-wrapped `~word~` strikethrough, code spans, lone
+tildes, and every other formatting character pass through untouched.
+"Lone" counts per line, though: two home-relative paths on one line
+(`rsync ~/a ~/b`) can pair, so both are substituted — put twin paths in
+a code span, or pass --raw to send the body byte-for-byte verbatim.
+
 Routes to: scripts/slack_company_outbound.py delegate

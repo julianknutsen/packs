@@ -325,3 +325,50 @@ def test_interpret_publish_receipt_shapes() -> None:
     delivered, kind = common.interpret_publish_receipt("not a dict")
     assert delivered is False
     assert kind == "non_dict_response"
+
+
+# --------------------------------------------------------------------------
+# Accidental-mrkdwn guard (gp-o42) — tilde pairs must not strike through.
+# --------------------------------------------------------------------------
+
+def test_publish_guards_tildes_by_default(monkeypatch) -> None:
+    pub, common = _import_modules()
+    import slack_mrkdwn
+    captured = {}
+
+    def fake_publish(**kwargs):
+        captured.update(kwargs)
+        return {"Receipt": {"Delivered": True, "MessageID": "1700.001"}}
+
+    monkeypatch.setattr(common, "publish_via_gc_outbound", fake_publish)
+    monkeypatch.setattr(
+        common, "look_up_binding",
+        lambda _sid: {"conversation_id": "C0CHAN01", "kind": "room",
+                      "scope_id": "test-city", "provider": "slack",
+                      "account_id": "T0TESTWS"})
+
+    rc = pub.main(["--session", "gc-1", "--body", "~$58.5k out, ~$16.5k left"])
+    assert rc == 0
+    assert captured["text"] == \
+        "~$58.5k out, ~$16.5k left".replace("~", slack_mrkdwn.TILDE_SUBSTITUTE)
+
+
+def test_publish_raw_flag_skips_guard(monkeypatch) -> None:
+    pub, common = _import_modules()
+    captured = {}
+
+    def fake_publish(**kwargs):
+        captured.update(kwargs)
+        return {"Receipt": {"Delivered": True, "MessageID": "1700.001"}}
+
+    monkeypatch.setattr(common, "publish_via_gc_outbound", fake_publish)
+    monkeypatch.setattr(
+        common, "look_up_binding",
+        lambda _sid: {"conversation_id": "C0CHAN01", "kind": "room",
+                      "scope_id": "test-city", "provider": "slack",
+                      "account_id": "T0TESTWS"})
+
+    rc = pub.main(["--session", "gc-1", "--raw",
+                   "--body", "~$58.5k out, ~$16.5k left"])
+    assert rc == 0
+    assert captured["text"] == "~$58.5k out, ~$16.5k left"
