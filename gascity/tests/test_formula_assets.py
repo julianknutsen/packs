@@ -5974,5 +5974,334 @@ description = "Override sink that writes the base triage report contract."
         )
 
 
+    def test_build_artifact_check_failure_surfaces_gc_bd_stderr(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "build-artifact-valid.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "echo 'IMPORT_LOCKED_NOT_CACHED run gc import install' >&2\n"
+                "exit 3\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "bd-err",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gc bd show bd-err failed", result.stderr)
+        self.assertIn("IMPORT_LOCKED_NOT_CACHED", result.stderr)
+
+    def test_implementation_review_check_notes_gc_bd_stderr_on_tolerant_paths(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "implementation-review-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                # The member read is `gc ready` (see gmol); let it succeed with an
+                # empty union so this test isolates the tolerant `gc bd show` site.
+                "if [ \"$1\" = \"ready\" ]; then\n"
+                "  printf '[]\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [ \"$2\" = \"show\" ]; then\n"
+                "  echo 'STDERR_A root lookup unavailable' >&2\n"
+                "  exit 3\n"
+                "fi\n"
+                "exit 99\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "root-err",
+                "GC_ITERATION": "1",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        # Tolerant sites keep their fallbacks (the gate still iterates rather
+        # than crashing), but the attempt log now carries the real error.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("review check: note: gc bd show root-err failed", result.stderr)
+        self.assertIn("STDERR_A", result.stderr)
+        self.assertIn("Implementation review needs another iteration: missing verdict", result.stdout)
+
+    def test_design_review_check_surfaces_member_read_stderr(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "design-review-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$2\" = \"show\" ]; then\n"
+                "  printf '%s\\n' '{\"metadata\":{\"gc.root_bead_id\":\"root-ok\",\"gc.attempt\":\"1\"}}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'DISTINCTIVE_LIST_FAILURE' >&2\n"
+                "exit 3\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "bead-ok",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("gmol: gc ready failed for status:", result.stderr)
+        self.assertIn("DISTINCTIVE_LIST_FAILURE", result.stderr)
+
+    def test_gap_analysis_check_notes_gc_bd_stderr_on_tolerant_paths(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "gap-analysis-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                # The member read is `gc ready` (see gmol); let it succeed with an
+                # empty union so this test isolates the tolerant `gc bd show` site.
+                "if [ \"$1\" = \"ready\" ]; then\n"
+                "  printf '[]\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [ \"$2\" = \"show\" ]; then\n"
+                "  echo 'GAP_SHOW_FAILURE' >&2\n"
+                "  exit 3\n"
+                "fi\n"
+                "exit 99\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "gap-root",
+                "GC_ITERATION": "1",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("gap check: note: gc bd show gap-root failed", result.stderr)
+        self.assertIn("GAP_SHOW_FAILURE", result.stderr)
+        self.assertIn("Gap analysis needs another iteration: missing verdict", result.stdout)
+
+    # The member read these gates make is `gc ready`, one leg per status, and a
+    # failed leg has to fail the gate rather than contribute an empty set: an
+    # empty union is indistinguishable from "no verdict yet", so swallowing the
+    # error starves the gate silently until Ralph runs out of attempts. The two
+    # tests below pin that -- the underlying stderr reaches the gate's stderr,
+    # and the gate does NOT reach its "needs another iteration" dispatch.
+
+    def test_implementation_review_check_fails_loudly_when_member_read_fails(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "implementation-review-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$2\" = \"show\" ]; then\n"
+                "  printf '%s\\n' '{\"metadata\":{\"gc.root_bead_id\":\"root-ok\",\"gc.attempt\":\"1\"}}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'REVIEW_MEMBER_READ_FAILURE' >&2\n"
+                "exit 3\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "root-ok",
+                "GC_ITERATION": "1",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gmol: gc ready failed for status:", result.stderr)
+        self.assertIn("REVIEW_MEMBER_READ_FAILURE", result.stderr)
+        self.assertNotIn("needs another iteration", result.stdout)
+
+    def test_gap_analysis_check_fails_loudly_when_member_read_fails(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "gap-analysis-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$2\" = \"show\" ]; then\n"
+                "  printf '%s\\n' '{\"metadata\":{\"gc.root_bead_id\":\"gap-ok\",\"gc.attempt\":\"1\"}}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'GAP_MEMBER_READ_FAILURE' >&2\n"
+                "exit 3\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "gap-ok",
+                "GC_ITERATION": "1",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gmol: gc ready failed for status:", result.stderr)
+        self.assertIn("GAP_MEMBER_READ_FAILURE", result.stderr)
+        self.assertNotIn("needs another iteration", result.stdout)
+
+    # The three tests below pin the capture sites the fixtures above never
+    # reach. Every fixture above fails the *first* `gc bd show`, which short
+    # -circuits design-review and makes the tolerant gates fall back to
+    # `PARENT_ROOT=$ROOT_ID` -- so the fatal design-review handler (the exact
+    # symptom this change exists to fix) and the two re-show sites were
+    # unpinned. Each fixture below lets the first show succeed.
+
+    def test_design_review_check_surfaces_gc_bd_show_stderr(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "design-review-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            # A dedicated TMPDIR that nothing else writes to, so "empty after the
+            # run" is an exact pin on the EXIT trap reclaiming the capture file.
+            tmpdir = pathlib.Path(tmp) / "tmpdir"
+            tmpdir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "echo 'DESIGN_SHOW_FAILURE store unavailable' >&2\n"
+                "exit 3\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "design-bead",
+                "TMPDIR": str(tmpdir),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+            leaked = sorted(p.name for p in tmpdir.iterdir())
+
+        # This site is fatal by design: a gate that cannot read its own bead
+        # must not fall through to a verdict decision.
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR: gc bd show design-bead failed", result.stderr)
+        self.assertIn("DESIGN_SHOW_FAILURE", result.stderr)
+        # `trap 'rm -f "$GC_ERR"' EXIT INT TERM HUP` actually reclaims the file.
+        self.assertEqual(leaked, [])
+
+    def test_implementation_review_check_notes_parent_show_stderr(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "implementation-review-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                # The member read is `gc ready` (see gmol); let it succeed with an
+                # empty union so this test isolates the parent `gc bd show` site.
+                "if [ \"$1\" = \"ready\" ]; then\n"
+                "  printf '[]\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [ \"$2\" = \"show\" ]; then\n"
+                # The root read succeeds and names a *different* parent, which is
+                # the only way control reaches the parent re-show.
+                "  if [ \"$3\" = \"parent-err\" ]; then\n"
+                "    echo 'PARENT_SHOW_FAILURE parent lookup unavailable' >&2\n"
+                "    exit 3\n"
+                "  fi\n"
+                "  printf '%s\\n' '{\"metadata\":{\"gc.root_bead_id\":\"parent-err\",\"gc.attempt\":\"1\"}}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "root-child",
+                "GC_ITERATION": "1",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("review check: note: gc bd show parent-err failed", result.stderr)
+        self.assertIn("PARENT_SHOW_FAILURE", result.stderr)
+        # The root read succeeded, so the tolerant note is the parent's alone --
+        # without this the fixture could regress into the already-pinned site.
+        self.assertNotIn("gc bd show root-child failed", result.stderr)
+
+    def test_build_artifact_check_root_reshow_failure_surfaces_gc_bd_stderr(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "build-artifact-valid.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$3\" = \"root-err\" ]; then\n"
+                "  echo 'ROOT_RESHOW_FAILURE root lookup unavailable' >&2\n"
+                "  exit 3\n"
+                "fi\n"
+                # The step read succeeds with a complete artifact contract and a
+                # root that differs from the bead, so the re-show is reached.
+                "printf '%s\\n' '{\"metadata\":{"
+                "\"gc.build.artifact_schema\":\"gc.build.requirements.v1\","
+                "\"gc.build.artifact_path_keys\":\"gc.build.requirements_path\","
+                "\"gc.root_bead_id\":\"root-err\"}}'\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "bd-child",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("build-artifact-check: gc bd show root-err failed", result.stderr)
+        self.assertIn("ROOT_RESHOW_FAILURE", result.stderr)
+        # The first show succeeded; only the root re-show is being reported.
+        self.assertNotIn("gc bd show bd-child failed", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

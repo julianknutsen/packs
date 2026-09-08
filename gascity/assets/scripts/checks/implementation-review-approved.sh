@@ -90,14 +90,23 @@ is_approved() {
   return 1
 }
 
-ROOT_JSON="$(gc bd show "$ROOT_ID" --json 2>/dev/null || true)"
+GC_ERR="$(mktemp)"
+# EXIT alone does not fire on an untrapped signal, and check gates run under a
+# documented 10m dispatcher budget -- timeout kills are an expected path, not a
+# hypothetical one, so each would leak this capture file. SIGKILL leaks either way.
+trap 'rm -f "$GC_ERR"' EXIT INT TERM HUP
+if ! ROOT_JSON="$(gc bd show "$ROOT_ID" --json 2>"$GC_ERR")"; then
+  echo "review check: note: gc bd show $ROOT_ID failed: $(tail -c 400 "$GC_ERR" | tr '\n' ' ')" >&2
+fi
 PARENT_ROOT="$(metadata_value "$ROOT_JSON" "gc.root_bead_id")"
 if [ -z "$PARENT_ROOT" ]; then
   PARENT_ROOT="$ROOT_ID"
 fi
 PARENT_JSON="$ROOT_JSON"
 if [ "$PARENT_ROOT" != "$ROOT_ID" ]; then
-  PARENT_JSON="$(gc bd show "$PARENT_ROOT" --json 2>/dev/null || true)"
+  if ! PARENT_JSON="$(gc bd show "$PARENT_ROOT" --json 2>"$GC_ERR")"; then
+    echo "review check: note: gc bd show $PARENT_ROOT failed: $(tail -c 400 "$GC_ERR" | tr '\n' ' ')" >&2
+  fi
 fi
 STEP_ID="$(metadata_value "$ROOT_JSON" "gc.step_id")"
 SCOPE_REF="$(metadata_value "$ROOT_JSON" "gc.scope_ref")"
