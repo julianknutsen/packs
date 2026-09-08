@@ -320,28 +320,56 @@ no branch on origin.**
 Nothing to salvage. The bead goes back to pool and a new polecat
 starts fresh.
 
-**Step 3: Verify work on main before resetting.**
+**Step 3: Verify work on the target branch before resetting.**
 
 Before resetting the bead to pool, check if the branch was already merged
-to main (polecat finished, pushed, but crashed before closing the bead):
+(polecat finished, pushed, but crashed before closing the bead). Merge
+evidence is origin-side ONLY: a commit-subject grep or a local ref is never
+evidence of a merge. Resolve the target from the bead, never a hardcoded
+branch name. When in doubt, reset to pool instead of closing — a wrong reset
+self-heals (the refinery closes a genuinely merged bead on re-dispatch), a
+wrong close is unrecoverable:
 ```bash
-git log main --oneline | grep -q "$BRANCH"
-# Or check if branch commits are reachable from main:
-git merge-base --is-ancestor origin/$BRANCH origin/main
+TARGET=$(gc bd show <bead> --json | jq -r '.[0].metadata.target // empty')
+if [ -z "$TARGET" ]; then
+  TARGET=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+fi
+git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"
+
+# A branch that was never pushed cannot be merged — reset, never close.
+if [ -z "$(git ls-remote --heads origin "$BRANCH")" ]; then
+  echo "NOT_MERGED: $BRANCH does not exist on origin; cannot be on $TARGET. Proceed with reset."
+else
+  git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
+  git merge-base --is-ancestor "origin/$BRANCH" "origin/$TARGET"
+  MERGE_STATE=$?
+  case "$MERGE_STATE" in
+    0)
+      # Merged. Close with forensics — only if BOTH writes land. Use --force:
+      # the bead is still assigned to the crashed polecat, so this is a
+      # cross-actor close and bd's close-authority guard
+      # (gastownhall/beads#3734) would otherwise refuse it.
+      MERGED_SHA=$(git rev-parse "origin/$BRANCH")
+      if gc bd update <bead> --set-metadata merge_result=already_merged \
+           --set-metadata merged_sha="$MERGED_SHA" \
+           --set-metadata merged_target="$TARGET" && \
+         gc bd close <bead> --force --reason "Already merged to $TARGET (origin/$BRANCH is an ancestor of origin/$TARGET; closed by witness orphan salvage)"; then
+        gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
+          -m "origin/$BRANCH is an ancestor of origin/$TARGET at $MERGED_SHA. Closed instead of resetting."
+        # Clean up worktree and skip to Step 4.
+      else
+        echo "ORPHAN_CLOSE failed for <bead>; bead still open. STOP — a later patrol retries."
+      fi
+      ;;
+    1) : ;;  # not merged -> proceed with reset below
+    *)
+      echo "merge-base errored (status $MERGE_STATE); cannot evaluate merge state. STOP. Do not mutate bead state."
+      ;;
+  esac
+fi
 ```
 
-If the work is already on main:
-- **Close the bead** (work is done, don't re-dispatch). Use `--force`: the bead
-  is still assigned to the crashed polecat, so this is a cross-actor close and
-  bd's close-authority guard (gastownhall/beads#3734) would otherwise refuse it:
-```bash
-gc bd close <bead> --force
-gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
-  -m "Branch $BRANCH already on main. Closed instead of resetting."
-```
-- Clean up worktree and skip to Step 4.
-
-If the work is NOT on main, proceed with reset:
+If the work is NOT on the target branch, proceed with reset:
 
 **Step 3b: Clean up worktree and return bead to pool.**
 

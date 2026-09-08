@@ -89,7 +89,12 @@ bead metadata; do not use template-pattern or fixed-prefix matching.
 branch-setup. For each orphaned bead:
 
 1. **Branch on origin** (`metadata.branch` exists, verified on remote) ->
-   worktree disposable. Delete worktree, reset bead to pool.
+   worktree disposable. Delete worktree, reset bead to pool — UNLESS
+   `origin/$BRANCH` is an ancestor of `origin/$TARGET` per
+   `mol-witness-patrol` Step 3, in which case close as merged instead.
+   Never close without that origin-side merge evidence: a wrong reset
+   self-heals (the refinery closes a genuinely merged bead on
+   re-dispatch), a wrong close does not.
 
 2. **Worktree exists, unpushed commits** ->
    commit any remaining uncommitted work (`git add -A && git commit`),
