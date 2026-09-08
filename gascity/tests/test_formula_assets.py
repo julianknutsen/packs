@@ -4225,11 +4225,21 @@ description = "Override sink that writes the base triage report contract."
             fake_gc.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
+                "if [ -n \"${GC_SCOPED_SHOW_CALLS:-}\" ]; then printf '%s\\n' \"$*\" >>\"$GC_SCOPED_SHOW_CALLS\"; fi\n"
                 "while [ \"${1:-}\" != \"bd\" ]; do shift; done\n"
                 "shift\n"
                 "case \"$1\" in\n"
                 "  version) exit 0 ;;\n"
-                "  show) cat \"$BD_SHOW_DIR/$2.json\" ;;\n"
+                "  show)\n"
+                "    if [ -n \"${GC_SHOW_COUNT_FILE:-}\" ]; then\n"
+                "      count=0\n"
+                "      [ ! -f \"$GC_SHOW_COUNT_FILE\" ] || count=$(cat \"$GC_SHOW_COUNT_FILE\")\n"
+                "      count=$((count + 1))\n"
+                "      printf '%s\\n' \"$count\" >\"$GC_SHOW_COUNT_FILE\"\n"
+                "      [ \"$count\" -gt \"${GC_SHOW_FAIL_COUNT:-0}\" ] || exit 1\n"
+                "    fi\n"
+                "    cat \"$BD_SHOW_DIR/$2.json\"\n"
+                "    ;;\n"
                 "  *) exit 2 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -4651,6 +4661,41 @@ description = "Override sink that writes the base triage report contract."
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("build artifact valid", result.stdout)
+
+    def test_build_artifact_check_scopes_reads_and_waits_for_close(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            tmp = pathlib.Path(artifact_dir)
+            artifact = tmp / "requirements.md"
+            artifact.write_text(self._valid_requirements_artifact(), encoding="utf-8")
+            calls = tmp / "calls"
+            count = tmp / "count"
+            control = (
+                '[{"id": "fc-loop", "metadata": {'
+                '"gc.root_bead_id": "fc-root", '
+                '"gc.build.artifact_schema": "gc.build.requirements.v1", '
+                '"gc.build.artifact_path_keys": "gc.build.requirements_path"}}]'
+            )
+            root_bead = (
+                '[{"id": "fc-root", "metadata": {'
+                f'"gc.build.requirements_path": "{artifact}"'
+                "}}]"
+            )
+            result = self._run_build_artifact_check(
+                {"fc-loop": control, "fc-root": root_bead},
+                "fc-loop",
+                {
+                    "GC_BEADS_SCOPE_ROOT": str(tmp),
+                    "GC_SCOPED_SHOW_CALLS": str(calls),
+                    "GC_SHOW_COUNT_FILE": str(count),
+                    "GC_SHOW_FAIL_COUNT": "6",
+                    "GC_BUILD_ARTIFACT_SHOW_RETRY_DELAY": "0",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertGreaterEqual(int(count.read_text(encoding="utf-8")), 7)
+            call_text = calls.read_text(encoding="utf-8")
+            self.assertIn(f"--rig {tmp} bd show fc-loop --json", call_text)
+            self.assertIn(f"--rig {tmp} bd show fc-root --json", call_text)
 
     def test_build_artifact_check_resolves_relative_path_from_rig_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
