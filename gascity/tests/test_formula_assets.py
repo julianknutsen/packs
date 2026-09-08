@@ -4,7 +4,6 @@ import json
 import os
 import pathlib
 import re
-import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -6177,6 +6176,131 @@ description = "Override sink that writes the base triage report contract."
         self.assertIn("gmol: gc ready failed for status:", result.stderr)
         self.assertIn("GAP_MEMBER_READ_FAILURE", result.stderr)
         self.assertNotIn("needs another iteration", result.stdout)
+
+    # The three tests below pin the capture sites the fixtures above never
+    # reach. Every fixture above fails the *first* `gc bd show`, which short
+    # -circuits design-review and makes the tolerant gates fall back to
+    # `PARENT_ROOT=$ROOT_ID` -- so the fatal design-review handler (the exact
+    # symptom this change exists to fix) and the two re-show sites were
+    # unpinned. Each fixture below lets the first show succeed.
+
+    def test_design_review_check_surfaces_gc_bd_show_stderr(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "design-review-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            # A dedicated TMPDIR that nothing else writes to, so "empty after the
+            # run" is an exact pin on the EXIT trap reclaiming the capture file.
+            tmpdir = pathlib.Path(tmp) / "tmpdir"
+            tmpdir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "echo 'DESIGN_SHOW_FAILURE store unavailable' >&2\n"
+                "exit 3\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "design-bead",
+                "TMPDIR": str(tmpdir),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+            leaked = sorted(p.name for p in tmpdir.iterdir())
+
+        # This site is fatal by design: a gate that cannot read its own bead
+        # must not fall through to a verdict decision.
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR: gc bd show design-bead failed", result.stderr)
+        self.assertIn("DESIGN_SHOW_FAILURE", result.stderr)
+        # `trap 'rm -f "$GC_ERR"' EXIT INT TERM HUP` actually reclaims the file.
+        self.assertEqual(leaked, [])
+
+    def test_implementation_review_check_notes_parent_show_stderr(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "implementation-review-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                # The member read is `gc ready` (see gmol); let it succeed with an
+                # empty union so this test isolates the parent `gc bd show` site.
+                "if [ \"$1\" = \"ready\" ]; then\n"
+                "  printf '[]\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [ \"$2\" = \"show\" ]; then\n"
+                # The root read succeeds and names a *different* parent, which is
+                # the only way control reaches the parent re-show.
+                "  if [ \"$3\" = \"parent-err\" ]; then\n"
+                "    echo 'PARENT_SHOW_FAILURE parent lookup unavailable' >&2\n"
+                "    exit 3\n"
+                "  fi\n"
+                "  printf '%s\\n' '{\"metadata\":{\"gc.root_bead_id\":\"parent-err\",\"gc.attempt\":\"1\"}}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "root-child",
+                "GC_ITERATION": "1",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("review check: note: gc bd show parent-err failed", result.stderr)
+        self.assertIn("PARENT_SHOW_FAILURE", result.stderr)
+        # The root read succeeded, so the tolerant note is the parent's alone --
+        # without this the fixture could regress into the already-pinned site.
+        self.assertNotIn("gc bd show root-child failed", result.stderr)
+
+    def test_build_artifact_check_root_reshow_failure_surfaces_gc_bd_stderr(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "build-artifact-valid.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$3\" = \"root-err\" ]; then\n"
+                "  echo 'ROOT_RESHOW_FAILURE root lookup unavailable' >&2\n"
+                "  exit 3\n"
+                "fi\n"
+                # The step read succeeds with a complete artifact contract and a
+                # root that differs from the bead, so the re-show is reached.
+                "printf '%s\\n' '{\"metadata\":{"
+                "\"gc.build.artifact_schema\":\"gc.build.requirements.v1\","
+                "\"gc.build.artifact_path_keys\":\"gc.build.requirements_path\","
+                "\"gc.root_bead_id\":\"root-err\"}}'\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "bd-child",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            result = subprocess.run([str(script)], capture_output=True, env=env, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("build-artifact-check: gc bd show root-err failed", result.stderr)
+        self.assertIn("ROOT_RESHOW_FAILURE", result.stderr)
+        # The first show succeeded; only the root re-show is being reported.
+        self.assertNotIn("gc bd show bd-child failed", result.stderr)
 
 
 if __name__ == "__main__":

@@ -50,7 +50,10 @@ print(value if isinstance(value, str) else "")
 }
 
 GC_ERR="$(mktemp)"
-trap 'rm -f "$GC_ERR"' EXIT
+# EXIT alone does not fire on an untrapped signal, and check gates run under a
+# documented 10m dispatcher budget -- timeout kills are an expected path, not a
+# hypothetical one, so each would leak this capture file. SIGKILL leaks either way.
+trap 'rm -f "$GC_ERR"' EXIT INT TERM HUP
 SHOW_JSON="$(gc bd show "$BEAD_ID" --json 2>"$GC_ERR")" \
   || fail "gc bd show $BEAD_ID failed: $(tail -c 400 "$GC_ERR" | tr '\n' ' ')"
 
