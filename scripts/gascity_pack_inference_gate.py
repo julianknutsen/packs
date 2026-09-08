@@ -2820,6 +2820,29 @@ def validate_gastown_orchestration_contract(pack_source: Path) -> None:
         for fragment in required_fragments:
             if fragment not in text:
                 missing.append(f"{formula_name}: missing contract fragment {fragment!r}")
+    idle_contract_files = {
+        "agents/refinery/agent.toml": (
+            'sleep_after_idle = "300s"',
+            "Normal no-work exit path depends on session_sleep restart policy via",
+        ),
+        "agents/refinery/prompt.template.md": (
+            "depends on `sleep_after_idle` in `agents/refinery/agent.toml`",
+            "without `gc runtime request-restart`",
+        ),
+        "formulas/mol-refinery-patrol.toml": (
+            "This normal idle path depends on `sleep_after_idle` in",
+            "Heavy-context recycling uses",
+        ),
+    }
+    for relpath, required_fragments in idle_contract_files.items():
+        path = pack_source / relpath
+        if not path.is_file():
+            missing.append(f"refinery idle contract: missing file {path}")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for fragment in required_fragments:
+            if fragment not in text:
+                missing.append(f"refinery idle contract: {relpath} missing {fragment!r}")
     if missing:
         raise GateError("Gastown orchestration contract drifted:\n" + "\n".join(f"- {item}" for item in missing))
 

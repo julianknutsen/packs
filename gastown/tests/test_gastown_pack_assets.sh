@@ -216,6 +216,38 @@ metadata = block.index('--set-metadata merge_result=merged')
 if verify >= metadata:
     raise SystemExit(1)
 PY
+
+    [[ "$direct_block" == *'cleanup_stale_polecat_refs()'* ]] ||
+        fail "direct refinery merge must define stale polecat ref cleanup"
+    [[ "$direct_block" == *'git for-each-ref --format='\''%(refname:short)'\'' refs/heads/polecat/'* ]] ||
+        fail "direct refinery merge must scan local polecat heads before cleanup"
+    [[ "$direct_block" == *'git update-ref -d "refs/heads/$ref"'* ]] ||
+        fail "direct refinery merge must delete stale local polecat refs"
+
+    grep -F 'cleanup_stale_polecat_ref()' "$formula" >/dev/null ||
+        fail "mr refinery merge must define stale polecat ref cleanup"
+    grep -F 'git update-ref -d "$branch_ref"' "$formula" >/dev/null ||
+        fail "mr refinery merge must delete the matching stale local polecat ref"
+}
+
+test_refinery_idle_contract_is_explicit_and_guarded() {
+    local agent prompt formula
+    agent="$GASTOWN/agents/refinery/agent.toml"
+    prompt="$GASTOWN/agents/refinery/prompt.template.md"
+    formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
+
+    grep -F 'sleep_after_idle = "300s"' "$agent" >/dev/null ||
+        fail "refinery agent must keep an explicit sleep_after_idle patrol interval"
+    grep -F 'Normal no-work exit path depends on session_sleep restart policy via' "$agent" >/dev/null ||
+        fail "refinery agent should document that normal idle depends on sleep_after_idle"
+    grep -F 'depends on `sleep_after_idle` in `agents/refinery/agent.toml`' "$prompt" >/dev/null ||
+        fail "refinery prompt must document that no-work idle depends on sleep_after_idle"
+    grep -F 'without `gc runtime request-restart`' "$prompt" >/dev/null ||
+        fail "refinery prompt must distinguish idle exit from heavy-context restart"
+    grep -F 'This normal idle path depends on `sleep_after_idle` in' "$formula" >/dev/null ||
+        fail "refinery formula must document that no-work idle depends on sleep_after_idle"
+    grep -F 'Heavy-context recycling uses' "$formula" >/dev/null ||
+        fail "refinery formula must distinguish heavy-context restart from idle exit"
 }
 
 test_prime_prompts_are_city_generic_and_compact() {
@@ -262,5 +294,6 @@ test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+test_refinery_idle_contract_is_explicit_and_guarded
 
 echo "gastown pack asset tests passed"

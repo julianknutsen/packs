@@ -147,6 +147,12 @@ and processes the queue with a clean context. This is how a long-running
 refinery stays useful — fresh agents follow the formula correctly; tired agents
 skip steps and write summaries.
 
+Normal no-work idle is different: that path exits without `gc runtime request-restart`
+and depends on `sleep_after_idle` in `agents/refinery/agent.toml` so
+session_sleep re-runs the patrol after the configured idle interval. Do not
+clear or blank `sleep_after_idle` unless you also redesign and update this
+prompt and `mol-refinery-patrol` to provide an equivalent wake contract.
+
 ---
 
 ## Startup

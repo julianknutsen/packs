@@ -4,5 +4,8 @@ work_dir = ".gc/worktrees/{{.Rig}}/refinery"
 nudge = "Run 'gc prime' to check merge queue and begin processing."
 pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync"]
 idle_timeout = "2h"
+# Normal no-work exit path depends on session_sleep restart policy via
+# sleep_after_idle. Heavy-context recycling uses `gc runtime request-restart`
+# from prompt/formula instead; do not clear this without updating that contract.
 sleep_after_idle = "300s"
 max_active_sessions = 1

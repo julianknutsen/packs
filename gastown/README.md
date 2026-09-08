@@ -75,3 +75,19 @@ Gastown deliberately does not ship retired dog formulas for JSONL export or
 stale-session reaping. The Gas City builtin core pack provides JSONL export,
 stale-session and stale-data cleanup, and Dolt housekeeping as deterministic
 exec orders.
+
+## Refinery Idle Contract
+
+Gastown refinery has two recycle paths:
+
+- Normal no-work idle prints `IDLE: no work, exiting turn.` and relies on
+  `sleep_after_idle = "300s"` in `agents/refinery/agent.toml` so session_sleep
+  wakes a fresh patrol after configured idle interval.
+- Heavy-context path pours next wisp, burns current wisp, then calls
+  `gc runtime request-restart` immediately.
+
+Treat those as one contract across `agents/refinery/agent.toml`,
+`agents/refinery/prompt.template.md`, and
+`formulas/mol-refinery-patrol.toml`. Do not clear `sleep_after_idle` as a
+latency tweak unless you also update prompt/formula wake contract and
+regression tests.

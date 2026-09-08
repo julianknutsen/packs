@@ -1084,6 +1084,20 @@ def test_validate_gastown_orchestration_contract_rejects_missing_refinery_false_
         gascity_pack_inference_gate.validate_gastown_orchestration_contract(tmp_path / "gastown")
 
 
+def test_validate_gastown_orchestration_contract_rejects_missing_refinery_idle_contract(tmp_path) -> None:
+    spec = gascity_pack_inference_gate.PACK_SPECS["gastown"]
+    pack_source = tmp_path / "gastown"
+    shutil.copytree(spec.source, pack_source)
+    agent = pack_source / "agents" / "refinery" / "agent.toml"
+    agent.write_text(
+        agent.read_text(encoding="utf-8").replace('sleep_after_idle = "300s"', 'sleep_after_idle = ""'),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="sleep_after_idle"):
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(pack_source)
+
+
 def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
     for pack_name in gascity_pack_inference_gate.METHODOLOGY_PACKS:
         gascity_pack_inference_gate.validate_methodology_flow_contract(
