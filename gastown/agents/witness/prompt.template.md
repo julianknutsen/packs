@@ -133,7 +133,7 @@ for the dog pool:
 gc bd create --type=task \
   --title="Stuck: <agent>" \
   --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}' \
-  --label=warrant
+  --labels=warrant
 ```
 
 The dog pool runs `mol-shutdown-dance` — a multi-stage interrogation
@@ -327,7 +327,7 @@ gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
 | Salvage worktree work | `git add -A && git commit && git push origin HEAD` |
 | Delete worktree | `git worktree remove <path> --force` |
 | Set branch metadata | `gc bd update <id> --set-metadata branch=<name>` |
-| File stuck-agent warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
+| File stuck-agent warrant | `gc bd create --type=task --labels=warrant --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
 
 Rig: {{ .RigName }}
 Working directory: {{ .WorkDir }}

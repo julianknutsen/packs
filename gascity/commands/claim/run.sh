@@ -118,6 +118,22 @@ if [ -z "$EXPECTED_ASSIGNEE" ]; then
     exit 1
 fi
 
+# The claim hook writes the OCCUPANT identity (the session bead id) for
+# unaliased pool workers and the alias for aliased ones; older binaries wrote
+# the slot-derived session name. All of these are OUR identities, so verify
+# membership in the session's own identity set instead of insisting on one
+# precomputed form -- a strict single-form compare rejected the session's own
+# claim forever after the writer moved to the occupant id (gascity ga-jrnou).
+claim_assignee_is_ours() {
+    _candidate="$1"
+    for _own in "${BEADS_ACTOR:-}" "${GC_ALIAS:-}" "${GC_SESSION_ID:-}" "${GC_SESSION_NAME:-}" "${GC_AGENT:-}"; do
+        if [ -n "$_own" ] && [ "$_candidate" = "$_own" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 claim_file="$(mktemp)"
 show_file="$(mktemp)"
 convoy_file="$(mktemp)"
@@ -209,7 +225,7 @@ while [ "$verify_try" -lt "$max_attempts" ]; do
             printf 'CLAIM_REJECTED unexpected status for %s: %s\n' \
                 "$work_id" "$claim_status" >&2
             break
-        elif [ "$claim_assignee" != "$EXPECTED_ASSIGNEE" ]; then
+        elif ! claim_assignee_is_ours "$claim_assignee"; then
             printf 'CLAIM_REJECTED assignee mismatch for %s\n' "$work_id" >&2
             break
         elif [ -n "$EXPECTED_ROUTE" ] && [ -n "$claim_route" ] && [ "$claim_route" != "$EXPECTED_ROUTE" ]; then

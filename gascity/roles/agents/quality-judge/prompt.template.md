@@ -1,0 +1,1 @@
+{{ template "gc-role-worker" . }}

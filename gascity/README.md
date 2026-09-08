@@ -72,15 +72,49 @@ Use skill gc.mayor
 
 ## Choosing an entrypoint
 
-| You have | Launch | Notes |
-| -------- | ------ | ----- |
-| Just an idea | `build-basic` (targeted at a bead) | Full lifecycle from requirements onward. |
-| Approved requirements | `build-from-plan` | Produces plan + plan review, then continues. |
-| Approved requirements, plan, and plan review | `build-from-decompose` | Starts at decomposition. |
-| An implementation convoy | `build-from-convoy` | Drains the convoy, then reviews. |
-| Implementation evidence | `build-from-review` | Review, repair/restart handoff, finalize, publish. |
-| An approved convoy, no build wrapper wanted | `implement` | Direct drain without the review/publish suffix. |
-| A GitHub issue or PR URL | `github-issue-triage`, `github-issue-fix`, `github-pr-review` | Targetless adapters; see GitHub Adapter Workflows below. |
+An idea or request is the input to the Software Development Lifecycle (SDLC).
+The `build-from-*` continuation formulas are named for the point where they
+enter it. For example, `build-from-requirements` starts at Requirements and
+gathers requirements from the idea or request you provide.
+
+Each full-lifecycle formula runs from its starting phase through a complete,
+tested, and reviewed implementation with any required review fixes applied,
+plus a final report. The result may remain local, be pushed, or be published
+as a PR.
+
+The SDLC phases are:
+
+- Requirements
+- Implementation Planning
+- Plan Review
+- Plan Decomposition into beads
+- Implementation and Testing
+- Implementation Review/Fix
+- Finalization
+- Optional Publication (push or PR)
+
+| What you have | Public formula | SDLC phase you're starting from |
+| --- | --- | --- |
+| A target bead containing an idea or request | `build-basic` | Requirements |
+| An idea or request, but no target bead | `build-from-requirements` | Requirements |
+| An approved requirements (aka plan) Markdown file | `build-from-plan` | Implementation Planning |
+| Approved requirements and a reviewed implementation plan | `build-from-decompose` | Plan Decomposition |
+| A Gas City implementation convoy and its requirements, implementation plan, and decomposition | `build-from-convoy` | Implementation |
+
+### Focused workflows
+
+| What you want to do | Public formula | Successful output or boundary |
+| --- | --- | --- |
+| Harden an implementation plan | `design-review` | Revised implementation plan approved or blocked by its review loop |
+| Implement an approved convoy without the full build suffix | `implement` | Implementation summary and optional publication; no normal review/fix/finalize suffix |
+| Resume an existing Gas City build at implementation review | `build-from-review` | Full-lifecycle output described above; requires its upstream build artifacts and implementation evidence |
+| Review an implementation | `review` | Review report only |
+| Check requirements and implementation coverage | `gap-analysis` | Coverage report only |
+| Assess a GitHub issue | `github-issue-triage` | Triage report and a sticky issue comment, created or updated; no implementation |
+| Fix a GitHub issue | `github-issue-fix` | Implemented and reviewed issue fix; sticky issue-fix status comment created or updated; optional draft or ready PR |
+| Review a GitHub PR | `github-pr-review` | Review report and a sticky PR comment for the current head, created or updated; no code changes, formal GitHub review, or merge |
+
+The normal build continuations use one implementation-plan review gate; a required-changes or blocked verdict stops the continuation. `design-review` and `github-issue-fix` provide review loops that harden an implementation plan. Testing evidence is required; TDD is not. `gc.mayor` can gather the upstream artifact paths needed by the continuation formulas.
 
 Discover everything that is launchable from the active rig/city context:
 

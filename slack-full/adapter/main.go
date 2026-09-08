@@ -807,7 +807,12 @@ type externalActor struct {
 type externalAttachment struct {
 	ProviderID string `json:"provider_id"`
 	URL        string `json:"url"`
-	MIMEType   string `json:"mime_type,omitempty"`
+	// mime_type is REQUIRED on the gc side (extmsg.ExternalAttachment):
+	// omitting the key gets the whole inbound message rejected with 422,
+	// so it is deliberately NOT omitempty. Producers derive a non-empty
+	// value via attachmentMIMEType; an empty string here is at worst a
+	// degraded value, never a missing required key.
+	MIMEType string `json:"mime_type"`
 }
 
 type externalInboundMessage struct {
@@ -1036,7 +1041,12 @@ type slackFile struct {
 	URLPrivateDownload string `json:"url_private_download,omitempty"`
 	MIMEType           string `json:"mimetype,omitempty"`
 	Filetype           string `json:"filetype,omitempty"`
-	Size               int    `json:"size,omitempty"`
+	// Subtype is set for recordings made inside Slack ("slack_audio"
+	// voice clips, "slack_video" video clips), which carry NO
+	// mimetype/filetype — the only hint attachmentMIMEType has for an
+	// extension-less one.
+	Subtype string `json:"subtype,omitempty"`
+	Size    int    `json:"size,omitempty"`
 }
 
 type slackMessageEvent struct {
@@ -2686,7 +2696,10 @@ func downloadSlackFiles(cfg config, channel, ts string, files []slackFile) []ext
 		out = append(out, externalAttachment{
 			ProviderID: f.ID,
 			URL:        "file://" + dest,
-			MIMEType:   f.MIMEType,
+			// Never f.MIMEType verbatim: Slack-native recordings (voice
+			// clips, video clips) carry an empty mimetype, and gc requires
+			// the field — see attachmentMIMEType.
+			MIMEType: attachmentMIMEType(f),
 		})
 	}
 	return out

@@ -292,7 +292,11 @@ The single best Tier 1 (or Tier 2 if no Tier 1) candidate, with:
 - Issue # and title
 - Why it's the best pick (priority, scope, no gates, no competing PR)
 - The exact dispatch command:
-  `gc-sling polecat <new-bead-id> --on mol-pr-start --var issue=<N>`
+  `gc sling <rig>/<worker-agent> <new-bead-id> --on mol-pr-start --var issue=<N> --nudge`
+  (`gc sling`, two words — there is no `gc-sling` wrapper. The target is the
+  worker pool's config agent as the city stamped it: `<rig>/polecat` when the
+  agent is stamped bare, `<rig>/gastown.polecat` when it comes from the
+  gastown pack. Discover it with `gc agent list`.)
 
 If no Tier 1 OR Tier 2 candidates exist, recommend a Tier 3 to investigate
 or note that the queue is empty and triage should wait for new issues.

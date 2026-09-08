@@ -69,7 +69,16 @@ if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
 fi
 
 # Refuse to ship from main / default branch.
-DEFAULT=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' || echo "main")
+# Resolve the default branch locally. `|| echo "main"` on the old
+# `git remote show origin` pipeline could never fire: sed exits 0 on empty
+# input, so a network failure produced DEFAULT="" and this check silently
+# fell back to the hardcoded main/master arms below.
+DEFAULT=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+if [ -z "$DEFAULT" ]; then
+    git remote set-head origin --auto >/dev/null 2>&1 || true
+    DEFAULT=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+fi
+[ -n "$DEFAULT" ] || DEFAULT=main
 if [ "$BRANCH" = "$DEFAULT" ] || [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
     echo "Cannot ship from default branch ($BRANCH). Create a feature branch first."
     gc bd close "$ROOT_ID" --reason "on default branch"

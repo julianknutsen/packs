@@ -2,9 +2,11 @@
 #
 # Pack-shipped binaries:
 #
-# - Adapter (./adapter/gc-slack-adapter, built from adapter/main.go).
-#   Public-facing Slack webhook receiver + outbound publisher. The
-#   [[service]] block below has gc supervise it as a proxy_process.
+# - Adapter (./adapter/gc-slack-adapter, built from the Go module in
+#   adapter/). Public-facing Slack webhook receiver + outbound
+#   publisher. The [[service]] block below has gc supervise it as a
+#   proxy_process via adapter/run.sh, which rebuilds the binary on
+#   missing so git-only pack re-materializations can't strand it.
 #
 # - Operator CLI (./cli/gc-slack-cli, built from cli/main.go +
 #   cli/cmd/). Backs the `gc slack <cmd>` verb surface (import-app,
@@ -28,9 +30,14 @@ schema = 2
 # /slack/events (Tailscale Funnel terminates there); proxy_process
 # accepts that — the controller only owns the UDS lifecycle.
 #
-# Secrets (SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, SLACK_WORKSPACE_ID)
-# stay in ~/.config/gc-slack-adapter/env and are inherited via
-# os.Environ() at start time. See README.md "Secrets".
+# The command is adapter/run.sh, NOT the binary: the binary is a
+# gitignored build artifact and `gc import install` re-materializes
+# the pack cache git-only, so a command pointing at the binary strands
+# the service on every pin bump. run.sh is checked in, sources the
+# secrets env file (~/.config/gc-slack-adapter/env, see README.md
+# "Secrets" — SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET,
+# SLACK_WORKSPACE_ID), rebuilds adapter/gc-slack-adapter from source
+# when it is missing, and execs it.
 #
 # [[service]] block re-enabled 2026-05-03 afternoon: gc-cdf shipped
 # the URL-prefix fix so GC_SERVICE_URL_PREFIX now resolves to
@@ -45,5 +52,5 @@ kind = "proxy_process"
 visibility = "private"
 
 [service.process]
-command = ["./adapter/gc-slack-adapter"]
+command = ["./adapter/run.sh"]
 health_path = "/healthz"

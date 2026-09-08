@@ -140,14 +140,14 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "gc workflow delete-source <bead> --apply && gc workflow reopen-source <bead>",
         "gc bd update <bead> --set-metadata recovered=true",
         "gc session nudge <rig>/{{binding_prefix}}refinery",
-        "--label=warrant",
+        "--labels=warrant",
         "\"gc.routed_to\":\"{{binding_prefix}}dog\"",
     ),
     "mol-deacon-patrol": (
         "Work-layer health",
         "queue-starvation-check",
         "gc agents list --json --active",
-        "gc bd create --type=task --label=warrant",
+        "gc bd create --type=task --labels=warrant",
         "\"gc.routed_to\":\"{{binding_prefix}}dog\"",
     ),
     "mol-idea-to-plan": (

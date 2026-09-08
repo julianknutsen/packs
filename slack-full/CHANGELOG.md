@@ -8,8 +8,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Inbound files recorded inside Slack itself — voice clips (file subtype
+  `slack_audio`) and video clips (`slack_video`) — arrive with an empty
+  `mimetype` AND `filetype`, which the adapter passed through verbatim.
+  The inbound payload then omitted `mime_type`, a REQUIRED property of
+  gc's `extmsg.ExternalAttachment`, so gc rejected the whole message
+  with 422 and the recording plus its text caption silently never
+  reached the bound session. The adapter now derives a media type for
+  every inbound file (Slack's `mimetype` → file-name extension → Slack
+  `filetype` code → Slack-native subtype → `application/octet-stream`)
+  and always serializes `mime_type` (no longer `omitempty`), so a
+  payload can never again be rejected for a missing key.
+  Scope: this covers the legacy `/extmsg/inbound` delivery path. Files
+  shared in a company/multi-bot room take the company hydration path,
+  which never posts to `/extmsg/inbound` and still renders Slack's raw
+  `filetype`, so a Slack-native recording there is unchanged by this fix
+  and still lists an empty filetype.
+- The `[[service]]` proxy_process command pointed straight at
+  `adapter/gc-slack-adapter`, a gitignored build artifact — but
+  `gc import install` re-materializes the pack cache git-only, so every
+  pack pin bump wiped the binary and left the slack service dead until
+  someone rebuilt it by hand. The service command is now
+  `adapter/run.sh` (checked in, survives every materialization): it
+  sources the secrets env file, execs an existing binary untouched,
+  and on a missing binary finds a Go toolchain (PATH plus
+  Homebrew/system fallbacks for minimal supervisor environments),
+  rebuilds from the colocated sources with loud stderr logging,
+  publishes via PID-suffixed temp file + atomic `mv` (safe under
+  concurrent supervisor restarts), and execs.
+
+  Env-file handling distinguishes the two cases. An absent *default*
+  (`~/.config/gc-slack-adapter/env`) warns and continues, since
+  supervised deployments legitimately inject the env another way and
+  the adapter fail-fasts on missing required keys itself. An absent
+  path you set *explicitly* in `GC_SLACK_ADAPTER_ENV` is fatal: the
+  adapter validates that credentials are present, never where they
+  came from, so continuing would boot it against whatever Slack token
+  happens to be in the ambient environment.
+
+  Because the rebuild now sits on the service startup path, it is
+  hardened for the minimal supervisor environments it targets: the
+  toolchain search also covers `/usr/bin/go` and `/bin/go` (where a
+  distro Go lands, and which a restricted PATH hides); `GOCACHE` and
+  `GOPATH` are defaulted under `TMPDIR` when HOME, `XDG_CACHE_HOME`
+  and `GOCACHE` are all unset, which `go build` otherwise rejects
+  outright; and the toolchain is checked against `go.mod`'s `go`
+  directive up front, so a too-old Go under `GOTOOLCHAIN=local` fails
+  with a named remedy instead of a raw compiler error (the default
+  `GOTOOLCHAIN=auto`, which can fetch the required toolchain itself,
+  warns and proceeds).
+
 ### Changed
 
+- **Behavior change on upgrade:** the slack service now *exits 1 at
+  startup* when `GC_SLACK_ADAPTER_ENV` is set to a path that does not
+  exist, where it previously logged one warning and started on the
+  ambient environment. Pointing the variable at a nonexistent path is
+  this pack's own established idiom for "no env file", so a unit file or
+  wrapper using it that way for the **service** will stop starting after
+  this pin bump. Audit before upgrading with
+  `grep -r GC_SLACK_ADAPTER_ENV` across your unit files and wrappers, and
+  either create the file or unset the variable to fall back to the
+  default. The strict rule is service-only: `slack_chat_*` commands
+  (`scripts/slack_intake_common.py`) still treat a missing path as "no
+  env file".
 - Renamed the pack directory from `slack-pack/` to `slack-full/` and the
   `pack.toml` name from `slack` to `slack-full` as part of the Slack pack
   tiering split (`gc-yrw`). This pack is now **Tier 3** of the Slack

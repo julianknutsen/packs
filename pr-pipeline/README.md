@@ -53,6 +53,21 @@ comment template (`templates/adoption-review-comment.md`); it reuses the
 same 11-category scorecard `mol-pr-review` applies, so review feedback
 keeps a consistent shape in both directions.
 
+## Testing across the layer boundary
+
+**[`docs/testing-across-the-layer-boundary.md`](docs/testing-across-the-layer-boundary.md)**
+is the standard behind the scorecard's evidence category, and the one to read
+before writing or reviewing a fix anywhere in the dolt / beads / gascity / packs
+stack.
+
+It answers two questions the scorecard assumes you have already settled. First,
+when does a test actually demonstrate that a fix repairs a live build, rather
+than repairing a graph of stubs? A tier ladder, a fidelity claim owed per
+replaced seam, and a second mutation that perturbs the stubs instead of only
+reverting the fix. Second, which of the four repositories owns a given defect,
+with a routing checklist and three open issues on this tracker that name
+artifacts living in `gastownhall/gascity` rather than here.
+
 ## Usage
 
 In your city's `pack.toml`:
@@ -94,7 +109,13 @@ Scorecard against 11 categories (behavioral correctness, contract
 fidelity, blast radius, concurrency, error handling, security, resource
 lifecycle, release safety, test evidence, architectural consistency,
 debuggability). Pre-flags 7 recurring fixup themes. Verdict: `block`,
-`request_changes`, or `approve`.
+`request_changes`, `approve`, or `too_large`.
+
+A PR whose additions+deletions exceed `--max-diff-lines` (default 5000, `0`
+disables) is refused before any agent is started, exiting 3 and recording
+`verdict: too_large`. That refusal describes the request, not a failed run:
+retrying it unchanged cannot succeed and spends the same budget again, so
+supervising loops must not treat it as retryable.
 
 ### Run the pre-push gate
 
@@ -127,6 +148,8 @@ gc sling api-server/polecat mol-pr-start --formula --var issue=1234
 ```
 pr-pipeline/
 ├── pack.toml
+├── docs/
+│   └── testing-across-the-layer-boundary.md   tier ladder + layer map
 ├── formulas/
 │   ├── mol-pr-start.formula.toml          6-step planner
 │   ├── mol-pr-blast-radius.formula.toml   5-step impact mapper

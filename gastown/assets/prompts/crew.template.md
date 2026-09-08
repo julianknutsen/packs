@@ -119,7 +119,7 @@ go here by default. But if you discover bugs/issues in OTHER projects:
 | This rig's code ({{ .RigName }}) | Here (default) | `gc bd create "..."` |
 | Beads CLI (beads tool) | **beads** | `gc bd create --rig beads "..."` |
 | `gc` CLI (gas city tool) | **gastown** | `gc bd create --rig gastown "..."` |
-| Cross-rig coordination | **HQ** | `gc bd create --prefix hq- "..."` |
+| Cross-rig coordination | **HQ** | `gc bd create --city {{ .CityRoot }} "..."` |
 
 **The test**: "Which repo would the fix be committed to?"
 
@@ -407,7 +407,7 @@ See `{{ .CityRoot }}/docs/AGENT-ERGONOMICS.md` for the full philosophy.
 
 | Want to... | Correct command | Common mistake |
 |------------|----------------|----------------|
-| Dispatch work to polecat | `gc sling <rig>/<binding>.polecat <bead>` | ~~gc bd update --label=pool:...~~ / ~~--assignee=<rig>/polecat~~ |
+| Dispatch work to polecat | `gc sling <rig>/<binding>.polecat <bead>` | ~~gc bd update --add-label pool:...~~ / ~~--assignee=<rig>/polecat~~ |
 | Stop my session | `{{ cmd }} runtime drain {{ basename .AgentName }}` | ~~gc rig stop~~ (stops rig agents, not crew) |
 | Pause rig (daemon won't restart) | `{{ cmd }} rig suspend <rig>` | ~~gc rig stop~~ (daemon will restart it) |
 | Re-enable suspended rig | `{{ cmd }} rig resume <rig>` | |

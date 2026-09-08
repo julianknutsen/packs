@@ -20,6 +20,19 @@ fi
 run_bounded() {
     if command -v timeout >/dev/null 2>&1; then
         timeout 2s "$@"
+    elif command -v perl >/dev/null 2>&1; then
+        # macOS ships no coreutils timeout. A plain alarm+exec is not enough:
+        # the Go runtime swallows SIGALRM, so gc would run unbounded anyway.
+        # Fork and SIGTERM (then SIGKILL) the child instead — Go honors TERM.
+        perl -e '
+            my $t = shift @ARGV;
+            my $p = fork;
+            if (!$p) { exec @ARGV or exit 127 }
+            $SIG{ALRM} = sub { kill "TERM", $p; select undef, undef, undef, 0.5; kill "KILL", $p; waitpid $p, 0; exit 124 };
+            alarm $t;
+            waitpid $p, 0;
+            exit($? >> 8);
+        ' 2 "$@"
     else
         "$@"
     fi
@@ -80,17 +93,36 @@ if is_number "$now" && is_number "$mtime" && [ "$mtime" -gt 0 ] && [ "$((now - m
     is_number "${w:-}" || w=0
     is_number "${m:-}" || m=0
 else
-    # Preserve gc hook ready-work semantics while bounding tmux refreshes.
-    w=$(json_array_count gc hook "$agent")
-
-    # Preserve gc mail check unread/recipient-route semantics while caching.
-    m=$(first_number gc mail check "$agent")
-
+    # Single-flight: only one render per agent may refresh; concurrent
+    # renders serve the stale cache instead of piling more gc (store)
+    # queries onto an already-slow store — stacked slow renders are the
+    # exact feedback loop that makes the store slower.
     mkdir -p "$cache_dir" 2>/dev/null || true
     if [ "$cache_private" = 1 ]; then
         chmod 700 "$cache_dir" 2>/dev/null || true
     fi
-    printf '%s %s\n' "${w:-0}" "${m:-0}" > "$cache" 2>/dev/null || true
+    lock="$cache.lock"
+    if mkdir "$lock" 2>/dev/null; then
+        trap 'rmdir "$lock" 2>/dev/null' EXIT INT TERM
+
+        # Preserve gc hook ready-work semantics while bounding tmux refreshes.
+        w=$(json_array_count gc hook "$agent")
+
+        # Preserve gc mail check unread/recipient-route semantics while caching.
+        m=$(first_number gc mail check "$agent")
+
+        printf '%s %s\n' "${w:-0}" "${m:-0}" > "$cache" 2>/dev/null || true
+    else
+        # Refresh already in flight: serve stale values. Break locks older
+        # than 120s so a killed refresher cannot wedge the status line.
+        lock_mtime=$(cache_mtime "$lock")
+        if is_number "$lock_mtime" && [ "$lock_mtime" -gt 0 ] && [ "$((now - lock_mtime))" -gt 120 ]; then
+            rmdir "$lock" 2>/dev/null || true
+        fi
+        read -r w m < "$cache" 2>/dev/null || true
+        is_number "${w:-}" || w=0
+        is_number "${m:-}" || m=0
+    fi
 fi
 
 # Format: agent | hook-icon N | mail-icon N  (omit segments that are 0)

@@ -486,7 +486,7 @@ else
   gc bd create --type=task \
     --title="Stuck: <session-name>" \
     --metadata '{"target":"<session-name>","reason":"No progress on <bead> for <duration>","requester":"witness","gc.routed_to":"{{binding_prefix}}dog"}' \
-    --label=warrant
+    --labels=warrant
 fi
 ```
 

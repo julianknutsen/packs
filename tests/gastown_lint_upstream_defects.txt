@@ -1,0 +1,144 @@
+# `gc lint gastown` findings that are defects in gc's linter, not in this pack.
+#
+# One finding per OCCURRENCE, as "<path relative to the pack dir>: <message>".
+# Blank lines and `#` comments ignored.
+#
+# NO LINE NUMBERS. An entry is matched on path and message only, and a finding
+# that occurs twice is written twice -- tests/test_gastown_lint_findings.py
+# counts occurrences, so a duplicate arriving still fails. Line numbers were
+# here for one day and cost a red main the first time anyone edited a pinned
+# file: #265 collapsed the mayor prompt's four-row rig-routing table into one
+# generic row, moving the same diagnostic from lines 118-121 to lines 23 and
+# 114. Nothing about the pack or the linter changed, and CI went red on every
+# open PR in the repo. A guard whose green depends on where in a file a line
+# sits reports edits, not regressions.
+#
+# What that costs, stated so nobody re-adds them: this no longer tells you
+# WHERE to look, and a finding that moves within a file is invisible here. Both
+# are fine. The section comments below carry the gc-side cause and a refute
+# command, which is what a reader actually needs, and a moved finding is not an
+# event. What still fails: a new path, a new message, or one more occurrence of
+# an existing pair.
+#
+# `# @section: <name>` switches which set the lines below it belong to:
+#
+#   universal   Present on every gc. tests/test_gastown_lint_findings.py
+#               requires each one, so a finding that disappears fails and the
+#               entry has to be deleted in the same change as the upstream fix.
+#   pre-5220    Emitted by gc up to v1.4.1 and fixed on gascity main. Tolerated
+#               rather than required, because which one CI sees depends on
+#               whether `gc@latest` has picked up the fix yet. The set still
+#               has to be all-present or all-absent; a partial match fails.
+#
+# Every line here that quotes a `bd` invocation does so because it is gc's own
+# output, matched byte for byte. tests/test_no_bare_bd_commands.py exempts
+# lines in this file that are exactly a gc lint diagnostic, so they cannot be
+# reworded to route through `gc bd` the way pack text is.
+#
+# The point is that gastown, a supported pack, never again drifts from the
+# binary with nothing failing.
+
+# ---------------------------------------------------------------------------
+# 1. named_session x5: `gc lint` calls a bare cap a "pool control"
+#
+# All five templates set `max_active_sessions = 1` and nothing else: no
+# min_active_sessions, no scale_check, no namepool. That configuration spawns
+# nothing. internal/agentutil/pool.go ScaleParamsFor takes Min from
+# EffectiveMinActiveSessions(), and internal/config/session_capacity.go returns
+# 0 for it when MinActiveSessions is nil. The cap is what HOLDS the singleton.
+#
+# Three places in one binary disagree about this shape:
+#   - cmd/gc/cmd_lint.go agentHasPoolControls returns true on
+#     `MaxActiveSessions != nil`, so it fires here.
+#   - internal/doctor/checks_named_session.go (check "named-always-min-conflict")
+#     warns only when EffectiveMinActiveSessions() > 0, so it is silent here.
+#   - internal/config/session_capacity.go SupportsInstanceExpansion documents
+#     "Named-session agents (MaxActiveSessions=1 with a [[named_session]] entry,
+#     no Min/ScaleCheck)" as a shape it deliberately handles.
+#
+# Following the remediation text would delete the cap that enforces the
+# singleton. The documented escape hatch (min=0 AND max=0) is worse: at max=0
+# SupportsGenericEphemeralSessions returns false, which changes how the agent
+# can be spawned rather than annotating intent.
+#
+# Refute: grep -n 'agentHasPoolControls' <gascity checkout>/cmd/gc/cmd_lint.go
+#         grep -n 'EffectiveMinActiveSessions' <gascity checkout>/internal/doctor/checks_named_session.go
+# ---------------------------------------------------------------------------
+# @section: universal
+pack.toml: named_session "mayor" targets pool-controlled agent "mayor"; remove pool settings from named-session templates or remove [[named_session]] for pool agents
+pack.toml: named_session "deacon" targets pool-controlled agent "deacon"; remove pool settings from named-session templates or remove [[named_session]] for pool agents
+pack.toml: named_session "boot" targets pool-controlled agent "boot"; remove pool settings from named-session templates or remove [[named_session]] for pool agents
+pack.toml: named_session "witness" targets pool-controlled agent "witness"; remove pool settings from named-session templates or remove [[named_session]] for pool agents
+pack.toml: named_session "refinery" targets pool-controlled agent "refinery"; remove pool settings from named-session templates or remove [[named_session]] for pool agents
+
+# ---------------------------------------------------------------------------
+# 2. `mol wisp` x2: the flag manifest stops one subcommand level short
+#
+# The template writes `gc bd mol wisp gc --age 24h`, which is correct. --age is
+# a flag on the `mol wisp gc` subcommand, shown in that subcommand's own --help
+# examples. internal/bdflags/bdflags.go keys its manifest on at most two words
+# ("mol wisp"), so matchSubcommand stops there, treats the third word `gc` as a
+# positional, and validates --age against the parent's flag set.
+#
+# The scanner's own doc says a subcommand it has no manifest for is "silently
+# skipped, there is no ground truth to validate them against". That is the
+# right behavior here and it does not happen, because the PARENT matched.
+#
+# Known upstream and deliberately left open: gascity 7724983de's own body lists
+# --age among "flags bd accepts but does not declare in --help", and says
+# closing that gap means finding a source of truth other than --help.
+#
+# Refute: gc bd mol wisp gc --help | grep -- --age
+#         grep -n '"mol wisp"' <gascity checkout>/internal/bdflags/bdflags.go
+# ---------------------------------------------------------------------------
+agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "--age"
+agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "--age"
+
+# ---------------------------------------------------------------------------
+# 3. x20, gc <= v1.4.1 only: the scanner ran past the pipe, and did not know
+#    about `gc bd`'s own scope flags
+#
+# Two separate scanner defects, both fixed by gascity 7724983de ("fix(bdflags):
+# stop reporting valid gc bd invocations as unknown flags", #5220, 2026-08-15),
+# which is on gascity main and is NOT in v1.4.1.
+#
+#   - Every `"-r"` below is jq's. The token loop ended at `--`, at a new bd
+#     invocation, or at end of line, and ran straight through `|`, so
+#     `gc bd show <id> --json | jq -r '...'` attributed jq's -r to the bead
+#     command on the left of the pipe.
+#   - `--rig` and `--city` belong to `gc bd`, which strips them in
+#     cmd/gc/cmd_bd.go extractBdScopeFlags before forwarding the rest to bd.
+#     The scanner validated every flag against bd's manifest alone.
+#
+# This section is why the finding set is version-dependent, and it is why this
+# file exists at all rather than the findings being "fixed": acting on any of
+# these breaks prompt text that works. .github/workflows/ci.yml installs
+# `gc@latest`, so CI sees them until the release after v1.4.1 ships. Delete the
+# whole section then; the test requires the set to be all-present or
+# all-absent, so a partial match still fails.
+#
+# Refute: cd <gascity checkout> && git log --oneline v1.4.1..main -- internal/bdflags/
+#         gc bd list --rig <a rig> -s open     (works; the same flag on bare
+#                                              bd is correctly rejected)
+# ---------------------------------------------------------------------------
+# @section: pre-5220
+agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
+agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
+agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
+agents/mayor/prompt.template.md: bd-unknown-flag: bd create uses unrecognized flag "--rig"
+agents/mayor/prompt.template.md: bd-unknown-flag: bd create uses unrecognized flag "--rig"
+agents/polecat/prompt.template.md: bd-unknown-flag: bd show uses unrecognized flag "-r"
+agents/polecat/prompt.template.md: bd-unknown-flag: bd show uses unrecognized flag "-r"
+agents/refinery/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
+agents/refinery/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
+agents/refinery/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
+agents/refinery/prompt.template.md: bd-unknown-flag: bd show uses unrecognized flag "-r"
+agents/refinery/prompt.template.md: bd-unknown-flag: bd show uses unrecognized flag "-r"
+agents/refinery/prompt.template.md: bd-unknown-flag: bd show uses unrecognized flag "-r"
+agents/refinery/prompt.template.md: bd-unknown-flag: bd show uses unrecognized flag "-r"
+agents/witness/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
+agents/witness/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
+agents/witness/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
+assets/prompts/crew.template.md: bd-unknown-flag: bd create uses unrecognized flag "--rig"
+assets/prompts/crew.template.md: bd-unknown-flag: bd create uses unrecognized flag "--rig"
+assets/prompts/crew.template.md: bd-unknown-flag: bd create uses unrecognized flag "--city"

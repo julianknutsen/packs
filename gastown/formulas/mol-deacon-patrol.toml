@@ -160,12 +160,8 @@ one signal that separates "idle and fine" from "the loop is gone", so it gets
 measured rather than judged.
 
 ```bash
-CHECK="${GC_PACK_DIR:-}/assets/scripts/witness-heartbeat-check.sh"
-if [ -x "$CHECK" ]; then
-  GASTOWN_WITNESS_STALE_MIN={{witness_stale_min}} bash "$CHECK"; echo "heartbeat check exit: $?"
-else
-  echo "witness-heartbeat-check.sh not resolvable under GC_PACK_DIR — use the judgment pass below only."
-fi
+GASTOWN_WITNESS_STALE_MIN={{witness_stale_min}} gc gastown witness-heartbeat-check
+echo "heartbeat check exit: $?"
 ```
 
 Exit 0 means every checked witness heartbeat is inside the window. Exit 1 means
@@ -234,7 +230,7 @@ EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 \
 if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
   echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
 else
-  gc bd create --type=task --label=warrant \
+  gc bd create --type=task --labels=warrant \
     --title="Stuck: <session>" \
     --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
 fi
@@ -312,7 +308,7 @@ EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 \
 if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
     echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
 else
-    gc bd create --type=task --label=warrant \
+    gc bd create --type=task --labels=warrant \
         --title="Stuck queue: <session> — $ASSIGNED beads, no activity $duration" \
         --metadata '{"target":"<session>","reason":"queue starvation: N beads, no bead.updated_at progress","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
 fi
@@ -364,7 +360,7 @@ EXISTING_WARRANT=$(gc bd list --label=warrant --json --limit=0 \
 if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
   echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
 else
-  gc bd create --type=task --label=warrant \
+  gc bd create --type=task --labels=warrant \
     --title="Stuck dog: <agent>" \
     --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
 fi
@@ -393,6 +389,7 @@ gc dolt health --json
 ```
 
 Parse the JSON output (HealthReport schema):
+- `applicable`: false when this city has no Dolt data plane at all
 - `server`: running, reachable, pid, port, latency_ms
 - `databases[]`: name, commits, open_beads
 - `backups`: dolt_freshness, dolt_age_seconds, dolt_stale
@@ -404,7 +401,25 @@ state is signalled in-band. Key decisions off `server.reachable`, not
 `server.running` — a process can hold the port while its goroutines
 are wedged (the latter is what first prompted this check to exist).
 
-**Step 2: Evaluate thresholds**
+**Step 1a: Check applicability BEFORE any threshold.**
+
+A city whose bead ledger is on another backend (MySQL, Postgres) has no
+managed Dolt runtime, so there is no data plane to report on. That city
+reports `applicable: false` with a `reason`, and its remaining fields are
+zero-valued placeholders — `server.reachable` is `false` because no Dolt
+server exists, NOT because one is down. Evaluating the table below on such
+a payload escalates a CRITICAL that no one can act on, every patrol cycle.
+
+```bash
+gc dolt health --json | jq -r 'if .applicable == false then "skip: " + .reason else "evaluate" end'
+```
+
+If it reports `skip`, log `Dolt health: not applicable (<reason>)` and move
+on to the next step. Do NOT escalate and do NOT nudge a dog. An older
+`gc dolt health` omits the field entirely; a payload without `applicable`
+is evaluated normally, exactly as before.
+
+**Step 2: Evaluate thresholds** (only when `applicable` is not false)
 
 | Signal | Threshold | Meaning |
 |--------|-----------|---------|

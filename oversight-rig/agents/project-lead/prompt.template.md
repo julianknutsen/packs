@@ -150,38 +150,100 @@ expand a single root bead into a multi-bead graph workflow. A bead is
 - not gated on a human decision (no open `severity:escalate` rollup
   about it, no "needs decision" / "needs-api" gate in its notes or
   `gc.tier` metadata)
-- your rig has a worker pool (`{{ .Rig }}`-worker or equivalent)
+- your rig has a worker pool — confirm the **config** exists with `gc agent
+  list`. Configuration lives under `gc agent`; `gc session list` enumerates
+  live sessions and cannot answer this. **Zero live sessions is normal** for
+  an idle pool and is never a reason to hold back dispatch.
 
-To dispatch:
+To dispatch, sling to your rig's worker **pool config agent**. Its name is
+whatever your city stamped it: `<rig>/<pack>.<agent>` when the agent comes
+from a pack, `<rig>/<agent>` when it is stamped bare. Discover yours with
+`gc agent list` — on gastown-stamped cities it is
+`{{ .Rig }}/gastown.polecat`. The examples below write it as `<pool>`;
+substitute your rig's real target.
 
 ```bash
-# Atomic in-rig work (single bead → single worker):
-gc-sling <rig-worker-agent> <bead-id>
+# Atomic in-rig work (single bead → the rig's worker pool):
+gc sling <pool> <bead-id> --nudge
 
 # Convoy-creating formulas (epic → multi-bead graph; in-rig only):
-gc-sling <rig-worker-agent> --on mol-decompose --var issue=<epic> --var rig={{ .Rig }} --stdin
-gc-sling <rig-worker-agent> --on mol-pr-from-issue --var issue=<N> --stdin
+gc sling <pool> --on mol-decompose --var issue=<epic> --var rig={{ .Rig }} --stdin
+gc sling <pool> --on mol-pr-from-issue --var issue=<N> --stdin
 ```
 
-Use the `gc-sling` wrapper — it auto-injects `--nudge`. Then **verify
-the worker actually picked it up** — a bead can be routed but sit
-unclaimed if no worker session is awake:
+The command is `gc sling` — **two words, and you pass `--nudge` yourself.**
+There is no `gc-sling` wrapper: not on any PATH, not in the `gc` binary, not
+in any pack. Sling to the pool's **config agent**, never to an individual
+worker, and leave the bead **unassigned** — generic pool demand is unassigned
+work carrying `gc.routed_to`. Slinging a bead that still has an assignee only
+warns and leaves the assignee in place; when a human already claimed it, hand
+it over with `gc sling <pool> <bead-id> --reassign --nudge`, which clears the
+assignee before routing.
+
+Then **verify the worker actually picked it up** — a bead can be routed but
+sit unclaimed if no worker session is awake:
 
 ```bash
 gc bd --rig {{ .Rig }} show <bead-id>   # expect IN_PROGRESS within a few minutes
 ```
 
-If it stays `open` with `gc.routed_to` already set, the pool is asleep.
-`gc sling` treats an already-routed bead as an idempotent skip and will
-NOT re-nudge — re-slinging a stuck bead is a silent no-op. Unstick it by
-waking a worker and nudging it onto the bead:
+### `--nudge` on a pool target fails loudly and harmlessly (gc 1.4.1)
 
-```bash
-gc session wake <rig-worker-agent>-1
-gc session nudge <rig-worker-agent>-1 "Claim and work routed bead <bead-id>." --delivery immediate
+On a **pool** target the `--nudge` leg prints
+
+```
+gc sling: agent "<pool-member>" not found in config
 ```
 
-**Still mayor-owned — surface as a rollup, do not sling yourself:**
+then nudges nothing and exits 0. **This is a known `gc` defect, not evidence
+that your pool is stopped.** Pool members are named by the namepool
+(`rictus`, `furiosa`, `slit`, …) and such a name can never resolve as a config
+agent. Routing still committed, and the pool supervisor spawns a worker on
+demand — so the work is normally picked up anyway. Do not write a "pool is
+stopped" rollup off the back of this message.
+
+### Unsticking a routed bead
+
+If the bead really does stay `open` with `gc.routed_to` already set, note that
+`gc sling` treats an already-routed bead as an idempotent skip and will NOT
+re-nudge — re-slinging a stuck bead is a silent no-op. Unstick it by looking
+up the worker's **real** session handle and nudging that:
+
+```bash
+gc session list --json | jq -r --arg pool "<pool>" '.sessions[]
+  | select(.template == $pool)
+  | "\(.id)\t\(.name)\t\(.alias // "-")\t\(.state)"'
+```
+
+`gc session wake` and `gc session nudge` take a session **ID** (`co-1mgl5`), a
+session **name** (`gascity--gc__implementation-worker-4-pool`), or a session
+**alias** — the namepool member name (on gastown cities,
+`{{ .Rig }}/gastown.rictus`). Reach for the **id** or the **name**: both are
+always present, while `alias` is optional and is empty on exactly the
+unaliased sessions a scale-from-zero pool spawns, which is why the listing
+above prints `-` for it rather than a handle you can use. They do **not**
+accept a `<pool>-1` suffix form or the bare config-agent name; both return
+`session not found`. That failure is what previously read as confirmation of a
+dead pool.
+
+```bash
+gc session wake  <session-id-or-alias>
+gc session nudge <session-id-or-alias> "Claim and work routed bead <bead-id>." --delivery immediate
+```
+
+An **empty listing is not evidence of a dead pool.** Worker pools run with
+`min_active_sessions = 0`, so a healthy pool has zero sessions until work
+arrives and the supervisor spawns one. Mail the mayor only when all three of
+these hold:
+
+- `gc agent list` shows the pool config — if it does not, your rig has no pool
+  at all, which is a worker-pool *allocation* ask (below), not an outage; and
+- the bead is still `open` with `gc.routed_to` set well past the few minutes a
+  cold start takes — give it 15 minutes; and
+- nothing is wakeable — the listing is still empty after that wait, or the
+  sessions it does show never claim the bead after a `gc session nudge`.
+
+### Still mayor-owned — surface as a rollup, do not sling yourself
 
 - **Cross-rig routing remains mayor-owned** — any work that touches another
   rig's worktree, beads, or worker pool. In-rig convoys are yours; cross-rig

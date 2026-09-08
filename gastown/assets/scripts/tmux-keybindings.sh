@@ -29,5 +29,11 @@ fi
 # even over mouse-reporting apps (no mouse_any_flag check) so scrollback wins;
 # once in copy-mode the wheel passes through (-M) for normal scrolling, and -e
 # exits at the bottom. Shift+wheel still does native terminal selection.
-gcmux bind-key -T root WheelUpPane   if-shell -F -t= "#{pane_in_mode}" "send-keys -M" "copy-mode -e"
+#
+# Exception — the alternate screen (#{alternate_on}): a full-screen TUI on the
+# alternate buffer (Claude Code, vim, less) has NO tmux scrollback, so forcing
+# copy-mode there just opens an empty [0/0] — "can't scroll back". Hand the wheel
+# to the app instead so it scrolls its own history; scrollback still wins on the
+# main screen, including mouse-reporting apps.
+gcmux bind-key -T root WheelUpPane   if-shell -F -t= "#{||:#{pane_in_mode},#{alternate_on}}" "send-keys -M" "copy-mode -e"
 gcmux bind-key -T root WheelDownPane send-keys -M

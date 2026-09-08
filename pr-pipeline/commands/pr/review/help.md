@@ -31,7 +31,20 @@ Direct sling (skip this command):
 
 Output:
   Report at <repo-root>/.gc/pr-pipeline/reviews/pr-<N>.md
-  Root-bead notes record `verdict:` (block | request_changes | approve).
+  Root-bead notes record `verdict:` (block | request_changes | approve |
+  too_large). `too_large` means the PR exceeded --max-diff-lines and was
+  refused WITHOUT being reviewed; it is not a judgement about the code.
+
+Budget:
+  --max-diff-lines <n>   Refuse a PR whose additions+deletions exceed <n>,
+                         before any agent is started. Default 5000; 0 disables.
+                         Env: GC_PR_MAX_DIFF_LINES. Exits 3 on refusal.
+                         Exit 3 describes the REQUEST, not a failed run: an
+                         identical retry cannot succeed and costs the same
+                         budget again. Dead-letter it, do not retry it.
+                         The formula re-measures the fetched diff as well, so
+                         a PR that grows after the check is still refused
+                         before the diff reaches the model.
 
 Decision policy (mechanical):
   Unresolved blocker in cat 1-4   → verdict block

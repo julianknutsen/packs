@@ -2,9 +2,14 @@ __pycache__/
 *.pyc
 .gc/
 
-# Built adapter binary — produced by `go build` in adapter/ and read
-# in place by the [[service]] proxy_process command.
+# Built adapter binary — produced by `go build` in adapter/ (or by
+# adapter/run.sh's build-on-missing self-heal). The [[service]]
+# proxy_process command is adapter/run.sh (checked in), which rebuilds
+# this binary when a git-only pack re-materialization has wiped it, so
+# the service can't strand. A crash mid-build (SIGKILL, host loss) can
+# leave a PID-suffixed temp behind — ignore those too.
 adapter/gc-slack-adapter
+adapter/gc-slack-adapter.build.*
 
 # Built operator CLI binary — produced by `go build` in cli/ and exec'd
 # by the commands/<cmd>.sh wrappers via $GC_PACK_DIR/cli/gc-slack-cli.

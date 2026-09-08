@@ -216,6 +216,41 @@ if verify >= metadata:
 PY
 }
 
+test_prime_prompts_are_city_generic_and_compact() {
+    local mayor propulsion awareness
+    mayor="$GASTOWN/agents/mayor/prompt.template.md"
+    propulsion="$GASTOWN/template-fragments/propulsion.template.md"
+    awareness="$GASTOWN/template-fragments/operational-awareness.template.md"
+
+    ! grep -E 'hq-|gt-|anthropics/|Wyvern game' "$mayor" >/dev/null ||
+        fail "mayor prompt must not hardcode demo cities, rigs, prefixes, or organizations"
+    ! grep -E '\{\{ \.IssuePrefix \}\}|\{\{ \.RigName \}\}' "$mayor" >/dev/null ||
+        fail "city-scoped mayor prompt must not render rig-scoped variables"
+    ! grep -F '**Rig lifecycle commands:**' "$mayor" >/dev/null ||
+        fail "mayor prompt should not duplicate the rig lifecycle quick-reference"
+    [[ $(grep -c '^## Handoff$' "$mayor") -eq 1 ]] ||
+        fail "mayor prompt should describe handoff once"
+
+    grep -F 'gc hook --claim --json' "$propulsion" >/dev/null ||
+        fail "propulsion roles should use the standard hook claim path"
+    ! grep -E '\{\{ \.(WorkQuery|AssignedReadyQuery|RoutedPoolQuery) \}\}' "$propulsion" >/dev/null ||
+        fail "mayor, crew, and dog propulsion should not inline generated work-query blobs"
+    ! grep -F '{{ .WorkQuery }}' "$GASTOWN/agents/dog/prompt.template.md" >/dev/null ||
+        fail "dog prompt should not expose the generated pool query"
+    grep -F 'gc hook --claim --json' "$GASTOWN/agents/dog/prompt.template.md" >/dev/null ||
+        fail "dog prompt should use atomic hook claim"
+    ! grep -F 'port 3307' "$awareness" >/dev/null ||
+        fail "operational awareness must not hardcode a Dolt port"
+    grep -F 'gc dolt status' "$awareness" >/dev/null ||
+        fail "operational awareness should direct agents to the effective Dolt port"
+    grep -F 'Never probe a guessed or fixed Dolt port.' "$awareness" >/dev/null ||
+        fail "operational awareness must forbid guessed Dolt endpoints"
+    grep -F 'configured endpoint and the exact probe target' "$awareness" >/dev/null ||
+        fail "operational awareness must require configured and probed endpoint evidence"
+    grep -F 'endpoint is unknown and stop' "$awareness" >/dev/null ||
+        fail "operational awareness must fail closed when endpoint discovery fails"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_shutdown_dance_contracts_are_executable
@@ -223,6 +258,7 @@ test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented
 test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
+test_prime_prompts_are_city_generic_and_compact
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 
 echo "gastown pack asset tests passed"

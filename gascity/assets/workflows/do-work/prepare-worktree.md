@@ -24,9 +24,25 @@ setup only. Do not edit source files in the launcher checkout.
    `$(pwd)/worktrees/<source-anchor-id>`, based on the up-to-date remote
    default branch — never the launcher's local `HEAD`, which may be behind
    `origin`. If the path is missing:
-   - Resolve the remote default branch (do not hardcode `main`):
-     `DEFAULT_BRANCH=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p')`.
-     If it is empty, fail closed — do not fall back to local `HEAD`.
+   - Resolve the remote default branch (do not hardcode `main`). Read the
+     local ref first, and only touch the network if it is missing:
+
+     ```sh
+     DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+     if [ -z "$DEFAULT_BRANCH" ]; then
+       git remote set-head origin --auto >/dev/null 2>&1 || true
+       DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+     fi
+     ```
+
+     `refs/remotes/origin/HEAD` is written by `git clone` and refreshed by
+     `git remote set-head origin --auto`. It is NOT written by `git init` plus
+     `git fetch`, which is how `actions/checkout` and several of our own
+     checkouts are built, so the refresh branch is load-bearing rather than
+     defensive. The fetch on the next line still guarantees the base is
+     current, so a stale ref costs nothing.
+
+     If it is still empty, fail closed — do not fall back to local `HEAD`.
    - Fetch it so the base is current:
      `git fetch --prune origin "$DEFAULT_BRANCH"`.
    - Create the worktree detached at the freshly fetched tip:

@@ -26,7 +26,9 @@ writes a structured scorecard to `.gc/pr-pipeline/reviews/pr-<N>.md`.
 1. Caller slings with `--var pr=<url-or-number>`
 2. Agent works through 4 sequential steps
 3. Scorecard report written
-4. Root-bead notes record `verdict:` (block | request_changes | approve)
+4. Root-bead notes record `verdict:` (block | request_changes | approve |
+   too_large, the last meaning the PR was refused unreviewed on budget, and
+   is NOT a judgement about the code)
 5. Agent exits — no fixes are applied
 
 Apply fixes by re-iterating the development loop, not by extending this
@@ -38,7 +40,7 @@ formula.
 |-----------|--------|
 | PR does not exist | gh fails; record error, close bead |
 | PR has no diff | Note in report; verdict approve |
-| Diff is too large to fully analyze | Note coverage, finish what fits |"""
+| Diff exceeds `max_diff_lines` | REFUSE in step 1, before reading the diff. Record `verdict: too_large`, close the bead, stop. Never retry, see Budget refusal |"""
 formula = "mol-pr-review"
 version = 1
 
@@ -46,6 +48,14 @@ version = 1
 [vars.pr]
 description = "PR URL (https://github.com/owner/repo/pull/N) or bare integer in current repo"
 required = true
+
+[vars.max_diff_lines]
+description = """Refuse to review a PR whose additions+deletions exceed this,
+before spending any model budget. 0 disables the guard. Raising it is a
+deliberate act: the cost of a review scales with the diff, and the failure
+mode it prevents is an expensive LATE failure that retry loops re-spend."""
+required = false
+default = "5000"
 
 [[steps]]
 id = "intake"
@@ -85,12 +95,110 @@ gh pr view <N> --repo <repo> --json \\
   changedFiles,mergeable,url,state,labels
 ```
 
+### Budget refusal, check the size BEFORE reading the diff
+
+The metadata above already carries `additions`, `deletions` and `changedFiles`.
+Compare them to `{{max_diff_lines}}` now, while nothing has been spent yet.
+
+```bash
+# Read the sizes directly rather than reusing a variable from the fetch above:
+# a guard that depends on an unset name silently computes 0 and can never fire.
+PR_LINES=$(gh pr view <N> --repo <repo> --json additions,deletions \
+             --jq '.additions + .deletions')
+PR_FILES=$(gh pr view <N> --repo <repo> --json changedFiles --jq '.changedFiles')
+case "$PR_LINES" in
+    ''|*[!0-9]*)
+        echo "Could not read PR size ('$PR_LINES'), refusing rather than"
+        echo "reviewing on an unknown budget. An unreadable size is not zero."
+        gc bd update "$ROOT_ID" --notes "verdict: too_large"
+        gc bd close "$ROOT_ID" --reason "PR size unreadable; refused without reviewing"
+        exit 0 ;;
+esac
+MAX_LINES="{{max_diff_lines}}"
+# A malformed limit REFUSES. Interpolated template text reaches `[` as shell
+# source: a non-numeric value makes the test error and the oversized PR sail
+# through. A guard that fails open on bad configuration is worse than none,
+# because it still reads as protection.
+case "$MAX_LINES" in
+    ''|*[!0-9]*)
+        echo "max_diff_lines is not a non-negative integer ('$MAX_LINES'), refusing."
+        gc bd update "$ROOT_ID" --notes "verdict: too_large"
+        gc bd close "$ROOT_ID" --reason "max_diff_lines malformed; refused without reviewing"
+        exit 0 ;;
+esac
+if [ "$MAX_LINES" -ne 0 ] && [ "$PR_LINES" -gt "$MAX_LINES" ]; then
+    # Establish the report path here rather than relying on the "Prepare the
+    # report path" block below: that runs AFTER the diff fetch, which is
+    # exactly what this guard exists to skip.
+    mkdir -p .gc/pr-pipeline/reviews
+    REPORT_PATH=".gc/pr-pipeline/reviews/pr-<N>.md"
+    cat > "$REPORT_PATH" <<EOF
+# PR #<N>, review refused
+
+## Verdict
+too_large
+
+Not reviewed. This PR changes $PR_LINES lines across $PR_FILES files,
+over the max_diff_lines budget of $MAX_LINES. No review was performed and
+no model budget was spent.
+
+This is a statement about the REQUEST, not a failed run. Retrying it
+unchanged cannot succeed and costs the same budget again. Either split the
+PR, review a subset of paths, or re-sling with a deliberately raised
+--var max_diff_lines=<new-limit>.
+EOF
+    gc bd update "$ROOT_ID" --notes "verdict: too_large
+status: refused
+refused_lines: $PR_LINES
+refused_limit: $MAX_LINES
+report_path: $REPORT_PATH"
+    gc bd close "$ROOT_ID" --reason "diff over max_diff_lines; refused before spending, do not retry unchanged"
+    exit 0
+fi
+```
+
+**Why this runs here and not as a failure mode later.** A review whose input does
+not fit spends the entire budget first and fails LAST, and that late failure is
+shaped exactly like a transient one, so callers that retry on failure re-spend
+on an input that can never fit. One maintainer traced three exhausted max
+accounts to this loop in 2026-08-22. The numbers needed to refuse are already in
+hand one step above; the only thing that made this expensive was not comparing
+them.
+
+**Exit 0 is deliberate.** The refusal is a completed decision, not an error, and
+must not present to a supervising loop as a failure to retry. The verdict
+`too_large` is distinct from `approve`, nothing was reviewed, and the report
+says so rather than implying the PR is clean.
+
 Fetch the diff:
 
 ```bash
 gh pr diff <N> --repo <repo> > /tmp/pr-<N>.diff
 gh pr view <N> --repo <repo> --json files --jq '.files[].path' > /tmp/pr-<N>.files
 ```
+
+The size check above read the PR's metadata; the fetch above read the PR's
+current head. Those are two separate reads, and a commit pushed between them
+can turn a PR that passed the budget into one that does not. So measure what
+you actually fetched, before any of it reaches the model. This is the reading
+that binds -- the diff on disk is the thing whose size costs money:
+
+```bash
+DIFF_LINES=$(wc -l < /tmp/pr-<N>.diff)
+MAX_LINES="{{max_diff_lines}}"
+if [ "$MAX_LINES" -ne 0 ] && [ "$DIFF_LINES" -gt "$MAX_LINES" ]; then
+    rm -f /tmp/pr-<N>.diff
+    gc bd update "$ROOT_ID" --notes "verdict: too_large
+status: refused
+refused_lines: $DIFF_LINES
+refused_limit: $MAX_LINES
+refused_at: post_fetch"
+    gc bd close "$ROOT_ID" --reason "diff grew past max_diff_lines between the size check and the fetch; refused before reading, do not retry unchanged"
+    exit 0
+fi
+```
+
+Do NOT read `/tmp/pr-<N>.diff` before that check has passed.
 
 Prepare the report path:
 

@@ -20,10 +20,8 @@ You CAN and SHOULD edit code when it's the fastest path. The key is balance.
 When you file a bead, default to immediately dispatching it to a polecat:
 
 ```bash
-gc bd create "Fix the auth timeout bug" -t task --json   # file it
-TARGET_RIG="${GC_RIG:-}"  # set to the target rig, or leave empty in an HQ-only city
-POLECAT_TARGET="${TARGET_RIG:+$TARGET_RIG/}{{ .BindingPrefix }}polecat"
-gc sling "$POLECAT_TARGET" <bead-id>                     # dispatch to polecat pool (sets gc.routed_to metadata for controller scale_check)
+gc bd create --rig <rig> "Fix the auth timeout bug" -t task --json
+gc sling <rig>/{{ .BindingPrefix }}polecat <bead-id>  # dispatch to that rig's pool
 ```
 
 **Pool dispatch leaves the assignee empty.** The polecat that picks the bead up sets the
@@ -70,7 +68,7 @@ Use these locations consistently:
 | Location | Use for |
 |----------|---------|
 | `{{ .WorkDir }}` | Your own coordination home, runtime files, scratch notes |
-| `{{ .CityRoot }}` | `{{ cmd }} mail`, coordination commands, `gc bd` with `hq-` prefix |
+| `{{ .CityRoot }}` | `{{ cmd }} mail`, coordination commands, city-level `gc bd` work |
 | configured rig repo root (`{{ cmd }} rig status <rig>`) | **ALL git/code operations** for that rig via `git -C` |
 | `{{ .CityRoot }}/.gc/worktrees/<rig>/...` | Agent sandboxes/worktrees — don't use these directly |
 
@@ -81,7 +79,7 @@ Never work in another agent's worktree. Use the configured rig repo root with
 
 | Level | Location | Prefix | Purpose |
 |-------|----------|--------|---------|
-| City | `{{ .CityRoot }}/.beads/` | `hq-*` | Your mail, HQ coordination |
+| City | `{{ .CityRoot }}/.beads/` | city prefix | Your mail, city coordination |
 | Rig | `<rig>/crew/*/.beads/` | project prefix | Project issues |
 
 **Key points:**
@@ -89,21 +87,19 @@ Never work in another agent's worktree. Use the configured rig repo root with
 - **Rig beads**: Project work lives in git worktrees (crew/*, polecats/*)
 - The rig-level `<rig>/.beads/` is **gitignored** (local runtime state)
 - Beads uses Dolt for storage - no manual sync needed
-- **GitHub URLs**: Use `git remote -v` to verify repo URLs - never assume orgs like `anthropics/`
+- **GitHub URLs**: Use `git remote -v` to verify repository ownership; never assume an organization.
 
 ## Prefix-Based Routing
 
 `gc bd` commands automatically route to the correct rig based on issue ID prefix:
 
-```
-gc bd show {{ .IssuePrefix }}-xyz   # Routes to {{ .RigName }} beads (from anywhere in town)
-gc bd show hq-abc      # Routes to town beads
+```bash
+gc bd show <issue-id>   # Routes by the issue ID's registered prefix
 ```
 
-**How it works:**
-- Routes defined in `{{ .CityRoot }}/.beads/routes.jsonl`
-- `{{ cmd }} rig add` auto-registers new rig prefixes
-- Each rig's prefix (e.g., `gt-`) maps to its beads location
+Routes are defined in `{{ .CityRoot }}/.beads/routes.jsonl`; `{{ cmd }} rig add`
+registers each rig's prefix. Use `{{ cmd }} rig list` to inspect configured rigs
+instead of assuming names or prefixes.
 
 **Debug routing:** `BD_DEBUG_ROUTING=1 gc bd show <id>`
 
@@ -122,22 +118,19 @@ IDs automatically.
 
 | Issue is about... | File in | Command |
 |-------------------|---------|---------|
-| Beads CLI (tool bugs, features, docs) | **beads** | `gc bd create --rig beads "..."` |
-| `gc` CLI (gas city tool bugs, features) | **gastown** | `gc bd create --rig gastown "..."` |
-| Polecat/witness/refinery/convoy code | **gastown** | `gc bd create --rig gastown "..."` |
-| Wyvern game features | **wyvern** | `gc bd create --rig wyvern "..."` |
-| Cross-rig coordination, convoys, mail threads | **HQ** | `gc bd create "..."` (default) |
-| Agent role descriptions, assignments | **HQ** | `gc bd create "..."` (default) |
+| Code or documentation owned by a configured rig | That rig | `gc bd create --rig <rig> "..."` |
+| Cross-rig coordination, convoys, or mail threads | City | `gc bd create "..."` (default) |
+| Agent role descriptions or city-level assignments | City | `gc bd create "..."` (default) |
 
-**IMPORTANT: File issues with `gc bd create`.** There is no `{{ cmd }} issue` or `{{ cmd }} issues` namespace here. Use `gc bd create` directly.
+Determine ownership from the configured rig list and repository remotes. Never
+assume a rig name, issue prefix, or GitHub organization.
 
-**The test**: "Which repo would the fix be committed to?"
-- Fix in `anthropics/beads` -> file in beads rig
-- Fix in `anthropics/gas-town` -> file in gastown rig
-- Pure coordination (no code) -> file in HQ
+**IMPORTANT: File issues with `gc bd create`.** There is no `{{ cmd }} issue` or
+`{{ cmd }} issues` namespace here.
 
-**Common mistake**: Filing Beads CLI issues in HQ because you're "coordinating."
-Wrong. The issue is about beads code, so it goes in the beads rig.
+**The test**: "Which repository would contain the fix?" File there. Pure
+coordination with no owning repository belongs at city scope.
+
 
 ## Gotchas when Filing Beads
 
@@ -187,14 +180,8 @@ When context is filling up and you have incomplete work:
 
 ## Session End Checklist
 
-```
-[ ] git status              (check what changed)
-[ ] git add <files>         (stage code changes)
-[ ] git commit -m "..."     (commit code)
-[ ] git push                (push to remote)
-[ ] HANDOFF (if incomplete work):
-    {{ cmd }} handoff "HANDOFF: <brief>" "<context>"
-```
+Before ending a completed coding task, inspect, commit, and push the owning
+repository. If work remains incomplete, use the Handoff command above.
 
 Note: Beads changes are persisted immediately to Dolt - no sync step needed.
 
@@ -229,7 +216,7 @@ gh pr create --repo $(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\
 
 | Want to... | Correct command | Common mistake |
 |------------|----------------|----------------|
-| Dispatch work to polecat | `gc sling <rig>/{{ .BindingPrefix }}polecat <bead>` | ~~gc bd update --label=pool:...~~ (labels don't trigger scale_check); plain `<rig>/polecat` won't match binding-prefixed polecats imported via PackV2 |
+| Dispatch work to polecat | `gc sling <rig>/{{ .BindingPrefix }}polecat <bead>` | ~~gc bd update --add-label pool:...~~ (labels don't trigger scale_check); plain `<rig>/polecat` won't match binding-prefixed polecats imported via PackV2 |
 | Drain stuck polecat | `{{ cmd }} runtime drain <name>` | ~~gc polecat kill~~ (not a command) |
 | Pause rig (daemon won't restart) | `{{ cmd }} rig suspend <rig>` | ~~gc rig stop~~ (daemon will restart it) |
 | Re-enable suspended rig | `{{ cmd }} rig resume <rig>` | |
@@ -237,14 +224,5 @@ gh pr create --repo $(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\
 | View convoy progress | `{{ cmd }} convoy status <id>` | |
 | Create issues | `gc bd create "title"` | ~~gc issue create~~ (not a command) |
 
-**Rig lifecycle commands:**
-- `suspend/resume` — Dormant toggle. Daemon skips suspended rigs entirely.
-- `stop/start` — Immediate stop/start of rig patrol agents (witness + refinery).
-- `restart/reboot` — Stop then start rig agents.
-
-| Want to... | Correct command | Common mistake |
-|------------|----------------|----------------|
-| Activate a dormant rig | `{{ cmd }} rig resume <rig>` | ~~gc rig start~~ (doesn't unsuspend) |
-| Suspend rig (daemon skips it) | `{{ cmd }} rig suspend <rig>` | ~~gc rig stop~~ (daemon will restart it) |
 
 Town root: {{ .CityRoot }}

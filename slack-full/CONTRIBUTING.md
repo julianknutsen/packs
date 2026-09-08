@@ -30,6 +30,12 @@ cd examples/slack-pack/adapter
 go build -o gc-slack-adapter
 ```
 
+In deployed packs you normally don't build by hand: the `[[service]]`
+command is `adapter/run.sh`, which rebuilds `gc-slack-adapter` from
+source whenever the binary is missing (build artifacts are gitignored,
+so `gc import install` re-materializes the pack cache without them —
+run.sh self-heals instead of stranding the service).
+
 Build the operator CLI with:
 
 ```bash

@@ -41,16 +41,46 @@ jobs:
         run: python3 validate_registry.py --require-git
 
       - name: Run Python pack tests
-        run: python3 -m pytest tests contributing/tests gascity/tests discord/tests github/tests slack-full/tests slack-channel/tests pr-pipeline/tests profiler/tests -q
+        run: python3 -m pytest tests contributing/tests gascity/tests discord/tests github/tests oversight-rig/tests slack-full/tests slack-channel/tests pr-pipeline/tests profiler/tests -q
 
       - name: Lint and exercise shared role prompt composition
         run: |
           go install github.com/gastownhall/gascity/cmd/gc@latest
           GC_BIN="$(go env GOPATH)/bin/gc"
-          for pack in gascity gascity/roles bmad compound-engineering gstack superpowers profiler; do
+          # oversight-rig is deliberately absent. Under the gc this step
+          # installs it reports four bd-unknown-flag findings for `gc bd list
+          # --rig`, which is valid: `gc bd` strips --rig in extractBdScopeFlags
+          # before forwarding, and the scanner validated against bare bd's
+          # manifest alone. Same upstream defect as the `pre-5220` section of
+          # tests/gastown_lint_upstream_defects.txt, fixed by gascity 7724983de
+          # and not in v1.4.1. Add oversight-rig here in the same change that
+          # deletes that section. A dev gc already reports zero for it, so
+          # pinning them would waive findings most contributors never see.
+          # Refute: gc lint oversight-rig  (0 findings on main, 4 on v1.4.1)
+          for pack in gascity gascity/roles bmad compound-engineering gstack superpowers profiler \
+                      pr-pipeline slack-channel slack-full slack-mini; do
             "$GC_BIN" lint "$pack"
           done
           GC_TEST_BIN="$GC_BIN" python3 -m pytest tests/test_gc_role_prompt_integration.py -q
+
+      # Installed, not parsed. `gc lint` above reads each pack on its own and
+      # the per-pack suites read their own TOML; neither can say what gc does
+      # when a city loads the pack, which is where a user meets it. pr-pipeline
+      # linted clean for months while putting a deprecation warning into every
+      # importing city's `gc doctor`.
+      - name: Stand each maintained pack up against gc
+        run: |
+          GC_TEST_BIN="$(go env GOPATH)/bin/gc" \
+            python3 -m pytest tests/test_maintained_packs_live_gc.py -q
+
+      # gastown is not in the lint loop above because seven of its findings are
+      # defects in gc's linter rather than in the pack; see
+      # tests/gastown_lint_upstream_defects.txt. This pins the finding set
+      # instead, so a new one fails and a fixed one has to be un-waived.
+      - name: Check gastown lint findings against the pinned set
+        run: |
+          GC_TEST_BIN="$(go env GOPATH)/bin/gc" \
+            python3 -m pytest tests/test_gastown_lint_findings.py -q
 
       - name: Run Gastown shell tests
         run: |

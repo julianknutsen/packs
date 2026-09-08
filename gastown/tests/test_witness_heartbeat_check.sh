@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SCRIPT="$ROOT/gastown/assets/scripts/witness-heartbeat-check.sh"
+COMMAND="$ROOT/gastown/commands/witness-heartbeat-check/run.sh"
+FORMULA="$ROOT/gastown/formulas/mol-deacon-patrol.toml"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -251,6 +253,54 @@ test_uses_no_bash4_only_constructs() {
         fail "the check must stay bash 3.2 compatible (the fleet includes macOS)"
 }
 
+test_formula_dispatches_via_pack_command_without_agent_pack_env() {
+    grep -Fqx 'GASTOWN_WITNESS_STALE_MIN={{witness_stale_min}} gc gastown witness-heartbeat-check' "$FORMULA" ||
+        fail "health-scan must invoke the heartbeat check through the gastown command namespace"
+    ! grep -Fq 'GC_PACK_DIR' "$FORMULA" ||
+        fail "agent formulas must not assume managed sessions receive GC_PACK_DIR"
+    [ -x "$COMMAND" ] ||
+        fail "the witness-heartbeat-check pack command must be executable"
+
+    local dispatch_bin="$tmp/dispatch-bin"
+    mkdir -p "$dispatch_bin"
+    cat >"$dispatch_bin/gc" <<'SH'
+#!/usr/bin/env sh
+case "$*" in
+    "gastown witness-heartbeat-check")
+        if [ -n "${GC_PACK_DIR:-}" ]; then
+            echo "agent unexpectedly inherited GC_PACK_DIR" >&2
+            exit 90
+        fi
+        GC_PACK_DIR="$GC_TEST_PACK_DIR"
+        export GC_PACK_DIR
+        exec "$GC_PACK_DIR/commands/witness-heartbeat-check/run.sh"
+        ;;
+    "session list --state=all --json")
+        cat "$GC_SESSIONS_JSON"
+        ;;
+    *)
+        echo "unexpected gc invocation: $*" >&2
+        exit 91
+        ;;
+esac
+SH
+    chmod +x "$dispatch_bin/gc"
+
+    printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","template":"gastown.witness","state":"asleep","last_active":"%s","closed":false}]}' "$FRESH" >"$SESSIONS"
+    set +e
+    OUT=$(env -u GC_PACK_DIR GC_CITY="$CITY" GC_TEST_PACK_DIR="$ROOT/gastown" \
+        GC_SESSIONS_JSON="$SESSIONS" PATH="$dispatch_bin:$PATH" \
+        GASTOWN_WITNESS_STALE_MIN=90 gc gastown witness-heartbeat-check 2>"$ERRFILE")
+    RC=$?
+    set -e
+    ERR=$(cat "$ERRFILE")
+
+    [ "$RC" -eq 0 ] ||
+        fail "pack-command dispatch without agent GC_PACK_DIR must succeed, got $RC ($ERR)"
+    printf '%s' "$OUT" | grep -q '^fresh	alpha	alpha/witness	asleep	' ||
+        fail "pack-command dispatch should reach the heartbeat implementation, got: $OUT"
+}
+
 test_fresh_heartbeat_is_not_flagged
 test_stale_heartbeat_is_stalled
 test_zero_time_sentinel_is_no_heartbeat_not_stalled
@@ -270,5 +320,6 @@ test_unreadable_roster_fails_loud
 test_missing_city_fails_loud
 test_multiple_rigs_report_every_witness
 test_uses_no_bash4_only_constructs
+test_formula_dispatches_via_pack_command_without_agent_pack_env
 
 echo "witness heartbeat check tests passed"

@@ -7,7 +7,7 @@ Dispatched by filing a warrant bead routed to the dog pool:
 gc bd create --type=task \
   --title="Stuck: <agent>" \
   --metadata '{"target":"<session>","reason":"<reason>","requester":"<who>","gc.routed_to":"<binding-prefix>dog"}' \
-  --label=warrant
+  --labels=warrant
 ```
 
 The dog pool picks up the warrant and runs this formula against the

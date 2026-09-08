@@ -1,0 +1,3 @@
+description = "Quality-gate judgment worker: fixed-prompt rubric evaluation for mol-ac-quality-gate (validated verdicts; uncertainty fails the gate)"
+scope = "rig"
+fallback = true

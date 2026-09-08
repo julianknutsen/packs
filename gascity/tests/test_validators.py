@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 import io
 
@@ -550,6 +552,54 @@ findings:
             self.assertEqual(code, 1)
             self.assertIn("error:", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
+
+
+class BuildArtifactSchemaRootsTests(unittest.TestCase):
+    def _write_schema(self, root: pathlib.Path, name: str, schema_id: str) -> None:
+        (root / name).write_text(
+            "schema_id: " + schema_id + "\n"
+            "required_front_matter: [schema, status, trace]\n"
+            "allowed_statuses: [approved]\n"
+            "coverage_statuses: [covered]\n"
+            "required_sections: []\n",
+            encoding="utf-8",
+        )
+
+    def test_extra_root_resolves_new_schema_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self._write_schema(root, "custom.v1.yaml", "acme.build.custom.v1")
+            with mock.patch.dict(os.environ, {"GC_BUILD_SCHEMA_ROOTS": str(root)}):
+                schema = build_artifact_validator.load_schema("acme.build.custom.v1")
+            self.assertEqual(schema["schema_id"], "acme.build.custom.v1")
+
+    def test_extra_root_cannot_shadow_base_schema_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self._write_schema(root, "requirements.v1.yaml", "gc.build.requirements.v1")
+            with mock.patch.dict(os.environ, {"GC_BUILD_SCHEMA_ROOTS": str(root)}):
+                schema = build_artifact_validator.load_schema("gc.build.requirements.v1")
+            # Base-first ordering: the published base definition wins; the
+            # shadow attempt in the extra root is never consulted.
+            self.assertIn("workflow.id", schema.get("required_front_matter", []))
+
+    def test_unset_env_is_byte_identical_base_behavior(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "GC_BUILD_SCHEMA_ROOTS"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                build_artifact_validator.schema_roots(),
+                [build_artifact_validator.SCHEMA_ROOT],
+            )
+            with self.assertRaises(build_artifact_validator.ValidationError):
+                build_artifact_validator.load_schema("acme.build.custom.v1")
+
+    def test_missing_or_blank_extra_roots_are_skipped(self) -> None:
+        bogus = os.pathsep.join(["", "  ", "/nonexistent/schema/root"])
+        with mock.patch.dict(os.environ, {"GC_BUILD_SCHEMA_ROOTS": bogus}):
+            self.assertEqual(
+                build_artifact_validator.schema_roots(),
+                [build_artifact_validator.SCHEMA_ROOT],
+            )
 
 
 if __name__ == "__main__":

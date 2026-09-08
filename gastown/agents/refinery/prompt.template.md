@@ -271,6 +271,16 @@ the bead when the branch has been pushed. If validation fails, record a
 durable blocked reason on the bead and escalate to mayor instead of
 closing the work.
 
+**GitHub-specific today.** `gh pr view`/`gh pr create` require a
+GitHub-hosted origin. Non-GitHub hosts (e.g. Azure DevOps Repos) are
+not yet supported: `metadata.existing_pr` suppresses the `gh pr create`
+call, but the validation step above (`gh pr view`) is also
+GitHub-only — it cannot resolve a non-GitHub PR, so a refinery on a
+non-GitHub rig will correctly fail validation and escalate to mayor
+rather than close, even for a perfectly valid PR. There is no working
+non-GitHub path today. Native support is tracked upstream:
+gascity#5260.
+
 If `metadata.existing_pr` is present while `merge_strategy` is unset or
 `direct`, treat the handoff as `mr`. An existing PR cannot be validated
 and then ignored by landing directly to the target branch.

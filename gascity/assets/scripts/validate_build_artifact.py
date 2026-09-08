@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -73,14 +74,32 @@ def parse_front_matter(text: str) -> tuple[str, dict[str, Any], str]:
     return schema_id, data, match.group("body")
 
 
+def schema_roots() -> list[Path]:
+    # Base root always first: a published base schema id resolves from the
+    # base pack before any extra root is consulted, so extra roots can only
+    # ADD new ids — they can never shadow or relax a published base schema
+    # (REQUIREMENTS "Schema IDs are immutable compatibility contracts").
+    # GC_BUILD_SCHEMA_ROOTS is os.pathsep-separated; missing dirs are skipped.
+    roots = [SCHEMA_ROOT]
+    for raw in os.environ.get("GC_BUILD_SCHEMA_ROOTS", "").split(os.pathsep):
+        raw = raw.strip()
+        if not raw:
+            continue
+        root = Path(raw)
+        if root.is_dir():
+            roots.append(root)
+    return roots
+
+
 def load_schema(schema_id: str) -> dict[str, Any]:
     if yaml is None:
         raise ValidationError("PyYAML is required to parse build schemas")
-    for path in sorted(SCHEMA_ROOT.glob("*.yaml")):
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if isinstance(raw, dict) and raw.get("schema_id") == schema_id:
-            validate_schema_definition(raw)
-            return raw
+    for root in schema_roots():
+        for path in sorted(root.glob("*.yaml")):
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if isinstance(raw, dict) and raw.get("schema_id") == schema_id:
+                validate_schema_definition(raw)
+                return raw
     raise ValidationError(f"unknown build artifact schema {schema_id!r}")
 
 

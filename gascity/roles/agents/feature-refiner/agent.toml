@@ -1,0 +1,3 @@
+description = "Intake compile worker: anchors-only template compilation for mol-feature-refine (never invents decisions; decision-waits on gaps)"
+scope = "rig"
+fallback = true

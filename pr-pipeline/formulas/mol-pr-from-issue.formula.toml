@@ -63,13 +63,19 @@ phase = "vapor"
 # predicate (internal/formula/compile.go) is
 #   rootOnly := (!f.Pour && f.Phase == "vapor") || len(f.Steps) == 0
 # which keys only on pour and phase; the graph declaration form is never
-# consulted, so `contract = "graph.v2"` does not protect against it. Note the
-# failure is silent: RecipeHasReadySurface still returns true because RootOnly
-# itself satisfies it, so the pool sling is accepted and only the steps go
-# missing.
+# consulted, so declaring a compiler requirement does not protect against it.
+# Note the failure is silent: RecipeHasReadySurface still returns true because
+# RootOnly itself satisfies it, so the pool sling is accepted and only the
+# steps go missing.
 pour = true
 version = 1
-contract = "graph.v2"
+
+# The v2 compiler requirement, in the form gc reads today. This was
+# `contract = "graph.v2"`, which gc still honors and reports as deprecated in
+# `gc doctor` -- one `formula-requirements` warning in every city that imports
+# this pack.
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.issue_number]
@@ -256,7 +262,16 @@ ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 BRANCH=$(git branch --show-current)
-DEFAULT=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' || echo "main")
+# Resolve the default branch locally. `|| echo "main"` on the old
+# `git remote show origin` pipeline could never fire: sed exits 0 on empty
+# input, so a network failure produced DEFAULT="" and this check silently
+# fell back to the hardcoded main/master arms below.
+DEFAULT=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+if [ -z "$DEFAULT" ]; then
+    git remote set-head origin --auto >/dev/null 2>&1 || true
+    DEFAULT=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+fi
+[ -n "$DEFAULT" ] || DEFAULT=main
 if [ "$BRANCH" = "$DEFAULT" ] || [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
     gc bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
       --set-metadata "summary_for_human=Cannot ship from default branch ($BRANCH). pr-start did not create a feature branch — chain stopped."

@@ -17,6 +17,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
 import discord_intake_common as common
 
+# GC_BIN and GC_API_BASE_URL: the assertions here expect the defaults the
+# scripts fall back to (`gc`, and the supervisor's own base URL). A Gas City
+# seat exports both, so nine of these tests fail for anyone running the suite
+# from inside a city, and pass in CI only because CI sets neither. Each setUp
+# pins the fallback rather than depending on the variables' absence.
+SEAT_ENV_OVERRIDES = ("GC_BIN", "GC_API_BASE_URL")
+
 
 class DiscordIntakeCommonTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -24,6 +31,8 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self._old_environ = os.environ.copy()
         os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        for name in SEAT_ENV_OVERRIDES:
+            os.environ.pop(name, None)
 
     def tearDown(self) -> None:
         os.environ.clear()

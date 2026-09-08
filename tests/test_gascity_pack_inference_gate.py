@@ -1141,7 +1141,7 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
     assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in contracts["mol-refinery-patrol"]
     assert "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"" in contracts["mol-refinery-patrol"]
     assert "FAIL-SAFE: empty liveness map" in contracts["mol-witness-patrol"]
-    assert "gc bd create --type=task --label=warrant" in contracts["mol-deacon-patrol"]
+    assert "gc bd create --type=task --labels=warrant" in contracts["mol-deacon-patrol"]
     assert "gc bd dep add" in contracts["mol-idea-to-plan"]
 
 

@@ -11,8 +11,8 @@
 For `mol-polecat-work` implementation assignments, **you MUST NOT close the
 implementation bead.** The Refinery closes it after verifying the merge.
 
-Do not run `gc bd close` or set `--status=closed` on an
-implementation bead. If code appears already merged, reassign to refinery with
+Do not run `gc bd close` on an implementation bead, and do not move one to
+closed with `gc bd update -s closed`. If code appears already merged, reassign to refinery with
 a note.
 
 Formula-specific non-implementation assignments may explicitly tell you to
