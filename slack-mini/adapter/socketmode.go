@@ -184,68 +184,80 @@ func runSocketModeWithTimings(ctx context.Context, cfg config, tm socketTimings)
 			return ctx.Err()
 		}
 
-		warned := make(chan struct{}, 1)
-		done, err := runSocketConnection(ctx, cfg, tm, func() {
-			select {
-			case warned <- struct{}{}:
-			default: // already warned; one signal is enough
-			}
-		})
+		next, err := superviseConnection(ctx, cfg, tm, backoff)
 		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			log.Printf("socket mode: connect failed: %v (retrying in %s)", err, backoff)
-			if waitErr := sleepFor(ctx, backoff); waitErr != nil {
-				return waitErr
-			}
-			backoff = nextBackoff(backoff, tm)
-			continue
+			return err
 		}
-		connectedAt := time.Now()
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-
-		case <-warned:
-			// Slack warned this socket is closing, ~10s ahead. The replacement
-			// is dialled while the old connection keeps draining and acking in
-			// its own goroutine — that overlap is the entire reason Slack sends
-			// the warning early. The drained connection closes itself; nothing
-			// here needs to wait for it.
-			//
-			// The dial is paced all the same. A connection that lasted a normal
-			// lifetime resets the delay to backoffMin first, which fits inside
-			// the warning's ~10s lead and keeps the overlap; only a connection
-			// warned moments after it opened — the connection-limit churn two
-			// adapters sharing one app token produce — carries an escalating
-			// delay here, and that is precisely the case this path used to
-			// redial at network speed.
-			backoff = settleBackoff(backoff, time.Since(connectedAt), tm)
-			log.Printf("socket mode: opening replacement connection in %s", backoff)
-			if waitErr := sleepFor(ctx, backoff); waitErr != nil {
-				return waitErr
-			}
-			backoff = nextBackoff(backoff, tm)
-			continue
-
-		case err := <-done:
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			backoff = settleBackoff(backoff, time.Since(connectedAt), tm)
-			if err != nil {
-				log.Printf("socket mode: connection ended: %v (reconnecting in %s)", err, backoff)
-			} else {
-				log.Printf("socket mode: connection closed (reconnecting in %s)", backoff)
-			}
-			if waitErr := sleepFor(ctx, backoff); waitErr != nil {
-				return waitErr
-			}
-			backoff = nextBackoff(backoff, tm)
-		}
+		backoff = next
 	}
+}
+
+// superviseConnection runs exactly one connection's lifecycle: dial it, wait
+// for it to end (or to be warned about), pace the delay before the next dial,
+// and return the backoff that dial should start from. A non-nil error means the
+// supervisor should stop — only shutdown produces one, which is what makes
+// runSocketModeWithTimings' loop return solely on cancellation.
+func superviseConnection(ctx context.Context, cfg config, tm socketTimings, backoff time.Duration) (time.Duration, error) {
+	warned := make(chan struct{}, 1)
+	done, err := runSocketConnection(ctx, cfg, tm, func() {
+		select {
+		case warned <- struct{}{}:
+		default: // already warned; one signal is enough
+		}
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return backoff, ctx.Err()
+		}
+		log.Printf("socket mode: connect failed: %v (retrying in %s)", err, backoff)
+		return paceRedial(ctx, backoff, tm)
+	}
+	connectedAt := time.Now()
+
+	select {
+	case <-ctx.Done():
+		return backoff, ctx.Err()
+
+	case <-warned:
+		// Slack warned this socket is closing, ~10s ahead. The replacement
+		// is dialled while the old connection keeps draining and acking in
+		// its own goroutine — that overlap is the entire reason Slack sends
+		// the warning early. The drained connection closes itself; nothing
+		// here needs to wait for it.
+		//
+		// The dial is paced all the same. A connection that lasted a normal
+		// lifetime resets the delay to backoffMin first, which fits inside
+		// the warning's ~10s lead and keeps the overlap; only a connection
+		// warned moments after it opened — the connection-limit churn two
+		// adapters sharing one app token produce — carries an escalating
+		// delay here, and that is precisely the case this path used to
+		// redial at network speed.
+		backoff = settleBackoff(backoff, time.Since(connectedAt), tm)
+		log.Printf("socket mode: opening replacement connection in %s", backoff)
+		return paceRedial(ctx, backoff, tm)
+
+	case connErr := <-done:
+		if ctx.Err() != nil {
+			return backoff, ctx.Err()
+		}
+		backoff = settleBackoff(backoff, time.Since(connectedAt), tm)
+		if connErr != nil {
+			log.Printf("socket mode: connection ended: %v (reconnecting in %s)", connErr, backoff)
+		} else {
+			log.Printf("socket mode: connection closed (reconnecting in %s)", backoff)
+		}
+		return paceRedial(ctx, backoff, tm)
+	}
+}
+
+// paceRedial waits out the current delay and returns the delay the dial after
+// it should use. Shutdown during the wait is reported as an error, which stops
+// the supervisor rather than redialling into a cancelled context.
+func paceRedial(ctx context.Context, backoff time.Duration, tm socketTimings) (time.Duration, error) {
+	if waitErr := sleepFor(ctx, backoff); waitErr != nil {
+		return backoff, waitErr
+	}
+	return nextBackoff(backoff, tm), nil
 }
 
 // settleBackoff picks the delay before the next dial from how long the
@@ -390,15 +402,7 @@ func pumpSocket(ctx context.Context, cfg config, tm socketTimings, conn socketCo
 
 		data, err := conn.Read(connCtx)
 		if err != nil {
-			if draining {
-				// Expected: the warned-about close finally landed, or the
-				// drain window elapsed.
-				return nil
-			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return err
+			return pumpReadErr(ctx, err, draining)
 		}
 
 		var env socketEnvelope
@@ -414,26 +418,13 @@ func pumpSocket(ctx context.Context, cfg config, tm socketTimings, conn socketCo
 			log.Printf("socket mode: disconnect requested (reason=%s), draining", env.Reason)
 			if !draining {
 				draining = true
-				// Bound the drain: if Slack never actually closes, this
-				// connection must not linger next to its replacement.
-				time.AfterFunc(tm.drainGrace, closeConn)
-				if onWarning != nil {
-					onWarning()
-				}
+				startDrain(tm, closeConn, onWarning)
 			}
 			continue
 		}
 
-		if env.EnvelopeID != "" {
-			ackCtx, ackCancel := context.WithTimeout(ctx, socketAckTimeout)
-			ackErr := conn.Write(ackCtx, socketAck(env.EnvelopeID))
-			ackCancel()
-			if ackErr != nil {
-				// Acking is what stops redelivery, so a failed ack means the
-				// connection is no longer usable — redial and let Slack
-				// redeliver rather than processing on a dead socket.
-				return fmt.Errorf("ack envelope %s: %w", env.EnvelopeID, ackErr)
-			}
+		if ackErr := ackEnvelope(ctx, conn, env.EnvelopeID); ackErr != nil {
+			return ackErr
 		}
 
 		// Bridge off the read loop, exactly as the HTTP path does after its
@@ -441,6 +432,51 @@ func pumpSocket(ctx context.Context, cfg config, tm socketTimings, conn socketCo
 		// not stall acks for the envelopes queued behind this one.
 		go handleSocketEnvelope(cfg, env)
 	}
+}
+
+// pumpReadErr maps a failed connection read to the pump's return value. A read
+// that fails while draining is the expected end of a warned-about connection,
+// not a fault; a read that fails during shutdown reports the shutdown.
+func pumpReadErr(ctx context.Context, readErr error, draining bool) error {
+	if draining {
+		// Expected: the warned-about close finally landed, or the drain
+		// window elapsed.
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return readErr
+}
+
+// startDrain begins the drain of a connection Slack has announced it will
+// close: the window is bounded, and the supervisor is signalled to dial the
+// replacement that overlaps it.
+func startDrain(tm socketTimings, closeConn func(), onWarning func()) {
+	// Bound the drain: if Slack never actually closes, this connection must
+	// not linger next to its replacement.
+	time.AfterFunc(tm.drainGrace, closeConn)
+	if onWarning != nil {
+		onWarning()
+	}
+}
+
+// ackEnvelope acknowledges one envelope. Envelopes that carry no id (hello,
+// disconnect) are not acked, matching Slack's protocol.
+func ackEnvelope(ctx context.Context, conn socketConn, envelopeID string) error {
+	if envelopeID == "" {
+		return nil
+	}
+	ackCtx, ackCancel := context.WithTimeout(ctx, socketAckTimeout)
+	ackErr := conn.Write(ackCtx, socketAck(envelopeID))
+	ackCancel()
+	if ackErr != nil {
+		// Acking is what stops redelivery, so a failed ack means the
+		// connection is no longer usable — redial and let Slack redeliver
+		// rather than processing on a dead socket.
+		return fmt.Errorf("ack envelope %s: %w", envelopeID, ackErr)
+	}
+	return nil
 }
 
 // keepaliveSocket pings Slack on a fixed interval and closes the connection
