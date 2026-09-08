@@ -91,6 +91,31 @@ REPORT="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
   ] | last // ""
 ' 2>/dev/null)"
 
+# Convergence guard (opt-in): the apply lane may record how many fixes it
+# applied this iteration and how many remaining findings this loop can still
+# act on. An `iterate` verdict with zero applied fixes and zero actionable
+# remaining findings is a livelock (nothing can change on the next identical
+# iteration), so it is treated as approve-with-notes. Both keys must be
+# present and exactly "0"; when the apply lane does not write them, behavior
+# is unchanged.
+APPLIED_COUNT="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
+  [
+    .[]
+    | select((.metadata["gc.attempt"] // "") == $attempt)
+    | select((.metadata["code_review.applied_count"] // "") != "")
+    | .metadata["code_review.applied_count"]
+  ] | last // ""
+' 2>/dev/null)"
+
+ACTIONABLE_REMAINING="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
+  [
+    .[]
+    | select((.metadata["gc.attempt"] // "") == $attempt)
+    | select((.metadata["code_review.actionable_remaining"] // "") != "")
+    | .metadata["code_review.actionable_remaining"]
+  ] | last // ""
+' 2>/dev/null)"
+
 REVIEW_MODE="$(metadata_value "$ROOT_JSON" "gc.var.review_mode")"
 if [ -z "$REVIEW_MODE" ]; then
   REVIEW_MODE="$(metadata_value "$PARENT_JSON" "gc.var.review_mode")"
@@ -193,6 +218,10 @@ if [ "$VERDICT" != "done" ]; then
       exit 1
       ;;
     *)
+      if [ "$APPLIED_COUNT" = "0" ] && [ "$ACTIONABLE_REMAINING" = "0" ]; then
+        echo "Implementation review converged: verdict=$VERDICT with applied_count=0 and actionable_remaining=0 (no actionable delta; approving with notes)"
+        exit 0
+      fi
       echo "Implementation review needs another iteration: $VERDICT"
       exit 1
       ;;

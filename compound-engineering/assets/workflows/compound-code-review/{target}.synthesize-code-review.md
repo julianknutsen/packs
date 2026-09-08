@@ -9,6 +9,18 @@ noise, classify required fixes, and write the approval verdict used by
 `.gc/scripts/checks/implementation-review-approved.sh`. Required fixes must be
 specific enough for the single apply step to resolve them directly.
 
+Verdict contract (livelock guard): `iterate` requires an actionable delta —
+at least one blocking finding the apply lane can resolve against the reviewed
+tree inside this loop, OR a non-empty apply plan for this iteration. If every
+finding is non-blocking, suppressed, human-ratified, or out of scope for this
+loop, and nothing is applicable this iteration, the verdict MUST be `approve`
+with `status: approved` (approve-with-notes: findings stay recorded and
+out-of-loop work is routed to beads/escalation; nothing gates this loop). A
+blocking finding fixable only outside this loop never justifies `iterate`.
+Convergence guard: if the reviewed tree is byte-identical to the previous
+iteration AND the finding set is unchanged, return `approve` — iterating on
+unchanged input is futile.
+
 Read the review context from `gc.build.code_review_context_path` and all lane
 artifacts from `{{artifact_root}}/code-review/`. Write the synthesized report to
 `gc.build.code_review_report_path`, which should be
