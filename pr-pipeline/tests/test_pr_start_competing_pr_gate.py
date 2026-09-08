@@ -110,6 +110,26 @@ class ClosingKeywordStillBlocksTests(unittest.TestCase):
         )
         self.assertFalse(gate.blocked)
 
+    def test_a_same_repo_qualified_keyword_blocks_when_the_gate_knows_the_repo(self) -> None:
+        # The gate's `repo` argument is what makes a qualified reference
+        # identifiable, and every other gate-level test leaves it defaulted —
+        # so this path is where the prose ("a qualified reference counts when it
+        # names THIS repo") and the aggregation actually meet.
+        gate = decide_competing_pr_gate(
+            42,
+            [GateCandidate(number=7, body="Fixes gastownhall/gascity#42.")],
+            repo="gastownhall/gascity",
+        )
+        self.assertTrue(gate.blocked)
+        self.assertEqual(gate.blocking[0][1].basis, "closing-keyword")
+        # Without the repo in hand the same body cannot be resolved to our #42,
+        # and the gate must fail safe by leaving the issue authorable.
+        self.assertFalse(
+            decide_competing_pr_gate(
+                42, [GateCandidate(number=7, body="Fixes gastownhall/gascity#42.")]
+            ).blocked
+        )
+
     def test_a_keyword_on_a_non_default_branch_pr_does_not_block(self) -> None:
         # GitHub's own rule: a release-branch PR saying "Fixes #42" never
         # closes #42, so it is not mechanical coverage.

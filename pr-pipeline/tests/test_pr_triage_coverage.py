@@ -5,6 +5,7 @@ import pathlib
 import unittest
 from typing import ClassVar
 
+import coverage_contract
 from coverage_contract import (
     CandidateSignals,
     CoverageVerdictError,
@@ -142,6 +143,65 @@ class ClosingKeywordTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(closing_keyword_refs(body), frozenset())
 
+    def test_stripping_code_cannot_create_keyword_adjacency(self) -> None:
+        # The stripper and the matcher have to agree about what "removed" means.
+        # Substituting a space makes "Fixes `x` #42" read as "Fixes  #42" — a
+        # space is exactly the separator the closing-keyword regex accepts, so
+        # removing the code span would CREATE the adjacency GitHub refuses to
+        # honour, minting mechanical coverage from a body that closes nothing.
+        for body in (
+            "Fixes `TestFoo` #42",
+            "This fixes `gc hook` #42 for good.",
+            "Fixes ```code``` #42",
+            "- Fixes `--resume` #42",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(closing_keyword_refs(body), frozenset())
+                # Suppressed as coverage, not erased: the reference is still
+                # candidate context, which is the fail-safe direction.
+                self.assertEqual(bare_refs(body), frozenset({42}))
+        # The positive arm is load-bearing: without it, a stripper that deleted
+        # the whole body would satisfy every assertion above.
+        self.assertEqual(closing_keyword_refs("Fixes #42"), frozenset({42}))
+
+    def test_a_closed_crlf_fence_does_not_blank_the_rest_of_the_body(self) -> None:
+        # CRLF is how the API delivers web-authored bodies, and "description,
+        # code block, `Fixes #N` at the bottom" is the standard template. The
+        # fence-close alternative anchors on a MULTILINE `$` that a trailing \r
+        # sits in front of, so an unnormalised CRLF body reads its closed fence
+        # as unclosed and blanks every reference after it. The direction is
+        # fail-safe, which is exactly why nothing downstream would surface it.
+        crlf = "Intro\r\n```\r\ngrep -n fixes #7\r\n```\r\nFixes #42\r\n"
+        self.assertEqual(closing_keyword_refs(crlf), frozenset({42}))
+        # The same body with LF endings must agree, or this pins the fence rule
+        # rather than CRLF parity.
+        self.assertEqual(closing_keyword_refs(crlf.replace("\r\n", "\n")), frozenset({42}))
+        # The keyword inside the fence is still code under either ending.
+        self.assertNotIn(7, closing_keyword_refs(crlf))
+        # Candidate context is lost the same way, so it is pinned the same way.
+        self.assertEqual(
+            bare_refs("See #9.\r\n```\r\ncode\r\n```\r\nAlso #11.\r\n"), frozenset({9, 11})
+        )
+
+    def test_a_fence_is_closed_only_by_its_own_character(self) -> None:
+        # CommonMark closes a fence with the character that opened it, so a ```
+        # block "closed" by a ~~~ line is still open and everything after it is
+        # code. Ending the blanked region at the wrong marker would expose a
+        # pasted "Fixes #42" as mechanical coverage — the phantom direction.
+        for body in ("```\ncode\n~~~\nFixes #42\n", "~~~\ncode\n```\nFixes #42\n"):
+            with self.subTest(body=body):
+                self.assertEqual(closing_keyword_refs(body), frozenset())
+
+    def test_a_keyword_with_no_space_before_the_reference_is_not_coverage(self) -> None:
+        # Pinned, not endorsed. The contract requires whitespace after the
+        # optional colon, and GitHub's tolerance of the no-space form is
+        # unverified; the direction is fail-safe (the issue stays authorable).
+        # Recording it here makes a future relaxation a deliberate edit.
+        for body in ("Fixes:#42", "Fixes#42"):
+            with self.subTest(body=body):
+                self.assertEqual(closing_keyword_refs(body), frozenset())
+                self.assertEqual(bare_refs(body), frozenset({42}))
+
     def test_keyword_embedded_in_a_longer_word_is_not_coverage(self) -> None:
         for body in ("prefixes #42", "This suffixes #42", "Refixes #42"):
             with self.subTest(body=body):
@@ -212,7 +272,7 @@ class RealPrBodyRegressionTests(unittest.TestCase):
 
     def test_pr3880_leaves_2713_and_3005_authorable(self) -> None:
         # AC1. PR #3880 references both issues and explicitly disclaims covering
-        # them ("intentionally does not cover", "not a fix for them"). Bare refs
+        # them ("intentionally does **not** cover", "not a fix for them"). Bare refs
         # plus a timeline cross-reference must not demote either issue.
         body = load_pr(3880)["body"]
         signals = CandidateSignals(bare_ref=True, timeline_crossref=True)
@@ -429,6 +489,23 @@ class FormulaContractTests(unittest.TestCase):
         self.assertIn("baseRefName", self.text)
         # ...and the fetch step must actually retrieve it, or classify cannot comply.
         self.assertIn("--json number,title,body,author,baseRefName", self.text)
+        # Naming what to compare against is the whole restriction. The fetch
+        # step captures DEFAULT_BRANCH; an unbound "check `baseRefName`" leaves
+        # the agent to guess the branch it is checked against.
+        self.assertIn("baseRefName == $DEFAULT_BRANCH", self.text)
+
+    def test_prose_mirrors_the_validators_evidence_floor(self) -> None:
+        # The prose claims coverage_contract.py implements "exactly these
+        # rules". That is only true while these numbers agree, and a triage
+        # agent following prose that omits the floor can record a Tier-4
+        # demotion citing a vacuous span the shared contract would reject — a
+        # false Tier 4, the expensive direction. Read from the module so a
+        # change to either side fails here rather than drifting silently.
+        self.assertIn(
+            f"at least {coverage_contract._MIN_EVIDENCE_CHARS} characters and at least "
+            f"{coverage_contract._MIN_EVIDENCE_WORDS} words",
+            self.text,
+        )
 
     def test_prose_does_not_promise_disclaimers_override_a_closing_keyword(self) -> None:
         self.assertIn("does NOT override a closing keyword", self.text)

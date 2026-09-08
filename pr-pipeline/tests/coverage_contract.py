@@ -60,12 +60,24 @@ _ANY_REF = re.compile(_REF_FORMS, re.IGNORECASE)
 # Fenced and inline code are prose to GitHub's linker, not references: a pasted
 # git log or grep line ("grep -n fixes #42") must not read as coverage. An
 # unclosed fence runs to end-of-body, and inline spans may use any backtick run.
+# A fence closes only on its own character, as CommonMark requires: a ``` block
+# "closed" by a ~~~ line is still open, and ending the blanked region there
+# would expose the pasted text after it as prose.
 # Known gap: 4-space indented code is NOT stripped, because list continuations
 # are indented the same way and stripping them would lose real references.
 _FENCED_CODE = re.compile(
-    r"^[ \t]*(?:```|~~~).*?(?:^[ \t]*(?:```|~~~)[ \t]*$|\Z)", re.DOTALL | re.MULTILINE
+    r"^[ \t]*(?P<fence>```|~~~).*?(?:^[ \t]*(?P=fence)[ \t]*$|\Z)",
+    re.DOTALL | re.MULTILINE,
 )
 _INLINE_CODE = re.compile(r"(?P<ticks>`+)[^\n]*?(?P=ticks)")
+
+# Code is replaced by a sentinel, never by a space. A space is exactly what
+# _CLOSING_KEYWORD_REF accepts between a keyword and its reference, so blanking
+# the span out of "Fixes `x` #42" with whitespace would *create* the adjacency
+# GitHub does not honour — the stripper would mint the phantom coverage it
+# exists to suppress. NUL cannot appear in a GitHub body, so it separates the
+# two sides without ever joining them.
+_CODE_SENTINEL = "\x00"
 
 # A citation must be substantial enough to be evidence. Without a floor, "." or
 # "a" appears in every body and the provenance check becomes vacuous — an
@@ -78,7 +90,15 @@ _MIN_EVIDENCE_WORDS = 2
 
 def _strip_code(body: str) -> str:
     """Blank out fenced and inline code so it cannot mint references."""
-    return _INLINE_CODE.sub(" ", _FENCED_CODE.sub(" ", body))
+    # Line endings are normalised first. The API delivers web-authored bodies
+    # with CRLF — the standard "description, code block, `Fixes #N` at the
+    # bottom" template arrives that way — and the fence-close alternative is
+    # anchored on a MULTILINE `$` that a trailing \r sits in front of. Left
+    # unnormalised, a properly closed CRLF fence reads as unclosed, the `\Z`
+    # alternative blanks the rest of the body, and every reference after the
+    # first fence silently disappears.
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n")
+    return _INLINE_CODE.sub(_CODE_SENTINEL, _FENCED_CODE.sub(_CODE_SENTINEL, normalized))
 
 
 def _scan_refs(pattern: re.Pattern[str], body: str, repo: str | None) -> frozenset[int]:

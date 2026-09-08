@@ -220,7 +220,9 @@ as merely "adjacent".
   `owner/repo#<num>`, or a full issue URL). Two restrictions carry real weight:
   a qualified reference counts only when it names THIS repo — `Fixes
   octo/other#42` is about someone else's #42 — and GitHub honours closing
-  keywords only on PRs targeting the default branch, so check `baseRefName`.
+  keywords only on PRs targeting the default branch, so require `baseRefName ==
+  $DEFAULT_BRANCH` (captured by the fetch step above; re-derive it with
+  `gh repo view` if this step does not share that shell).
   Keywords inside code spans or fences do not count. No judgment needed. Record
   `coverage_basis: closing-keyword`.
 
@@ -232,10 +234,13 @@ as merely "adjacent".
     "evidence": ["<span quoted verbatim from the PR body>", ...],
     "reasoning": "<why the change does or does not resolve the issue>" }
   ```
-  Every `evidence` span MUST be copied verbatim from the PR body. A covering
-  verdict that cites nothing, or cites a span absent from the body, is invalid —
-  discard it and leave the issue authorable. Record `coverage_basis:
-  model-verdict`.
+  Every `evidence` span MUST be copied verbatim from the PR body, and must be
+  substantial enough to be evidence: at least 12 characters and at least 2
+  words after trimming. Without that floor a single "." is quoted from every
+  body and the provenance check is vacuous. A covering verdict that cites
+  nothing, cites a span absent from the body, or cites a span below the floor
+  is invalid — discard it and leave the issue authorable. Record
+  `coverage_basis: model-verdict`.
 
 Within the verdict branch, an explicit scope disclaimer is evidence AGAINST
 coverage — the PR author has already answered the question. Treat "intentionally
