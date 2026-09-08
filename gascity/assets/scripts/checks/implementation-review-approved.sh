@@ -26,15 +26,21 @@ gmol() {   # root_id -> molecule-member JSON array
         echo "gmol: gc ready failed for status: $(tr '\n' ' ' <"$tmp/failed")" >&2
         rc=1
     fi
-    # unique_by sorts by id, so the union comes back in bead-id order -- and
-    # that is the only order there is. `gc ready --json` emits no `updated_at`,
-    # so the re-sort this line used to carry compared every row equal, left the
-    # id order untouched, and still claimed to mean "most recently updated".
+    # unique_by sorts by id, so the union comes back in bead-id order.
     #
-    # The verdict selection below does not depend on this order: it partitions
-    # the candidates by ownership and then reduces them to one value by value,
-    # never by position. The lane-status aggregation further down does still
-    # take the id-last value per key; see the note there.
+    # `updated_at` is `omitempty` on the reader's bead struct -- absent only on
+    # a bead never updated since it was created, which no verdict carrier can
+    # be: it got its verdict key from `gc bd update`. So the re-sort this line
+    # used to carry was live, and the `| last` it fed really did mean "most
+    # recently updated".
+    #
+    # It is gone because the verdict selection below no longer decides by
+    # position at all. It reads recency where recency is used -- narrowing to
+    # the newest `updated_at` explicitly, by value -- instead of staging it in
+    # the row order for a later `| last` to consume. That is what makes the
+    # selection invariant under a permutation of bead ids. The lane-status
+    # aggregation further down does still take the id-last value per key, and
+    # dropping the re-sort changed what that means; see the note there.
     jq -s 'map(select(type=="array")) | add // [] | unique_by(.id)' "$tmp"/*.json || rc=1
     rm -rf "$tmp"
     return "$rc"
@@ -64,17 +70,20 @@ metadata_value() {
 # The one approval vocabulary. Both consumers read this single definition and
 # both match case-insensitively: the jq lane-status helper, which receives it
 # via --argjson, and the bash dispatch at the bottom of the file. A spelling
-# added here reaches every consumer at once.
+# added here reaches every consumer at once -- in any case, because each
+# consumer downcases the entry as well as the candidate. Matching only the
+# candidate would have made a mixed-case entry silently unmatchable everywhere,
+# which is the same class of defect as the split vocabulary this replaced.
 APPROVAL_VERDICTS=(approve approved pass done)
 APPROVAL_VERDICTS_JSON="$(printf '%s\n' "${APPROVAL_VERDICTS[@]}" \
-  | jq -Rsc 'split("\n") | map(select(. != ""))')"
+  | jq -Rsc 'split("\n") | map(select(. != "")) | map(ascii_downcase)')"
 
 is_approved() {
   local candidate known
   candidate="$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')"
   [ -n "$candidate" ] || return 1
   for known in "${APPROVAL_VERDICTS[@]}"; do
-    if [ "$candidate" = "$known" ]; then
+    if [ "$candidate" = "${known,,}" ]; then
       return 0
     fi
   done
@@ -106,10 +115,15 @@ MATCHES="$(gmol "$PARENT_ROOT")"
 # may never starve the gate. That fallback decides from lane beads alone, so it
 # announces itself on stderr whenever it reduces more than one candidate.
 #
-# The survivors are then reduced to one value by value, never by position: an
-# approval if any survivor carries one, otherwise the lexicographically
-# smallest of the distinct non-approving values. Both are invariant under a
-# permutation of bead ids -- the property the old `| last` could not hold.
+# The survivors are then reduced to one value in two steps, neither of them
+# positional. First recency: keep only the survivors carrying the newest
+# `updated_at`, so a later pass overrules an earlier one exactly as it did
+# before this file stopped sorting the union. Then, among values recency could
+# not separate, prefer a NON-approving one. Resolving an unresolvable dispute
+# toward "approve" ships unaddressed findings; resolving it toward "iterate"
+# costs one more loop iteration in a state that should not occur anyway.
+# Both steps are invariant under a permutation of bead ids -- the property the
+# old `| last` could not hold.
 #
 # jq emits two lines: the selected verdict, then an optional ambiguity note.
 VERDICT_SELECTION="$(printf '%s\n' "$MATCHES" | jq -r \
@@ -118,12 +132,30 @@ VERDICT_SELECTION="$(printf '%s\n' "$MATCHES" | jq -r \
   def is_approval($value):
     (($value // "") | ascii_downcase) as $v
     | any($approvals[]; . == $v);
+  # Narrow to the newest rows -- but only when every row is dated. `updated_at`
+  # is omitempty, and ranking a partially dated set would silently rank the
+  # undated rows oldest, which is a guess, not a reading. Selecting by max
+  # value rather than by position keeps ties whole for the reduction below.
+  def newest($rows):
+    ($rows | map(select((.updated_at // "") != "")) | length) as $dated
+    | if $dated > 0 and $dated == ($rows | length)
+      then ($rows | map(.updated_at) | max) as $max
+        | ($rows | map(select(.updated_at == $max)))
+      else $rows
+      end;
+  # Reduce to one value, fail-closed: the lexicographically smallest distinct
+  # non-approving value if there is one, else the smallest approval.
+  def decide($rows):
+    ($rows | map(.value) | unique) as $vals
+    | ($vals | map(select(is_approval(.) | not))) as $blocking
+    | if ($blocking | length) > 0 then $blocking[0] else ($vals[0] // "") end;
   [
     .[]
     | select((.metadata["gc.attempt"] // "") == $attempt)
     | select((.metadata["code_review.verdict"] // "") != "")
     | {
         value: .metadata["code_review.verdict"],
+        updated_at: (.updated_at // ""),
         lane: (
           [(.metadata // {}) | keys[] | select(test("^code_review\\..+_verdict$"))]
           | length > 0
@@ -133,15 +165,22 @@ VERDICT_SELECTION="$(printf '%s\n' "$MATCHES" | jq -r \
   | ($candidates | map(select(.lane | not))) as $owners
   | (if ($owners | length) > 0 then $owners else $candidates end) as $surviving
   | ($surviving | map(.value) | unique) as $values
-  | ($values | map(select(is_approval(.)))) as $approving
+  | newest($surviving) as $current
+  | decide($current) as $verdict
   | (
-      if ($approving | length) > 0 then $approving[0] else ($values[0] // "") end
-    ) as $verdict
+      if (($current | map(.value) | unique | length) > 1) then
+        "fail-closed among \($current | map(.value) | unique | length) values"
+      elif (($current | length) < ($surviving | length)) then
+        "newest updated_at"
+      else
+        "unanimous"
+      end
+    ) as $basis
   | (
       if ($owners | length) > 1 then
-        "review check: \($owners | length) owner-shaped beads carry code_review.verdict at attempt \($attempt) (values: \($values | join(", "))); selected \"\($verdict)\""
+        "review check: \($owners | length) owner-shaped beads carry code_review.verdict at attempt \($attempt) (values: \($values | join(", "))); selected \"\($verdict)\" (\($basis))"
       elif ($owners | length) == 0 and ($surviving | length) > 1 then
-        "review check: no owner-shaped bead at attempt \($attempt); reduced \($surviving | length) lane candidates (values: \($values | join(", "))); selected \"\($verdict)\""
+        "review check: no owner-shaped bead at attempt \($attempt); reduced \($surviving | length) lane candidates (values: \($values | join(", "))); selected \"\($verdict)\" (\($basis))"
       else
         ""
       end
@@ -168,8 +207,11 @@ if [ "$REVIEW_MODE" = "report" ]; then
   fi
   if [ -z "$REPORT_MODE_PATH" ]; then
     # This `| last` picks a report *path* out of the same id-ordered union, not
-    # a loop decision. Report mode is behavior-preserved here, so the id-order
-    # dependency is documented rather than changed.
+    # a loop decision. Dropping the re-sort in gmol did change it -- from
+    # recency-last to id-last -- so this is a documented behavior change, not a
+    # preservation. The two orders diverge only when one attempt carries more
+    # than one row with a report path. Report mode is left unrepaired here
+    # deliberately; the residual is recorded rather than claimed away.
     REPORT_MODE_PATH="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
       [
         .[]
@@ -233,8 +275,12 @@ LANE_STATUS="$(printf '%s\n' "$MATCHES" | jq -r \
       }
   ] as $rows
   # Each key still takes the id-last non-empty value out of the id-ordered
-  # union gmol returns. That dependency is real; this change deliberately
-  # leaves the lane-status path behavior-preserving and does not repair it.
+  # union gmol returns. Dropping the re-sort in gmol changed that from
+  # recency-last to id-last: a behavior change, not a preservation. The two
+  # diverge only when one attempt carries the same lane key twice, in which
+  # case this path can now report a stale value where it used to report the
+  # fresh one. That is a real residual, recorded and deliberately left
+  # unrepaired here rather than described as equivalent.
   | {
       acceptance: ([$rows[].acceptance | select(. != "")] | last // ""),
       test_evidence: ([$rows[].test_evidence | select(. != "")] | last // ""),
