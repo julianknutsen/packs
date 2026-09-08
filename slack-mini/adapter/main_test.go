@@ -331,6 +331,50 @@ func TestBridgeEventIgnoresNonMentions(t *testing.T) {
 	drop("empty after strip", slackMessageEvent{Type: "app_mention", User: "U1", Text: "<@U0BOT>", Channel: "C1", TS: "1"})
 }
 
+// TestBridgeEventWorkspaceGuard pins the workspace check at the funnel both
+// transports feed. Neither transport establishes which workspace an event
+// belongs to — Socket Mode has no signature, and the HTTP path's HMAC only
+// proves Slack sent it for this app — while every bridged message is stamped
+// with cfg.workspaceID, so an app installed twice would misfile the second
+// workspace's mentions. Guarding here means neither transport can miss it.
+func TestBridgeEventWorkspaceGuard(t *testing.T) {
+	bridged := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		bridged = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	cfg := config{gcAPIBase: srv.URL, cityName: "c", workspaceID: "T123", inboundTarget: "mayor"}
+
+	raw, err := json.Marshal(slackMessageEvent{
+		Type: "app_mention", User: "U1", Text: "<@U0BOT> hi", Channel: "C1", TS: "1",
+	})
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		teamID   string
+		wantSent bool
+	}{
+		{"foreign workspace", "T_OTHER", false},
+		{"configured workspace", "T123", true},
+		// Slack sends team_id on every event_callback, so an absent one means a
+		// hand-built payload rather than a foreign workspace; the guard must not
+		// silently swallow those.
+		{"absent team_id", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bridged = false
+			bridgeEvent(cfg, slackEventEnvelope{Type: "event_callback", TeamID: tc.teamID, Event: raw})
+			if bridged != tc.wantSent {
+				t.Errorf("bridged = %v, want %v (team_id=%q, workspace=%q)", bridged, tc.wantSent, tc.teamID, cfg.workspaceID)
+			}
+		})
+	}
+}
+
 func TestHandlePostMessage(t *testing.T) {
 	var gotBody slackPostMessageReq
 	var gotAuth string

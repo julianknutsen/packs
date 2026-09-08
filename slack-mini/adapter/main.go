@@ -34,6 +34,8 @@
 //	                       is rejected. Not used (and not required) in Socket
 //	                       Mode, which has no request signatures.
 //	SLACK_WORKSPACE_ID     Slack workspace (team) id; the extmsg account id.
+//	                       Also the inbound workspace filter: bridgeEvent drops
+//	                       events whose team_id differs, on both transports.
 //	GC_CITY_NAME           gc city the adapter bridges into.
 //
 // Controller-injected env (proxy_process mode):
@@ -402,6 +404,20 @@ func handleSlackEvents(cfg config) http.HandlerFunc {
 // cannot leak goroutines under sustained traffic.
 func bridgeEvent(cfg config, env slackEventEnvelope) {
 	if env.Type != "event_callback" || len(env.Event) == 0 {
+		return
+	}
+	// Drop events from another workspace. Neither transport establishes which
+	// workspace an event belongs to — Socket Mode has no signature at all, and
+	// the HTTP path's HMAC proves only that Slack sent it for this app — yet
+	// every bridged message is stamped with cfg.workspaceID as its account id
+	// below. An app installed in a second workspace would therefore file that
+	// workspace's mentions under this one. The guard sits here, at the funnel
+	// both transports feed, so neither can be missed.
+	//
+	// An absent team_id is allowed through: Slack sends one on every
+	// event_callback, so this only affects hand-built payloads.
+	if env.TeamID != "" && env.TeamID != cfg.workspaceID {
+		log.Printf("dropping event from unexpected team %s (want %s)", env.TeamID, cfg.workspaceID)
 		return
 	}
 	var msg slackMessageEvent

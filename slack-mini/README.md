@@ -5,8 +5,8 @@
 session. Reply back with one verb.
 
 slack-mini is **Tier 1** of the Slack pack family — the smallest surface
-that gets a human talking to gc over Slack. It ships a single-file adapter
-and one outbound verb. No channel bindings, no per-session identity, no
+that gets a human talking to gc over Slack. It ships a small two-file
+adapter and one outbound verb. No channel bindings, no per-session identity, no
 multi-rig routing — those live in `slack-channel` (Tier 2) and `slack-full`
 (Tier 3). See the [slack-pack tiering design memo](../docs/design/slack-pack-tiering.md)
 (landing separately).
@@ -61,7 +61,8 @@ Socket Mode, `manifest/app.json` for HTTP:
 
 Both manifests request only three bot scopes — `app_mentions:read`,
 `chat:write`, `chat:write.public` — and subscribe to the `app_mention`
-event. They differ only in `socket_mode_enabled`.
+event. They differ in `socket_mode_enabled` and in the display description
+text; nothing else.
 
 ### 2. Configure the city (1 min)
 
@@ -151,7 +152,7 @@ The built binary is git-ignored; the `[[service]]` block runs it in place.
 | --- | :---: | --- | --- |
 | `SLACK_BOT_TOKEN` | ✓ | — | Bot token for `chat.postMessage` and the inbound POST. |
 | `SLACK_SIGNING_SECRET` | HTTP only | — | HMAC secret for verifying Slack requests. Required unless `SLACK_APP_TOKEN` is set. |
-| `SLACK_WORKSPACE_ID` | ✓ | — | Slack team id (the extmsg account id). |
+| `SLACK_WORKSPACE_ID` | ✓ | — | Slack team id (the extmsg account id). Also gates inbound: events carrying a different `team_id` are dropped on both transports, so a wrong value looks like a silent bot. |
 | `GC_CITY_NAME` | ✓ | — | gc city to bridge into. |
 | `SLACK_APP_TOKEN` | Socket Mode | — | App-level token (`xapp-…`) with `connections:write`. Setting it selects Socket Mode: no public listener, no signing secret. |
 | `LISTEN_PUBLIC` | | `0.0.0.0:8775` | Public bind for `/slack/events`. Not bound in Socket Mode. |
@@ -173,8 +174,11 @@ injected by gc when the adapter runs as a `proxy_process` service.
   on networks that force egress through a proxy.
 - **Reconnects are normal.** Slack recycles connections routinely and warns
   ~10s ahead; the adapter opens a replacement while the old connection
-  drains, so mentions are not dropped. Reconnect failures back off from 1s
-  to a 30s cap.
+  drains, so mentions are not dropped. Every redial is paced, from 1s up to
+  a 30s cap — a 1s pause fits well inside the warning's lead, so an ordinary
+  refresh still overlaps. The pacing only escalates for connections that die
+  before lasting 30s, which is what stops a server that accepts and
+  immediately drops connections from producing a redial loop.
 - **Redelivery is safe.** Every envelope is acked before bridging, and each
   bridged message carries a `dedup_key` of `slack-<ts>`, so a redelivered
   event does not produce a duplicate in gc.

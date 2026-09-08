@@ -22,19 +22,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Supervised reconnect with capped exponential backoff (1s → 30s). On
     Slack's advance disconnect warning a replacement connection is opened
     while the old one drains and keeps acking, so mentions are not dropped.
-  - Envelopes are acked before bridging; events from a workspace other than
-    `SLACK_WORKSPACE_ID` are dropped rather than filed under the wrong
-    account.
+    Every redial is paced, including the warned one — a 1s pause fits inside
+    the ~10s warning, so an ordinary refresh still overlaps — and the delay
+    escalates only for connections that fail to last 30s, so a server that
+    accepts and immediately drops connections cannot be redialled in a
+    tight loop.
+  - Envelopes are acked before bridging.
   - Dialled through Go's default HTTP client, so `HTTPS_PROXY`/`NO_PROXY`
     are honoured.
 - `manifest/app-socket.json`, the Socket Mode variant of the app manifest
-  (identical to `manifest/app.json` but with `socket_mode_enabled: true`).
+  (`manifest/app.json` with `socket_mode_enabled: true` and its own display
+  description; nothing else differs).
 
 ### Changed
 
 - The adapter now depends on `github.com/coder/websocket` v1.8.15, which
-  has no dependencies of its own. The HTTP transport is unchanged and still
-  verifies request signatures exactly as before.
+  has no dependencies of its own.
+- Events from a workspace other than `SLACK_WORKSPACE_ID` are dropped
+  rather than filed under the wrong account. This guard sits in the shared
+  bridge, so it covers **both** transports: neither establishes which
+  workspace an event belongs to (Socket Mode has no signature, and the HTTP
+  path's HMAC proves only that Slack sent the request for this app), while
+  every bridged message is stamped with `SLACK_WORKSPACE_ID` as its account
+  id. Otherwise the HTTP transport is unchanged and still verifies request
+  signatures exactly as before.
 
 ## [0.1.0] — Tier 1 extraction
 

@@ -67,9 +67,18 @@ const (
 	socketOpenTimeout = 30 * time.Second
 
 	// Reconnect backoff after a failed or lost connection. Reset once a
-	// connection is established (see runSocketMode).
+	// connection has lasted socketMinLifetime (see settleBackoff).
 	socketBackoffMin = 1 * time.Second
 	socketBackoffMax = 30 * time.Second
+
+	// socketMinLifetime is how long a connection must survive before its
+	// successor is allowed to start from socketBackoffMin again. Resetting on
+	// establishment alone lets a server that accepts a connection and drops or
+	// disowns it immediately be redialled at the floor forever; making a
+	// connection prove itself first is what escalates the delay in exactly that
+	// case. Slack recycles healthy connections on a far longer cadence, so
+	// ordinary refreshes still reset the backoff.
+	socketMinLifetime = 30 * time.Second
 
 	// socketDrainGrace is how long a connection that announced a disconnect
 	// keeps reading after its replacement is live, so in-flight envelopes
@@ -80,6 +89,38 @@ const (
 	// maxInboundBody on the HTTP path.
 	maxSocketMessage = 1 << 20 // 1 MiB
 )
+
+// socketTimings groups the connection-lifecycle timers. Production passes
+// defaultSocketTimings(); tests pass a scaled-down copy so the same code paths
+// can be driven in milliseconds.
+//
+// The seam exists because these timers are the layer no test could otherwise
+// reach: read at their call sites, they made it impossible to pin that
+// pumpSocket actually runs a keepalive, that a drain is bounded, or that
+// reconnects are paced — each of which stayed green through the mutation that
+// removed it. socketPingTimeout, socketAckTimeout and socketOpenTimeout stay
+// constants deliberately: nothing drives them, and a knob no test turns is
+// only a wider surface.
+type socketTimings struct {
+	pingInterval time.Duration
+	drainGrace   time.Duration
+	backoffMin   time.Duration
+	backoffMax   time.Duration
+	// minLifetime is how long a connection must last before its successor is
+	// allowed to start from backoffMin again.
+	minLifetime time.Duration
+}
+
+// defaultSocketTimings is the production timer set.
+func defaultSocketTimings() socketTimings {
+	return socketTimings{
+		pingInterval: socketPingInterval,
+		drainGrace:   socketDrainGrace,
+		backoffMin:   socketBackoffMin,
+		backoffMax:   socketBackoffMax,
+		minLifetime:  socketMinLifetime,
+	}
+}
 
 // socketEnvelope is the Socket Mode frame wrapping each delivery. Payload is
 // the same JSON body the Events API would have POSTed to /slack/events.
@@ -130,14 +171,21 @@ func (r realSocketConn) Close() error {
 // is the expected steady state (Slack recycles connections routinely) rather
 // than a fatal condition.
 func runSocketMode(ctx context.Context, cfg config) error {
-	backoff := socketBackoffMin
+	return runSocketModeWithTimings(ctx, cfg, defaultSocketTimings())
+}
+
+// runSocketModeWithTimings is runSocketMode with its timer set injected, so
+// the reconnect lifecycle can be driven in a test without waiting on
+// production intervals.
+func runSocketModeWithTimings(ctx context.Context, cfg config, tm socketTimings) error {
+	backoff := tm.backoffMin
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
 		warned := make(chan struct{}, 1)
-		done, err := runSocketConnection(ctx, cfg, func() {
+		done, err := runSocketConnection(ctx, cfg, tm, func() {
 			select {
 			case warned <- struct{}{}:
 			default: // already warned; one signal is enough
@@ -148,50 +196,87 @@ func runSocketMode(ctx context.Context, cfg config) error {
 				return ctx.Err()
 			}
 			log.Printf("socket mode: connect failed: %v (retrying in %s)", err, backoff)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
+			if waitErr := sleepFor(ctx, backoff); waitErr != nil {
+				return waitErr
 			}
-			if backoff *= 2; backoff > socketBackoffMax {
-				backoff = socketBackoffMax
-			}
+			backoff = nextBackoff(backoff, tm)
 			continue
 		}
-		// A live connection means the backoff has served its purpose.
-		backoff = socketBackoffMin
+		connectedAt := time.Now()
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 
 		case <-warned:
-			// Slack warned this socket is closing, ~10s ahead. Dial the
-			// replacement now, while the old connection keeps draining and
-			// acking in its own goroutine — that overlap is the entire
-			// reason Slack sends the warning early. The drained connection
-			// closes itself; nothing here needs to wait for it.
-			log.Printf("socket mode: opening replacement connection")
+			// Slack warned this socket is closing, ~10s ahead. The replacement
+			// is dialled while the old connection keeps draining and acking in
+			// its own goroutine — that overlap is the entire reason Slack sends
+			// the warning early. The drained connection closes itself; nothing
+			// here needs to wait for it.
+			//
+			// The dial is paced all the same. A connection that lasted a normal
+			// lifetime resets the delay to backoffMin first, which fits inside
+			// the warning's ~10s lead and keeps the overlap; only a connection
+			// warned moments after it opened — the connection-limit churn two
+			// adapters sharing one app token produce — carries an escalating
+			// delay here, and that is precisely the case this path used to
+			// redial at network speed.
+			backoff = settleBackoff(backoff, time.Since(connectedAt), tm)
+			log.Printf("socket mode: opening replacement connection in %s", backoff)
+			if waitErr := sleepFor(ctx, backoff); waitErr != nil {
+				return waitErr
+			}
+			backoff = nextBackoff(backoff, tm)
 			continue
 
 		case err := <-done:
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			backoff = settleBackoff(backoff, time.Since(connectedAt), tm)
 			if err != nil {
 				log.Printf("socket mode: connection ended: %v (reconnecting in %s)", err, backoff)
 			} else {
 				log.Printf("socket mode: connection closed (reconnecting in %s)", backoff)
 			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
+			if waitErr := sleepFor(ctx, backoff); waitErr != nil {
+				return waitErr
 			}
-			if backoff *= 2; backoff > socketBackoffMax {
-				backoff = socketBackoffMax
-			}
+			backoff = nextBackoff(backoff, tm)
 		}
+	}
+}
+
+// settleBackoff picks the delay before the next dial from how long the
+// connection that just ended lasted. A connection that survived
+// tm.minLifetime proved the endpoint healthy, so its successor starts from the
+// floor again; one that died sooner keeps the escalating delay, which is what
+// stops a dial-OK → instant-death cycle from redialling at the floor forever.
+func settleBackoff(backoff, lifetime time.Duration, tm socketTimings) time.Duration {
+	if lifetime >= tm.minLifetime {
+		return tm.backoffMin
+	}
+	return backoff
+}
+
+// nextBackoff doubles the reconnect delay, capped.
+func nextBackoff(backoff time.Duration, tm socketTimings) time.Duration {
+	backoff *= 2
+	if backoff > tm.backoffMax {
+		return tm.backoffMax
+	}
+	return backoff
+}
+
+// sleepFor waits for d, returning early with ctx.Err() if the context is
+// cancelled first.
+func sleepFor(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
 	}
 }
 
@@ -201,13 +286,13 @@ func runSocketMode(ctx context.Context, cfg config) error {
 // connected and then ended" (reconnect promptly); pumping is not, so the
 // caller can react to a disconnect warning without waiting for the drain.
 // onWarning fires when Slack announces an impending close.
-func runSocketConnection(ctx context.Context, cfg config, onWarning func()) (<-chan error, error) {
+func runSocketConnection(ctx context.Context, cfg config, tm socketTimings, onWarning func()) (<-chan error, error) {
 	conn, err := dialSocketMode(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	done := make(chan error, 1)
-	go func() { done <- pumpSocket(ctx, cfg, conn, onWarning) }()
+	go func() { done <- pumpSocket(ctx, cfg, tm, conn, onWarning) }()
 	return done, nil
 }
 
@@ -281,7 +366,7 @@ func openSocketConnectionURL(ctx context.Context, cfg config) (string, error) {
 
 // pumpSocket reads envelopes until the connection ends, acking each one and
 // bridging events through the same path the HTTP listener uses.
-func pumpSocket(ctx context.Context, cfg config, conn socketConn, onWarning func()) error {
+func pumpSocket(ctx context.Context, cfg config, tm socketTimings, conn socketConn, onWarning func()) error {
 	defer func() { _ = conn.Close() }()
 
 	// connCtx bounds this connection specifically: the keepalive cancels it
@@ -290,7 +375,7 @@ func pumpSocket(ctx context.Context, cfg config, conn socketConn, onWarning func
 	// it with no deadline of their own — see socketPingInterval.
 	connCtx, closeConn := context.WithCancel(ctx)
 	defer closeConn()
-	go keepaliveSocket(connCtx, conn, socketPingInterval, closeConn)
+	go keepaliveSocket(connCtx, conn, tm.pingInterval, closeConn)
 
 	// A disconnect warning arrives ~10s before Slack drops the socket. Rather
 	// than tear down immediately (which loses whatever is in flight), the
@@ -331,7 +416,7 @@ func pumpSocket(ctx context.Context, cfg config, conn socketConn, onWarning func
 				draining = true
 				// Bound the drain: if Slack never actually closes, this
 				// connection must not linger next to its replacement.
-				time.AfterFunc(socketDrainGrace, closeConn)
+				time.AfterFunc(tm.drainGrace, closeConn)
 				if onWarning != nil {
 					onWarning()
 				}
@@ -416,15 +501,11 @@ func handleSocketEnvelope(cfg config, env socketEnvelope) {
 		log.Printf("socket mode: decode payload: %v", err)
 		return
 	}
-	// The HTTP path proves workspace identity via the signing secret. Socket
-	// Mode has no equivalent, and the adapter stamps every bridged message
-	// with cfg.workspaceID as its account id — so an event from another
-	// workspace (an app installed more than once) would be filed under the
-	// wrong account. Drop it instead.
-	if payload.TeamID != "" && payload.TeamID != cfg.workspaceID {
-		log.Printf("socket mode: dropping event from unexpected team %s (want %s)", payload.TeamID, cfg.workspaceID)
-		return
-	}
+	// The workspace-identity check lives in bridgeEvent, shared with the HTTP
+	// path: neither transport proves which workspace an event belongs to (the
+	// HTTP signature proves it came from Slack for this app, not from this
+	// team), and both stamp cfg.workspaceID as the account id, so the guard
+	// belongs at the funnel rather than here.
 	if env.RetryAttempt > 0 {
 		// gc dedupes on DedupKey, so a redelivery is harmless; log it because
 		// a persistent retry count means acks are not landing in time.
