@@ -103,14 +103,15 @@ instead of assuming names or prefixes.
 
 **Debug routing:** `BD_DEBUG_ROUTING=1 gc bd show <id>`
 
-**Conflicts:** Prefix collisions are fatal. In proxied mode, do not run
-`gc bd rename-prefix` (the command is unsupported). Stop writes, record the
-affected rig IDs, and resolve the collision in the owning city/rig configuration
-by assigning a unique prefix. If existing IDs must be rewritten, first take a
-verified backup, explicitly switch that scope to direct/server mode, run the
-supported Beads migration there, and verify `gc bd list`/`gc bd show` before
-re-enabling proxy mode. Keep the backup for rollback and never delete or rewrite
-IDs automatically.
+**Conflicts:** Prefix collisions are fatal. In proxied mode, do not run the Beads
+`rename-prefix` subcommand (it is refused there). Stop writes, record the
+affected rig IDs, and resolve the collision in the owning city's configuration
+by giving the rig a unique `prefix` in its `city.toml` entry (`{{ cmd }}`
+regenerates `{{ .CityRoot }}/.beads/routes.jsonl` from it). If existing IDs must
+be rewritten, first take a verified backup, explicitly switch that scope to
+direct/server mode, run the supported Beads migration there, and verify
+`gc bd list`/`gc bd show` before re-enabling proxy mode. Keep the backup for
+rollback and never delete or rewrite IDs automatically.
 
 ## Where to File Beads - Create issues (CRITICAL)
 
