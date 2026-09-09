@@ -12,8 +12,9 @@ from __future__ import annotations
 import os
 import pathlib
 import subprocess
-import unittest
 import tempfile
+import time
+import unittest
 
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "assets" / "scripts" / "worker-worktree.sh"
@@ -70,12 +71,14 @@ class Fixture:
         git(scratch, "push", "--quiet", "origin", name)
         return sha
 
-    def run(self, workdir: pathlib.Path, bead: str | None, *extra: str, check: bool = True, mkdir: bool = True) -> subprocess.CompletedProcess[str]:
+    def run(self, workdir: pathlib.Path, bead: str | None, *extra: str, check: bool = True, mkdir: bool = True, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         env = {
             **os.environ,
             "GC_DIR": str(workdir),
             "GC_RIG_ROOT": str(self.rig),
             "GC_CITY": str(self.city),
+            "WORKER_WORKTREE_LOCK_WAIT": "10",
+            **(env_extra or {}),
         }
         env.pop("GC_TRIGGER_BEAD_ID", None)
         if bead is not None:
@@ -128,7 +131,8 @@ class WorkerWorktreeTests(unittest.TestCase):
         self.assertTrue((self.lane / "README.md").is_file())
         self.assertEqual(proc.stdout.split(), ["WORKTREE", str(self.lane), "gp-abc1", self.fx.main_sha[:7]])
 
-    def test_workdir_that_does_not_exist_yet_is_created(self) -> None:
+    def test_workdir_that_does_not_exist_yet_is_created_when_its_parent_does(self) -> None:
+        self.lane.parent.mkdir(parents=True)
         proc = self.fx.run(self.lane, "gp-abc1", mkdir=False)
         self.assert_is_worktree(self.lane)
         self.assertEqual(self.branch_of(self.lane), "gp-abc1")
@@ -323,6 +327,73 @@ class WorkerWorktreeTests(unittest.TestCase):
         self.assertEqual(self.branch_of(self.lane), "HEAD")
         self.assertNotIn("WARN", proc.stderr)
 
+    # --- foreign checkouts and the lock -----------------------------------------------------------
+
+    def test_checkout_of_another_repository_at_the_lane_is_refused_not_moved(self) -> None:
+        self.lane.mkdir(parents=True)
+        subprocess.run(["git", "init", "--quiet", str(self.lane)], check=True)
+        (self.lane / "theirs.txt").write_text("someone else's repo\n", encoding="utf-8")
+        proc = self.fx.run(self.lane, "gp-abc1", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("another repository", proc.stderr)
+        self.assertEqual(self.asides(), [])
+        self.assertEqual((self.lane / "theirs.txt").read_text(encoding="utf-8"), "someone else's repo\n")
+
+    def lock_dir(self) -> pathlib.Path:
+        return self.fx.rig / ".git" / "worker-worktree.lock"
+
+    def test_lock_is_taken_and_released(self) -> None:
+        self.fx.run(self.lane, "gp-abc1")
+        self.assertFalse(self.lock_dir().exists())
+
+    def test_stale_lock_from_a_dead_pid_is_cleared(self) -> None:
+        self.lock_dir().mkdir()
+        (self.lock_dir() / "pid").write_text("999999\n", encoding="utf-8")
+        proc = self.fx.run(self.lane, "gp-abc1")
+        self.assertIn("clearing stale lock", proc.stderr)
+        self.assertEqual(self.branch_of(self.lane), "gp-abc1")
+        self.assertFalse(self.lock_dir().exists())
+
+    def orphan_sleep(self, seconds: int) -> int:
+        """Start `sleep` reparented to init so the OS reaps it when it exits."""
+        out = subprocess.run(["sh", "-c", f"sleep {seconds} >/dev/null 2>&1 & echo $!"], check=True, capture_output=True, text=True).stdout
+        return int(out.strip())
+
+    def test_live_lock_is_waited_for(self) -> None:
+        pid = self.orphan_sleep(3)
+        self.lock_dir().mkdir()
+        (self.lock_dir() / "pid").write_text(f"{pid}\n", encoding="utf-8")
+        started = time.monotonic()
+        proc = self.fx.run(self.lane, "gp-abc1")
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 2.0)
+        self.assertIn("waiting for another run", proc.stderr)
+        self.assertEqual(self.branch_of(self.lane), "gp-abc1")
+        self.assertFalse(self.lock_dir().exists())
+
+    def test_live_lock_held_too_long_fails_closed(self) -> None:
+        pid = self.orphan_sleep(8)
+        self.lock_dir().mkdir()
+        (self.lock_dir() / "pid").write_text(f"{pid}\n", encoding="utf-8")
+        proc = self.fx.run(self.lane, "gp-abc1", check=False, env_extra={"WORKER_WORKTREE_LOCK_WAIT": "2"})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("has held", proc.stderr)
+        self.assertFalse((self.lane / ".git").exists())
+        self.assertTrue(self.lock_dir().exists())  # not ours to clear while its owner lives
+        os.kill(pid, 15)
+
+    def test_zombie_lock_owner_counts_as_dead(self) -> None:
+        holder = subprocess.Popen(["sleep", "0"])  # exits at once; not reaped until wait()
+        time.sleep(0.5)
+        self.lock_dir().mkdir()
+        (self.lock_dir() / "pid").write_text(f"{holder.pid}\n", encoding="utf-8")
+        try:
+            proc = self.fx.run(self.lane, "gp-abc1")
+        finally:
+            holder.wait()
+        self.assertIn("clearing stale lock", proc.stderr)
+        self.assertEqual(self.branch_of(self.lane), "gp-abc1")
+
     # --- refusals ----------------------------------------------------------------------------
 
     def test_workdir_inside_rig_root_is_refused_even_if_it_does_not_exist(self) -> None:
@@ -334,6 +405,27 @@ class WorkerWorktreeTests(unittest.TestCase):
         proc = self.fx.run(self.fx.rig, "gp-abc1", check=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("is the rig root", proc.stderr)
+
+    def test_workdir_whose_parent_does_not_exist_is_refused(self) -> None:
+        deep = self.fx.city / "missing" / "deeper" / "lane"
+        proc = self.fx.run(deep, "gp-abc1", check=False, mkdir=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("parent of work dir does not exist", proc.stderr)
+        self.assertFalse((self.fx.city / "missing").exists())
+
+    def test_dot_dot_cannot_reach_into_the_rig_root(self) -> None:
+        via_existing = self.fx.rig / ".." / "rig" / "nested"
+        proc = self.fx.run(via_existing, "gp-abc1", check=False, mkdir=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("inside the rig root", proc.stderr)
+        self.assertFalse((self.fx.rig / "nested").exists())
+        via_missing = self.fx.root / "nope" / ".." / "rig" / "nested"
+        proc = self.fx.run(via_missing, "gp-abc1", check=False, mkdir=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.fx.rig / "nested").exists())
+        trailing_dots = self.fx.city / "lane" / ".."
+        proc = self.fx.run(trailing_dots, "gp-abc1", check=False, mkdir=False)
+        self.assertNotEqual(proc.returncode, 0)
 
     def test_workdir_that_is_an_ancestor_of_the_rig_root_is_refused(self) -> None:
         proc = self.fx.run(self.fx.root, "gp-abc1", check=False)

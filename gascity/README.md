@@ -201,16 +201,25 @@ pre_start = ["sh {{.CityRoot}}/.gc/scripts/worker-worktree.sh"]
 ```
 
 The script makes `$GC_DIR` a worktree of `$GC_RIG_ROOT`'s repository and
-never touches the rig root's working tree. With a trigger bead it reuses the
-one branch whose name contains the bead id (local or on the remote) or
-creates `<bead id>` from `origin/HEAD`; a branch checked out in another
-worktree is not stolen (the lane is left detached at its tip, with a WARN).
-Nothing is ever deleted: a lane with tracked modifications, or a non-empty
-directory that is not a worktree, is moved to `<lane>.aside-<utc stamp>`
-first. Untracked files (materialized skills, hooks, `node_modules`) do not
-count as modifications. Because the lane is on the bead's branch when the
-worker claims, `gc hook --claim` stamps a correct `gc.work_branch` instead of
-inheriting a stale one. `sh worker-worktree.sh --help` lists the flags.
+never touches the rig root's working tree; the rig root, anything inside it,
+and any ancestor of it are refused up front. Runs on one repository are
+serialized by a lock in its git dir, so concurrent sessions cannot race on a
+branch or a lane. With a trigger bead it reuses the one branch whose name
+contains the bead id as a whole token (local or on the remote) or creates
+`<bead id>` from `origin/HEAD`; a branch checked out in another worktree is
+not stolen (the lane is left detached at its tip, with a WARN). Nothing is
+ever deleted: a lane with tracked modifications, or a non-empty directory
+that is not a git checkout, is moved to `<lane>.aside-<utc stamp>` first; a
+checkout of another repository is refused. Untracked files (materialized
+skills, hooks, `node_modules`) do not count as modifications. `sh
+worker-worktree.sh --help` prints the full contract.
+
+The lane is on the bead's branch when the worker claims. With a gascity that
+resolves the work branch from the session work dir (`hookClaimWorkBranchDir`,
+the companion core change), `gc hook --claim` then stamps a correct
+`gc.work_branch`; older builds read the rig root's branch, so the role prompt
+has the worker compare `gc.work_branch` with its branch after the claim and
+restamp it when they differ.
 
 Two related core behaviors complete the picture:
 

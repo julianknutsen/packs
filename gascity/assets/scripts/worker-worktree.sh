@@ -18,33 +18,41 @@
 #   --base REF       start point for a new branch (default <remote>/HEAD, else <remote>/main)
 #   --remote NAME    remote to fetch and match branches on (default origin)
 #   --no-fetch       do not fetch before resolving refs
+#   WORKER_WORKTREE_LOCK_WAIT  seconds to wait for another run on the same repository (default 120)
 #
 # Contract:
+#   * One path, serialized. Every run on a repository takes the lock
+#     <git common dir>/worker-worktree.lock before it reads or changes anything
+#     and releases it on exit; a lock whose owning pid is gone is cleared. So
+#     two sessions preparing lanes at once cannot race on branch creation, on
+#     the same lane, or on the aside destination.
+#   * The work dir is resolved on the real filesystem: it must exist, or its
+#     parent must exist and its last component must be a plain name (no `.`,
+#     `..`, or deeper missing levels). Symlinks resolve. The rig root itself,
+#     anything inside it, and any ancestor of it are refused before any change.
 #   * The rig root's working tree is never touched: the script only reads
-#     refs, fetches, and registers worktrees from it. A work dir that is the
-#     rig root, inside it, or an ancestor of it is refused before any change.
-#   * Nothing is deleted. A work dir that is not a worktree of this repository
-#     and is not empty is moved to <workdir>.aside-<utc stamp>; a worktree with
-#     tracked modifications is moved aside the same way before a fresh one
-#     replaces it; a branch switch that would overwrite an ignored file
-#     (`git switch --no-overwrite-ignore`) moves the worktree aside instead.
+#     refs, fetches, and registers worktrees from it.
+#   * Nothing is deleted. A non-empty work dir that is not a git checkout is
+#     moved to <workdir>.aside-<utc stamp>; a worktree of this repository with
+#     tracked modifications is moved aside the same way (through `git worktree
+#     move`, so registration follows; if git refuses, e.g. locked, the script
+#     fails in place); a branch switch that would overwrite an ignored file
+#     (`git switch --no-overwrite-ignore`) moves the worktree aside instead. A
+#     checkout of ANOTHER repository at the work dir is refused, not moved.
 #     Untracked files (staged skills, hooks, node_modules) do not count as
-#     modifications and ride along on a branch switch. A worktree git refuses
-#     to move (locked) is left in place and the script fails.
+#     modifications and ride along on a branch switch.
 #   * Bead branch: exactly one branch (local or on the remote) whose name
 #     contains the bead id as a whole token — `gp-abc1`, `fix/gp-abc1-x`, never
 #     `gp-abc10` — is reused. None: a new branch named <bead id> is created
-#     from --base. Several: fail closed and list them. If another session
-#     creates the branch first, this one falls back the same way it would have
-#     had the branch existed at the start (checkout, or detached when it is
-#     checked out elsewhere).
+#     from --base. Several: fail closed and list them.
 #   * A bead branch already checked out in another worktree is not stolen: the
 #     work dir is left detached at that branch's tip and a WARN line says so.
 #     Create your own branch in this work dir before committing.
 #   * No bead: the work dir is detached at --base, whatever branch it was on
 #     (the branch itself is kept; nothing is deleted).
 #   * Idempotent. Re-running on a work dir that is already on the right branch
-#     changes nothing (besides the fetch).
+#     changes nothing (besides the fetch). The result is verified before the
+#     script reports success.
 #   * On success prints one line: WORKTREE <dir> <branch|detached> <head sha>.
 
 set -eu
@@ -59,6 +67,7 @@ BEAD="${GC_TRIGGER_BEAD_ID:-}"
 BASE=""
 REMOTE="origin"
 FETCH=1
+LOCK_WAIT="${WORKER_WORKTREE_LOCK_WAIT:-120}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -73,7 +82,7 @@ while [ "$#" -gt 0 ]; do
         --remote) [ "$#" -ge 2 ] || die "--remote needs a value"; REMOTE="$2"; shift 2 ;;
         --remote=*) REMOTE="${1#--remote=}"; shift ;;
         --no-fetch) FETCH=0; shift ;;
-        -h|--help) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -83,35 +92,33 @@ done
 [ -d "$RIG_ROOT" ] || die "rig root is not a directory: $RIG_ROOT"
 command -v git >/dev/null 2>&1 || die "git is required on PATH"
 
-# abs DIR: absolute, symlink-resolved path of an existing directory.
+# abs DIR: absolute, symlink-resolved path of an existing directory. Callers
+# check the exit status; a failure is never silently folded into a path.
 abs() { (cd "$1" 2>/dev/null && pwd -P); }
 
-# canon PATH: the same for a path that need not exist yet — resolve the deepest
-# existing ancestor and re-append the rest, so a not-yet-created work dir is
-# compared on the real filesystem location it will occupy.
-canon() {
-    p="$1"
-    case "$p" in
-        /*) ;;
-        *) p="$PWD/$p" ;;
+# --- resolve and check paths, before anything else --------------------------------
+
+RIG_ROOT="$(abs "$RIG_ROOT")" || die "cannot enter rig root: $RIG_ROOT"
+
+case "$WORKDIR" in
+    /*) ;;
+    *) WORKDIR="$PWD/$WORKDIR" ;;
+esac
+while [ "${WORKDIR%/}" != "$WORKDIR" ] && [ "$WORKDIR" != "/" ]; do WORKDIR="${WORKDIR%/}"; done
+if [ -d "$WORKDIR" ]; then
+    WORKDIR="$(abs "$WORKDIR")" || die "cannot enter work dir: $WORKDIR"
+else
+    leaf="${WORKDIR##*/}"
+    parent="${WORKDIR%/*}"
+    [ -n "$parent" ] || parent="/"
+    case "$leaf" in
+        ""|.|..) die "work dir must end in a plain directory name: $WORKDIR" ;;
     esac
-    rest=""
-    while [ ! -d "$p" ]; do
-        base="${p##*/}"
-        parent="${p%/*}"
-        [ -n "$parent" ] || parent="/"
-        [ "$parent" != "$p" ] || die "cannot resolve path: $1"
-        rest="/$base$rest"
-        p="$parent"
-    done
-    printf '%s%s\n' "$(abs "$p")" "$rest"
-}
+    [ -d "$parent" ] || die "parent of work dir does not exist: $parent (gc creates work_dir before pre_start; create the parent first)"
+    parent="$(abs "$parent")" || die "cannot enter parent of work dir: $parent"
+    WORKDIR="$parent/$leaf"
+fi
 
-RIG_ROOT="$(abs "$RIG_ROOT")" || die "cannot enter rig root"
-WORKDIR="$(canon "$WORKDIR")"
-
-# Refuse before anything else: the rig root itself, anything inside it, and any
-# ancestor of it (moving an ancestor aside would move the rig).
 [ "$WORKDIR" != "$RIG_ROOT" ] || die "work dir is the rig root; give the agent a work_dir outside it"
 case "$WORKDIR/" in
     "$RIG_ROOT"/*) die "work dir $WORKDIR is inside the rig root $RIG_ROOT" ;;
@@ -129,6 +136,53 @@ esac
 RIG_COMMON="$(abs "$RIG_COMMON")" || die "cannot resolve the rig's git dir"
 
 git_rig() { git -C "$RIG_ROOT" "$@"; }
+
+# --- lock: one run per repository at a time -----------------------------------------
+
+LOCK="$RIG_COMMON/worker-worktree.lock"
+LOCKED=0
+release_lock() {
+    if [ "$LOCKED" -eq 1 ]; then
+        rm -f "$LOCK/pid" 2>/dev/null || true
+        rmdir "$LOCK" 2>/dev/null || true
+        LOCKED=0
+    fi
+}
+trap 'release_lock' EXIT
+trap 'release_lock; exit 129' HUP
+trap 'release_lock; exit 130' INT
+trap 'release_lock; exit 143' TERM
+
+owner_is_zombie() {
+    case "$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')" in
+        Z*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+waited=0
+while :; do
+    if mkdir "$LOCK" 2>/dev/null; then
+        LOCKED=1
+        printf '%s\n' "$$" > "$LOCK/pid"
+        break
+    fi
+    owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    # Dead owner: no such process, or a zombie its parent never reaped (kill -0
+    # still succeeds on a zombie; ps reports state Z).
+    if [ -n "$owner" ] && { ! kill -0 "$owner" 2>/dev/null || owner_is_zombie "$owner"; }; then
+        warn "clearing stale lock $LOCK left by pid $owner"
+        rm -f "$LOCK/pid" 2>/dev/null || true
+        rmdir "$LOCK" 2>/dev/null || true
+        continue
+    fi
+    [ "$waited" -lt "$LOCK_WAIT" ] || die "another worker-worktree run (pid ${owner:-unknown}) has held $LOCK for ${LOCK_WAIT}s"
+    [ "$waited" -gt 0 ] || log "waiting for another run on this repository (pid ${owner:-unknown})"
+    sleep 1
+    waited=$((waited + 1))
+done
+
+# --- refs -------------------------------------------------------------------------------
 
 if [ "$FETCH" -eq 1 ]; then
     if ! git_rig fetch --quiet --prune "$REMOTE" 2>/dev/null; then
@@ -150,7 +204,7 @@ if [ -z "$BASE" ]; then
 fi
 git_rig rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || die "base ref does not resolve: $BASE"
 
-# --- helpers -------------------------------------------------------------------
+# --- helpers ------------------------------------------------------------------------------
 
 # bead_branches: every branch name (local, and remote with the remote prefix
 # stripped) containing BEAD as a whole token, one per line, de-duplicated.
@@ -174,21 +228,23 @@ checked_out_at() {
     '
 }
 
+# is_our_worktree DIR: DIR is a git checkout whose common dir is this rig's.
 is_our_worktree() {
     [ -e "$1/.git" ] || return 1
-    c="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null || true)"
-    [ -n "$c" ] || return 1
+    c="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 1
     case "$c" in
         /*) ;;
         *) c="$1/$c" ;;
     esac
-    [ -d "$c" ] && [ "$(abs "$c")" = "$RIG_COMMON" ]
+    c="$(abs "$c")" || return 1
+    [ "$c" = "$RIG_COMMON" ]
 }
 
 # move_aside DIR REASON: relocate DIR out of the way without deleting anything.
-# A registered worktree goes through `git worktree move` so its registration
-# follows it; if git refuses (locked, or otherwise), fail closed rather than
-# mv a registered worktree out from under git.
+# A worktree of this repository goes through `git worktree move` so its
+# registration follows it; if git refuses (locked, or otherwise), fail closed.
+# Anything else that is a git checkout belongs to another repository and is
+# refused. Plain content is moved with mv.
 move_aside() {
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     aside="$1.aside-$stamp"
@@ -198,65 +254,63 @@ move_aside() {
         if ! out="$(git_rig worktree move "$1" "$aside" 2>&1)"; then
             die "git refused to move the worktree $1 aside ($2): $out"
         fi
+    elif [ -e "$1/.git" ]; then
+        die "$1 is a git checkout of another repository; refusing to move or replace it ($2)"
     else
         mv "$1" "$aside"
     fi
     warn "moved aside $1 -> $aside ($2); nothing was deleted"
 }
 
-# --- bead branch resolution -----------------------------------------------------
+# --- resolve what the work dir should have checked out --------------------------------------
 # MODE: local (check out TARGET), remote (track TARGET from the remote),
 # new (create TARGET from BASE), detached (detach at DETACH_AT).
-resolve_mode() {
-    MODE=""
-    TARGET=""
-    DETACH_AT=""
-    if [ -z "$BEAD" ]; then
-        MODE="detached"
-        DETACH_AT="$BASE"
-        return
-    fi
+MODE=""
+TARGET=""
+DETACH_AT=""
+if [ -z "$BEAD" ]; then
+    MODE="detached"
+    DETACH_AT="$BASE"
+else
     candidates="$(bead_branches)"
     count="$(printf '%s\n' "$candidates" | grep -c . || true)"
     if [ "$count" -gt 1 ]; then
         die "several branches name bead $BEAD; pass --bead with a unique id, or --base and no bead: $(printf '%s\n' "$candidates" | tr '\n' ' ')"
-    fi
-    if [ "$count" -eq 0 ]; then
+    elif [ "$count" -eq 0 ]; then
         MODE="new"
         TARGET="$BEAD"
-        return
-    fi
-    TARGET="$candidates"
-    if git_rig show-ref --verify --quiet "refs/heads/$TARGET"; then
-        elsewhere="$(checked_out_at "$TARGET" | grep -v -x -F -- "$WORKDIR" || true)"
-        if [ -n "$elsewhere" ]; then
-            MODE="detached"
-            DETACH_AT="$TARGET"
-            warn "branch $TARGET is checked out at $elsewhere; leaving $WORKDIR detached at its tip. Create your own branch in this work dir before committing."
-        else
-            MODE="local"
-        fi
     else
-        MODE="remote"
+        TARGET="$candidates"
+        if git_rig show-ref --verify --quiet "refs/heads/$TARGET"; then
+            elsewhere="$(checked_out_at "$TARGET" | grep -v -x -F -- "$WORKDIR" || true)"
+            if [ -n "$elsewhere" ]; then
+                MODE="detached"
+                DETACH_AT="$TARGET"
+                warn "branch $TARGET is checked out at $elsewhere; leaving $WORKDIR detached at its tip. Create your own branch in this work dir before committing."
+            else
+                MODE="local"
+            fi
+        else
+            MODE="remote"
+        fi
     fi
-}
+fi
 
-# --- classify the work dir --------------------------------------------------------
+# --- classify the work dir ------------------------------------------------------------------
 IS_WORKTREE=0
-if [ -d "$WORKDIR" ] && is_our_worktree "$WORKDIR"; then
-    IS_WORKTREE=1
+if [ -d "$WORKDIR" ]; then
+    if is_our_worktree "$WORKDIR"; then
+        IS_WORKTREE=1
+        if [ -n "$(git -C "$WORKDIR" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+            move_aside "$WORKDIR" "tracked modifications present"
+            IS_WORKTREE=0
+        fi
+    elif [ -n "$(ls -A "$WORKDIR" 2>/dev/null)" ]; then
+        move_aside "$WORKDIR" "not a worktree of $RIG_ROOT"
+    fi
 fi
 
-if [ "$IS_WORKTREE" -eq 0 ] && [ -d "$WORKDIR" ] && [ -n "$(ls -A "$WORKDIR" 2>/dev/null)" ]; then
-    move_aside "$WORKDIR" "not a worktree of $RIG_ROOT"
-fi
-
-if [ "$IS_WORKTREE" -eq 1 ] && [ -n "$(git -C "$WORKDIR" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-    move_aside "$WORKDIR" "tracked modifications present"
-    IS_WORKTREE=0
-fi
-
-# --- act ----------------------------------------------------------------------------
+# --- act --------------------------------------------------------------------------------------
 add_worktree() {
     [ -d "$WORKDIR" ] || mkdir -p "$WORKDIR"
     case "$MODE" in
@@ -267,7 +321,7 @@ add_worktree() {
     esac
 }
 
-# switch_worktree: change what a clean worktree has checked out. Never
+# switch_worktree: change what a clean worktree of ours has checked out. Never
 # overwrite an ignored file the target tracks; on any refusal the caller moves
 # the worktree aside and adds a fresh one.
 switch_worktree() {
@@ -277,31 +331,6 @@ switch_worktree() {
         new)      git -C "$WORKDIR" switch --quiet --no-overwrite-ignore -c "$TARGET" "$BASE" ;;
         detached) git -C "$WORKDIR" switch --quiet --no-overwrite-ignore --detach "$DETACH_AT" ;;
     esac
-}
-
-resolve_mode
-
-# A branch this run meant to create may have been created by a concurrent run
-# between resolution and the git call; re-resolving turns that into the
-# checkout-or-detached path the contract promises instead of a failure.
-attempt() {
-    # $1 = add|switch
-    tries=0
-    while :; do
-        tries=$((tries + 1))
-        if [ "$1" = add ]; then
-            if out="$(add_worktree 2>&1)"; then return 0; fi
-        else
-            if out="$(switch_worktree 2>&1)"; then return 0; fi
-        fi
-        if [ "$MODE" = "new" ] && [ "$tries" -lt 3 ] && git_rig show-ref --verify --quiet "refs/heads/$TARGET"; then
-            log "branch $TARGET appeared while preparing $WORKDIR; re-resolving"
-            resolve_mode
-            continue
-        fi
-        printf '%s\n' "$out" >&2
-        return 1
-    done
 }
 
 if [ "$IS_WORKTREE" -eq 1 ]; then
@@ -314,16 +343,25 @@ if [ "$IS_WORKTREE" -eq 1 ]; then
                       need_switch=0
                   fi ;;
     esac
-    if [ "$need_switch" -eq 1 ] && ! attempt switch; then
-        move_aside "$WORKDIR" "branch switch refused (ignored files in the way, or git error above)"
-        attempt add || die "could not prepare $WORKDIR after moving the previous worktree aside"
+    if [ "$need_switch" -eq 1 ]; then
+        if ! out="$(switch_worktree 2>&1)"; then
+            printf '%s\n' "$out" >&2
+            move_aside "$WORKDIR" "branch switch refused (ignored files in the way, or the git error above)"
+            IS_WORKTREE=0
+        fi
     fi
-else
-    attempt add || die "could not create the worktree at $WORKDIR"
+fi
+if [ "$IS_WORKTREE" -eq 0 ]; then
+    out="$(add_worktree 2>&1)" || die "could not create the worktree at $WORKDIR: $out"
 fi
 
-WORKDIR="$(abs "$WORKDIR")"
+# --- verify before reporting ----------------------------------------------------------------
+is_our_worktree "$WORKDIR" || die "$WORKDIR is not a worktree of $RIG_ROOT after preparation"
 branch="$(git -C "$WORKDIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+case "$MODE" in
+    local|remote|new) [ "$branch" = "$TARGET" ] || die "$WORKDIR is on $branch, expected $TARGET" ;;
+    detached)         [ "$branch" = "HEAD" ] || die "$WORKDIR is on $branch, expected a detached HEAD" ;;
+esac
 [ "$branch" != "HEAD" ] || branch="detached"
 sha="$(git -C "$WORKDIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 printf 'WORKTREE %s %s %s\n' "$WORKDIR" "$branch" "$sha"
