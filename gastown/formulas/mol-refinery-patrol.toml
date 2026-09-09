@@ -395,19 +395,72 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
    - Close this step after the current wisp is burned.
 
 3. If pre-existing on target:
-   - Check for duplicates first:
+
+   **Dedupe before filing. This is a gate, not a courtesy.** A baseline failure is
+   re-discovered on every branch gated against the same target, so one defect
+   surfaces once per branch you process. Filing per discovery turns a single fix
+   into N beads, N polecats, and N branches that then conflict with each other at
+   this very gate. The bead you are about to duplicate is usually sitting in YOUR
+   OWN queue — finding it needs no cross-agent knowledge, just a lookup.
+
+   - Derive a stable key from the failing test identifier, never from your prose
+     summary. Two agents describing one failure write different sentences but read
+     the same test name:
      ```bash
-     gc bd list --type=bug --status=open --search "<failure summary>"
+     FAILURE_TEST="TestGeneratedClientInSync"   # the failing test/case name
+     FAILURE_PKG="internal/api/genclient"       # its package/suite path
+     FAILURE_KEY=$(printf '%s::%s' "$FAILURE_PKG" "$FAILURE_TEST" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed -E 's/-+/-/g; s/^-|-$//g')
+     BASELINE_SHA=$(git rev-parse "origin/$TARGET")
      ```
-   - If a matching bug already exists: note its ID and proceed with merge.
-   - If no duplicate: file a new bead:
+   - Look for an existing bead. Filter on status only: **not** `--type` (it may be
+     filed as a task), **not** `--assignee` (it is probably assigned to you), and
+     always include `in_progress` — a fix that is already written and queued is
+     `in_progress`, which is precisely the bead worth finding.
      ```bash
-     gc bd create --type=bug --priority=1 --title="Pre-existing failure: <summary>"
+     STATUSES=open,in_progress,blocked,deferred
+     LOOKUP_OK=1
+     DUPES=$(gc bd list --status "$STATUSES" --metadata-field baseline_failure_key="$FAILURE_KEY" --limit 0 --json) || LOOKUP_OK=0
+     if [ "$LOOKUP_OK" = "1" ] && [ "$(printf '%s' "$DUPES" | jq 'length')" = "0" ]; then
+       DUPES=$(gc bd list --status "$STATUSES" --title-contains "$FAILURE_TEST" --limit 0 --json) || LOOKUP_OK=0
+     fi
+     if [ "$LOOKUP_OK" = "1" ] && [ "$(printf '%s' "$DUPES" | jq 'length')" = "0" ]; then
+       DUPES=$(gc bd list --status "$STATUSES" --desc-contains "$FAILURE_TEST" --limit 0 --json) || LOOKUP_OK=0
+     fi
+     printf '%s' "$DUPES" | jq -r '.[] | .id + " [" + .status + "] " + .title'
      ```
+     The key pass matches beads this step filed; the text passes catch beads filed
+     by hand or before the key existed. Use flags that exist — `bd list` has no
+     `--search`, and a lookup that errors returns nothing.
+   - **Read the candidates; do not auto-take the first hit.** The text passes match
+     on mention, so they also surface beads that merely *discuss* the failure
+     (incident reports, tracking beads, this very formula's own bug reports). A
+     match is a bead reporting *the same failing test on the same target*. Commenting
+     on a meta-bead instead of filing would silently drop a real failure — the one
+     outcome worse than a duplicate. Set `EXISTING` to the matching bead ID, or
+     leave it empty if none of the candidates is the same failure:
+     ```bash
+     EXISTING=            # e.g. EXISTING=ga-1h0z, or leave empty to file
+     ```
+   - Act on the result. **A failed lookup is not an all-clear.** If you could not
+     check, do not file:
+     ```bash
+     if [ "$LOOKUP_OK" != "1" ]; then
+       gc bd comment "$WORK" "Pre-existing failure on $TARGET@$BASELINE_SHA NOT filed: dedupe lookup failed. Failure: <summary>"
+     elif [ -n "$EXISTING" ]; then
+       gc bd comment "$EXISTING" "Re-observed on $TARGET@$BASELINE_SHA while gating $WORK ($BRANCH). Not re-filed."
+     else
+       gc bd create --type=bug --priority=1 --title="Pre-existing failure: <summary>" --metadata "$(jq -nc --arg k "$FAILURE_KEY" --arg s "$BASELINE_SHA" '{baseline_failure_key: $k, baseline_sha: $s}')"
+     fi
+     ```
+     Stamping `baseline_failure_key` on create is what makes the next discovery an
+     exact match instead of a text guess.
    - Proceed with merge (failure not caused by this branch)
 
-**GATE**: Cannot merge without all checks passing OR pre-existing bug filed/found.
-**FORBIDDEN**: Writing code to fix failures. You are a merge processor."""
+**GATE**: Cannot merge without all checks passing OR the pre-existing failure
+filed, matched to an existing bead, or — when the dedupe lookup itself failed —
+recorded as a comment on $WORK.
+**FORBIDDEN**: Writing code to fix failures. You are a merge processor.
+**FORBIDDEN**: Filing a baseline-failure bead without a completed dedupe lookup."""
 
 [[steps]]
 id = "merge-push"
