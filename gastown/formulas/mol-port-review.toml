@@ -1,0 +1,559 @@
+description = """
+Cross-rig port → owning-PL review → mayor publish.
+
+Encodes the three-stage cross-rig port rail that was hand-cranked three
+times the week of 2026-08-01 (det-hpj PR 620, det-1zr PR 632 — the
+pre-approved-mechanical-fixes variant, det-x1h PR 637 — the scoped-re-review
+variant). A technique, fix, or law developed in one rig is ported into
+another rig, reviewed by the agent that OWNS the technique (the owning
+project-lead), and — only on a passing verdict — published to the receiving
+rig's canonical branch by the mayor. See gci-7x4 D5 for the design.
+
+The rail exists because a cross-rig port has two failure surfaces a normal
+same-rig change does not: (1) the porter adapts someone else's technique and
+can get the adaptation subtly wrong, and (2) the SEED the porter built on —
+a technique/law/entity-name supplied by the owning PL — can itself be wrong
+(flinders Q5 mis-named a parent entity; the reviewer caught it only while
+reviewing the downstream port and self-corrected). So the review step is
+owned by the technique's author, and it re-verifies the author's own seeds
+against the live implementation, not just the porter's diff.
+
+## Stages
+
+1. PORT (receiving-rig polecat) — adapt the source change to the receiving
+   rig, run the receiving rig's tests, push a feature branch, and HALT at
+   branch-ready with `halt_reason=owning-PL-review` and `review_target` set.
+   No PR, no merge — stage 1 stops at a pushed branch.
+2. OWNING-PL REVIEW (owning project-lead, a DIFFERENT rig) — review the port
+   diff and the porter's test evidence, persist the verdict to the work-bead
+   notes, and mail the coordinator. Three variants (see below).
+3. MAYOR VERIFY + PUBLISH (mayor) — mechanical diff-scope + secret-shape +
+   squash-complete gates, then squash-publish to the receiving rig's
+   canonical branch and propagate. Only a passing stage-2 verdict unlocks
+   stage 3.
+
+## Stage-2 review variants
+
+- **scoped-re-review** — when a prior review returned changes-needed and the
+  porter pushed a fix, the re-review may be bounded to the fix diff only,
+  with everything else marked accepted-as-is. The reviewer declares the
+  scope in the verdict; the publish gate is a scoped pass, not a full re-run.
+  Carried across the round-trip as `evidence.review_scope=fix-diff`.
+- **pre-approved-mechanical-fixes** — when the only outstanding items are
+  mechanical fixes the reviewer pre-approves (rename, formatting, a trivial
+  adaptation), the reviewer APPLIES them on the branch and marks the port
+  publishable WITHOUT a second review round
+  (`evidence.review_verdict=pre-approved-mechanical`).
+- **SEED-ERROR self-verification** — the reviewer must re-verify any
+  technique, law, or seed THEY supplied against the LIVE implementation. A
+  wrong seed is a review finding even when the porter applied it faithfully.
+
+## Cross-agent routing
+
+The three stages run as one v2 workflow whose step beads are independently
+routable (formula-spec-v2 §0.2). Stage-2 steps carry `assignee =
+{{review_target}}` and stage-3 steps `assignee = {{publish_target}}`, so when
+a stage's steps become Ready the orchestrator routes them to the next actor —
+who is in a DIFFERENT rig. Cross-rig targets must be fully-qualified
+`<rig>/<agent>` endpoints (or a city-scoped `mayor/`); the `gc doctor` check
+`v2-routed-to-namespace` governs the namespacing. Each stage's final step
+also wakes/nudges the next actor as a belt-and-suspenders prod. The work bead
+(derived from `{{convoy_id}}`) is the shared state carrier: provenance and
+verdict live in its metadata and notes, readable by every stage's agent.
+
+## Provenance
+
+`source_rig` + `source_ref` (the origin rig and its source commit/PR/branch)
+are stamped on the work bead at stage 1 and carried through so the reviewer
+and mayor can trace the port back to what it adapted. `evidence.ported_commit`
+records the receiving-rig commit that realized it.
+
+## Invoking
+
+Slung onto an existing port work bead — the change to port is the bead; this
+formula is the method. The invocation must be targeted (`{{convoy_id}}` binds
+to the port bead's convoy):
+
+    gc sling <receiving-rig>/{{binding_prefix}}polecat <port-bead> --on mol-port-review --var review_target=<owning-rig>/<pl-agent> --var source_rig=<origin-rig> --var source_ref=<commit|PR|branch> --var base_branch=<integration-branch>
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| review_target | caller | Fully-qualified owning-PL endpoint (cross-rig), e.g. `detmold/gastown.crew`. |
+| publish_target | caller/default | Canonical publisher; defaults to `mayor/`. |
+| coordinator | caller | Who receives the review-complete mail. Empty → the PL falls back to `mayor/`. |
+| source_rig | caller | Rig the change is ported FROM (provenance). |
+| source_ref | caller | Source commit SHA / PR URL / branch (provenance). |
+| base_branch | caller/default | Receiving rig's integration/merge target (default `main`). |
+| review_formula | default | Review-leg helper reused for the discipline (default `mol-review-leg`). |
+| binding_prefix | import binding | Agent identity prefix for bound Gas Town imports. |
+
+## Failure Modes
+
+| Situation | Action |
+|-----------|--------|
+| Receiving-rig tests fail at port | Fix before pushing; stage 1 does not hand off a red branch. |
+| Review verdict = changes-needed | review-gate routes the branch back to the receiving pool with `rejection_reason` + `review_scope=fix-diff`; the workflow halts. A rejection-aware re-dispatch runs the scoped re-review. |
+| Reviewer's own seed was wrong | Record it as a finding, self-correct, and factor it into the verdict (SEED-ERROR). |
+| diff-scope / secret-shape / squash-complete gate fails | mayor-verify halts and escalates; nothing is published. |
+| Blocked / unclear | Mail the coordinator or witness; do not guess a cross-rig merge."""
+formula = "mol-port-review"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars]
+[vars.review_target]
+description = "Fully-qualified owning-PL endpoint that reviews the port (cross-rig), e.g. detmold/gastown.crew."
+required = true
+
+[vars.source_rig]
+description = "Rig the change is ported FROM. Provenance — stamped on the work bead and carried through review and publish."
+required = true
+
+[vars.source_ref]
+description = "Source commit SHA, PR URL, or branch the port adapts. Provenance — stamped on the work bead."
+required = true
+
+[vars.publish_target]
+description = "Canonical publisher for the receiving rig. City-scoped mayor by default."
+default = "mayor/"
+
+[vars.coordinator]
+description = "Endpoint that receives the review-complete mail. Empty → the PL falls back to mayor/."
+default = ""
+
+[vars.base_branch]
+description = "Receiving rig's integration/merge target branch."
+default = "main"
+
+[vars.review_formula]
+description = "Review-leg helper whose discipline the owning-PL review reuses (durable verdict in bead notes, coordinator mail)."
+default = "mol-review-leg"
+
+[vars.binding_prefix]
+description = "Import binding prefix for gastown agent identities, including trailing dot when bound."
+default = ""
+
+[[steps]]
+id = "load-context"
+title = "Load port assignment and provenance"
+description = """
+Prime your environment and understand the change you are porting.
+
+**1. Prime and derive the work bead:**
+```bash
+gc prime
+gc bd prime
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+if [ -z "$WORK_BEAD_ID" ]; then
+  echo "mol-port-review requires an input convoy with exactly one tracked member" >&2
+  gc runtime drain-ack
+  exit 1
+fi
+gc bd show "$WORK_BEAD_ID"
+gc bd show "$WORK_BEAD_ID" --json | jq '.[0].metadata'
+```
+
+**2. Read the provenance and any prior review state:**
+
+- **Provenance** — the source of the port: `source_rig = {{source_rig}}`,
+  `source_ref = {{source_ref}}`. The bead description is the source of truth
+  for WHAT to port and WHY.
+- **Resume state** — this may be a re-dispatch after a changes-needed
+  verdict. Check for it:
+```bash
+PRIOR_VERDICT=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata."evidence.review_verdict" // empty')
+REVIEW_SCOPE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata."evidence.review_scope" // empty')
+REJECTION=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.rejection_reason // empty')
+BRANCH=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.branch // empty')
+```
+If `REJECTION` and `BRANCH` are set, a prior port was reviewed and sent back.
+Resume the existing branch and address `rejection_reason` ONLY (the scoped
+fix); do not re-port from scratch. `REVIEW_SCOPE=fix-diff` means the coming
+re-review will be bounded to your fix — keep the fix diff tight.
+
+**Exit criteria:** You know what to port, where it came from, and whether
+this is a fresh port or a scoped fix of a rejected one."""
+
+[[steps]]
+id = "port"
+title = "Adapt the source change into the receiving rig"
+needs = ["load-context"]
+description = """
+Apply and ADAPT the source change to the receiving rig on a feature branch,
+then verify it against the receiving rig's tests.
+
+**Config: base_branch = {{base_branch}}**
+
+**1. Worktree + branch (idempotent — safe to re-run):**
+```bash
+git fetch --prune origin
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
+BRANCH=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.branch // empty')
+if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then cd "$WORKTREE"; fi
+if [ -z "$BRANCH" ]; then
+  BRANCH="polecat/$WORK_BEAD_ID"
+  git fetch origin {{base_branch}}
+  git worktree add "$(pwd)/worktrees/$WORK_BEAD_ID" -B "$BRANCH" "origin/{{base_branch}}" 2>/dev/null \
+    || git checkout -B "$BRANCH" "origin/{{base_branch}}"
+  gc bd update "$WORK_BEAD_ID" --set-metadata branch="$BRANCH" --set-metadata work_dir="$(git rev-parse --show-toplevel)"
+else
+  git checkout "$BRANCH" 2>/dev/null || git checkout -B "$BRANCH" "origin/{{base_branch}}"
+fi
+```
+
+**2. Port with adaptation — NOT a blind cherry-pick.**
+
+Read the source change at `{{source_rig}}` `{{source_ref}}` (the source
+commit/PR named in the provenance). Re-express the technique in the receiving
+rig's own conventions, file layout, and naming. A cross-rig port is a
+translation, not a copy: the same intent, realized the way this rig would
+have written it. Where the source relied on a rig-specific surface the
+receiving rig lacks, adapt it and note the adaptation in the commit body.
+
+If this is a scoped fix of a rejected branch (`rejection_reason` set from
+load-context), address ONLY that rejection reason. Keep the fix diff minimal
+so the scoped re-review stays tight.
+
+Commit as conventional commits, one logical change per commit:
+```bash
+git add -A
+git commit -m "<type>: <imperative subject> ($WORK_BEAD_ID)" -m "Port of {{source_rig}} {{source_ref}}; adaptation notes: <what changed vs source>."
+```
+
+**3. TEST-FIRST evidence (det-1zr baseline).**
+
+Run the receiving rig's tests over the ported change and capture the result.
+The reviewer will re-run independently — hand them a green branch and a named
+test command, not a claim.
+```bash
+PORTED_COMMIT=$(git rev-parse HEAD)
+gc bd update "$WORK_BEAD_ID" \
+  --set-metadata source_rig={{source_rig}} \
+  --set-metadata source_ref={{source_ref}} \
+  --set-metadata evidence.ported_commit="$PORTED_COMMIT" \
+  --set-metadata evidence.tests="<test command run + pass/fail summary>"
+```
+
+**Exit criteria:** Change ported and adapted on a feature branch, committed,
+receiving-rig tests green, provenance + test evidence recorded."""
+
+[[steps]]
+id = "branch-ready-halt"
+title = "Push branch and halt for owning-PL review"
+needs = ["port"]
+description = """
+Push the branch and hand off to the owning project-lead. Stage 1 stops
+here — no PR, no merge. The review and publish happen downstream.
+
+**1. Resolve the work bead and push:**
+```bash
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+BRANCH=$(git branch --show-current)
+git push -u origin "$BRANCH"
+REMOTE_REF=$(git ls-remote origin "refs/heads/$BRANCH" 2>/dev/null | awk '{print $1}')
+if [ -z "$REMOTE_REF" ] || [ "$REMOTE_REF" != "$(git rev-parse HEAD)" ]; then
+  echo "PUSH VERIFICATION FAILED: origin/$BRANCH does not match local HEAD. Not handing off." >&2
+  gc runtime drain-ack
+  exit 1
+fi
+```
+
+**2. Stamp the branch-ready handoff state on the work bead:**
+```bash
+gc bd update "$WORK_BEAD_ID" \
+  --set-metadata branch="$BRANCH" \
+  --set-metadata target={{base_branch}} \
+  --set-metadata branch_ready=true \
+  --set-metadata halt_reason=owning-PL-review \
+  --set-metadata review_target={{review_target}} \
+  --set-metadata coordinator={{coordinator}} \
+  --notes "Ported {{source_rig}} {{source_ref}} → branch $BRANCH ($(git rev-parse HEAD)); tests green. Halting at branch-ready for owning-PL review by {{review_target}}."
+```
+
+**3. Wake the owning PL (belt-and-suspenders).**
+
+The `owning-pl-review` step is assigned to `{{review_target}}` and becomes
+Ready now that this step is done; the orchestrator routes it to the PL. Nudge
+them so they pick it up promptly:
+```bash
+gc session wake "{{review_target}}" || true
+gc session nudge "{{review_target}}" "Port branch $BRANCH ready for owning-PL review (bead $WORK_BEAD_ID). Run 'gc hook --claim --json'." || true
+```
+
+Do NOT reassign the work bead or drain the whole workflow — the workflow
+continues under the PL. Simply let this step complete.
+
+**Exit criteria:** Branch pushed and verified on origin, review_target +
+halt_reason recorded, owning PL notified."""
+
+[[steps]]
+id = "owning-pl-review"
+title = "Owning-PL review of the port (verdict to bead notes)"
+needs = ["branch-ready-halt"]
+assignee = "{{review_target}}"
+description = """
+You are the owning project-lead: you own the technique this port adapts.
+Review the port, persist the verdict, and mail the coordinator. This reuses
+the `{{review_formula}}` discipline — the FULL report is the deliverable and
+lives in the bead notes, not in transient pane output.
+
+**1. Resolve the work bead and read the port:**
+```bash
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+BRANCH=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.branch // empty')
+REVIEW_SCOPE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata."evidence.review_scope" // empty')
+COORD=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.coordinator // empty')
+[ -z "$COORD" ] && COORD="mayor/"
+# Read the diff against the integration branch and re-run the porter's tests.
+git fetch origin "$BRANCH" {{base_branch}}
+git diff "origin/{{base_branch}}...origin/$BRANCH"
+```
+
+**2. Choose the review mode:**
+
+- **Scoped re-review** — if `REVIEW_SCOPE == "fix-diff"`, a prior review
+  returned changes-needed and the porter pushed a fix. Bound your re-check to
+  the fix diff since the last review; everything outside the fix is
+  accepted-as-is. The publish gate is a scoped pass, not a full re-run.
+  Declare the scope explicitly in your verdict.
+- **Full review** — otherwise review the whole port diff.
+
+**3. SEED-ERROR self-verification (required).**
+
+If any technique, law, seed, or entity-name in this port originated from YOU
+(the owning PL), re-verify that seed against the LIVE implementation on the
+branch — not against your memory of it. A wrong seed the porter applied
+faithfully is still a review finding: name it, correct it, and record the
+self-correction. Review the porter's adaptation AND your own seeds.
+
+**4. Independently re-run the receiving rig's tests** named in
+`evidence.tests`. Do not take the porter's green on trust.
+
+**5. Reach a verdict and, if applicable, apply pre-approved mechanical fixes.**
+
+- If the only outstanding items are mechanical fixes you pre-approve (rename,
+  formatting, a trivial adaptation), APPLY them on the branch yourself,
+  commit, push, and set the verdict to `pre-approved-mechanical` — this
+  publishes WITHOUT a second review round.
+- Otherwise the verdict is `pass` (ready to publish as-is) or
+  `changes-needed` (the porter must fix and re-submit).
+
+**6. Persist the FULL report to the bead notes and mail the coordinator:**
+```bash
+gc bd update "$WORK_BEAD_ID" --notes "$(cat <<'EOF'
+# Owning-PL review — <pass | changes-needed | pre-approved-mechanical>
+
+## Scope
+<full review | scoped re-review bounded to the fix diff since <ref>>
+
+## Port adaptation findings
+...
+
+## SEED re-verification
+<which seeds you supplied, and whether each still holds against the live impl>
+
+## Test evidence
+<the receiving-rig test command you re-ran, and its result>
+
+## Verdict + required fixes (if changes-needed)
+...
+EOF
+)"
+gc bd update "$WORK_BEAD_ID" \
+  --set-metadata evidence.review_verdict="<pass|changes-needed|pre-approved-mechanical>" \
+  --set-metadata evidence.review_scope="<full|fix-diff>" \
+  --set-metadata evidence.reviewer="$GC_AGENT"
+gc mail send "$COORD" -s "PORT_REVIEW $WORK_BEAD_ID <verdict>" -m "Owning-PL review complete for the port of {{source_rig}} {{source_ref}} on $BRANCH. Verdict: <verdict>. Full report in bead notes."
+```
+
+**Exit criteria:** Verdict in `evidence.review_verdict`, full report in bead
+notes, coordinator mailed. Do NOT publish here — the mayor publishes."""
+
+[[steps]]
+id = "review-gate"
+title = "Gate on the review verdict"
+needs = ["owning-pl-review"]
+assignee = "{{review_target}}"
+description = """
+Route on the verdict. A passing verdict unlocks the mayor's publish stage; a
+changes-needed verdict sends the branch back for a scoped fix and halts.
+
+**1. Read the verdict:**
+```bash
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+VERDICT=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata."evidence.review_verdict" // empty')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+```
+
+**2. Decide:**
+
+- **changes-needed** — record the scoped-re-review state and route the branch
+  back to the receiving-rig polecat pool, then halt the workflow. A
+  rejection-aware re-dispatch (the porter, resuming the same branch) runs the
+  scoped re-review:
+  ```bash
+  RECV_POOL="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+  gc bd update "$WORK_BEAD_ID" \
+    --set-metadata evidence.review_scope=fix-diff \
+    --set-metadata rejection_reason="<the specific fixes the porter must make>" \
+    --set-metadata summary_for_human="Port of {{source_rig}} {{source_ref}} returned changes-needed by {{review_target}}. Branch left ready for a scoped fix; re-dispatch to $RECV_POOL to resume." \
+    --status=open --assignee="" --set-metadata gc.routed_to="$RECV_POOL"
+  gc bd close "$ROOT_ID" --reason "review verdict changes-needed; routed back for scoped re-review"
+  gc runtime drain-ack
+  exit 0
+  ```
+
+- **pass** or **pre-approved-mechanical** — clear the gate and hand to the
+  mayor. Do not close the root; the `mayor-verify` step (assigned to
+  `{{publish_target}}`) becomes Ready and routes to the mayor. Nudge them:
+  ```bash
+  gc session wake "{{publish_target}}" || true
+  gc session nudge "{{publish_target}}" "Port $WORK_BEAD_ID passed owning-PL review; ready for mayor verify + publish. Run 'gc hook --claim --json'." || true
+  ```
+  Then let this step complete.
+
+- **empty / unknown verdict** — the review step did not record a verdict.
+  Halt for investigation rather than publishing blind:
+  ```bash
+  gc bd update "$WORK_BEAD_ID" --set-metadata summary_for_human="review-gate found no evidence.review_verdict for $WORK_BEAD_ID; owning-PL review incomplete. Halting before publish."
+  gc bd close "$ROOT_ID" --reason "missing review verdict"
+  gc runtime drain-ack
+  exit 0
+  ```
+
+**Exit criteria:** Either halted (root closed, routed back or flagged) or
+cleared (verdict pass/pre-approved-mechanical; workflow advances to the mayor)."""
+
+[[steps]]
+id = "mayor-verify"
+title = "Mayor mechanical gates: diff-scope, secret-shape, squash-complete"
+needs = ["review-gate"]
+assignee = "{{publish_target}}"
+description = """
+You are the mayor. Before publishing a reviewed port to the receiving rig's
+canonical branch, run three mechanical gates. No LLM judgment — each gate is a
+count, a pattern match, or a build/test exit code. Any failure halts and
+escalates; nothing is published on a failed gate.
+
+**1. Resolve the branch:**
+```bash
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+ROOT_ID=$(gc bd mol current --json | jq -r '.molecule_id')
+BRANCH=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.branch // empty')
+git fetch origin "$BRANCH" {{base_branch}}
+DIFF_RANGE="origin/{{base_branch}}...origin/$BRANCH"
+
+halt_publish() {
+  gc bd update "$WORK_BEAD_ID" \
+    --set-metadata gc.escalate_to=operator \
+    --set-metadata summary_for_human="Publish gate '$1' failed for port $WORK_BEAD_ID ({{source_rig}} {{source_ref}}) on $BRANCH: $2. Not published."
+  gc bd close "$ROOT_ID" --reason "publish gate failed: $1"
+  gc runtime drain-ack
+  exit 0
+}
+```
+
+**2. diff-scope gate.**
+
+The published diff must stay within the reviewed port's footprint — no
+unrelated files, and no protected paths unless the port genuinely intends
+them. Confirm the diff still matches what the PL reviewed
+(`evidence.ported_commit`), and that it touches no baseline-protected paths:
+```bash
+PROTECTED=$(git diff --name-only "$DIFF_RANGE" | grep -E '^\\.github/|(^|/)secrets/|^\\.beads/|(^|/)migrations/|^hooks/' || true)
+[ -n "$PROTECTED" ] && halt_publish "diff-scope" "touches protected paths: $(echo "$PROTECTED" | tr '\\n' ' ')"
+```
+If the diff no longer matches the reviewed commit, treat the review as stale
+and halt — the PL reviewed different bytes.
+
+**3. secret-shape gate.**
+
+Scan the diff for secret-shaped strings. Any hit halts — a leaked credential
+must never reach the canonical branch:
+```bash
+LEAK=$(git diff "$DIFF_RANGE" | grep -nEi '(ghp_|gho_|github_pat_|xox[baprs]-|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|(secret|token|password|api[_-]?key)[[:space:]]*[=:][[:space:]]*[^[:space:]]{12,})' || true)
+[ -n "$LEAK" ] && halt_publish "secret-shape" "diff contains secret-shaped strings"
+```
+
+**4. squash-complete gate.**
+
+The branch must be coherent and squash-ready: the tip builds/tests green, and
+the commits are complete work — no `WIP`/`fixup!`/`squash!` debris that a
+squash-merge would bake into history:
+```bash
+DEBRIS=$(git log --format='%s' "origin/{{base_branch}}..origin/$BRANCH" | grep -Ei '^(wip|fixup!|squash!)' || true)
+[ -n "$DEBRIS" ] && halt_publish "squash-complete" "commit debris present: $DEBRIS"
+# Verify the tip is green with the receiving rig's build/test command before publishing.
+```
+
+**5. All gates passed — arm publish:**
+```bash
+gc bd update "$WORK_BEAD_ID" --set-metadata evidence.publish_gates=passed
+```
+
+**Exit criteria:** Either halted (root closed, escalated) or all three gates
+passed and `evidence.publish_gates=passed` recorded."""
+
+[[steps]]
+id = "mayor-publish"
+title = "Mayor squash-publishes the port to the canonical branch"
+needs = ["mayor-verify"]
+assignee = "{{publish_target}}"
+description = """
+Publish the reviewed, gated port to the receiving rig's canonical branch and
+record the result. As the mayor you are the publisher of record for a
+cross-rig port.
+
+**1. Resolve state:**
+```bash
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+BRANCH=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.branch // empty')
+GATES=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata."evidence.publish_gates" // empty')
+[ "$GATES" != "passed" ] && { echo "publish gates not passed; refusing to publish" >&2; gc runtime drain-ack; exit 1; }
+```
+
+**2. Squash-publish to `{{base_branch}}`.**
+
+Use the receiving rig's canonical merge path — the rig's PR/`mr` flow or its
+refinery — to squash-merge `$BRANCH` into `{{base_branch}}`. The squash
+message should summarize the ported change and cite the provenance
+(`{{source_rig}} {{source_ref}}`). Do not force-push the canonical branch.
+
+If the receiving rig's integration branch is a convoy target, set it so the
+merge lands on the integration branch rather than trunk:
+```bash
+# gc convoy target {{convoy_id}} integration/<convoy-id>   # when integrating a series
+```
+
+**3. Record the publish and propagate:**
+```bash
+gc bd update "$WORK_BEAD_ID" \
+  --set-metadata pr_url="<canonical PR/merge URL>" \
+  --set-metadata evidence.published_commit="<merged commit sha>" \
+  --notes "Published port of {{source_rig}} {{source_ref}} to {{base_branch}}: <PR/merge URL>."
+```
+Propagate the technique onward if other rigs are waiting on it (that is a
+fresh `mol-port-review` sling per receiving rig, not part of this workflow).
+
+**4. Let the workflow finalize.**
+
+Completing this step lets `workflow-finalize` become Ready; the orchestrator
+closes the workflow root and, on pass, propagates closure across the
+`gc.source_bead_id` chain. Then drain:
+```bash
+gc runtime drain-ack
+```
+
+**Exit criteria:** Port squash-published to the canonical branch, PR/merge URL
+and published commit recorded, workflow finalized."""
