@@ -18,6 +18,7 @@ Create the deterministic generic-review handoff artifacts for this head SHA:
 
 - `SUBJECT_PATH=<gc.github.review_dir>/subject.md`
 - `REPORT_PATH=<gc.github.review_dir>/review-report.md`
+- `VERDICT_PATH=<gc.github.review_dir>/verdict-report.md`
 
 Write `SUBJECT_PATH` as a Markdown review subject that includes the PR URL
 {{github_pr_url}}, repo, PR number, head SHA, snapshot JSON path, and explicit
@@ -45,10 +46,29 @@ gc sling gc.run-operator {{code_review_formula}} --formula \
 If the selected formula does not declare the mode vars, omit the two mode
 `--var` arguments rather than failing the launch.
 
-Do not close this step until `REPORT_PATH` exists and validates through
-`{{pack_root}}/assets/scripts/github_reports.py review-outcome "$REPORT_PATH"`.
+`REPORT_PATH` is a `gc.build.review.v1` artifact (the generic `review`
+formula's own write-report step already gated it against that schema before
+returning). It is not a `gc.verdict-report.v1` document, so do not validate
+`REPORT_PATH` itself with `review-outcome` — that check expects the
+verdict-report shape and will always reject the build-artifact shape. Instead,
+translate it: run
+`{{pack_root}}/assets/scripts/github_reports.py translate-review-report "$REPORT_PATH" --output "$VERDICT_PATH"`.
+This maps the review's `status` front matter (`approved` -> pass/none,
+`changes_required` -> fail/major-or-minor, `blocked` -> fail/blocker, driven by
+the `## Findings` table's own severities) into the verdict/severity/findings[]
+shape downstream steps expect. If the selected `code_review_formula` produced
+a `status` the translator does not recognize (anything other than `approved`,
+`changes_required`, or `blocked`), or a Findings table the translator cannot
+parse, the translator fails with a machine-readable reason: repair the review
+report rather than hand-writing `VERDICT_PATH`.
+
+Do not close this step until `VERDICT_PATH` exists and validates through
+`{{pack_root}}/assets/scripts/github_reports.py review-outcome "$VERDICT_PATH"`.
 Persist the review handoff and result on workflow root metadata:
-`gc bd update <root-bead-id> --set-metadata gc.github.review_subject_path="$SUBJECT_PATH" --set-metadata gc.github.review_report_path="$REPORT_PATH" --set-metadata gc.github.review_outcome=<approve|comment|request_changes|block>`.
+`gc bd update <root-bead-id> --set-metadata gc.github.review_subject_path="$SUBJECT_PATH" --set-metadata gc.github.review_report_raw_path="$REPORT_PATH" --set-metadata gc.github.review_report_path="$VERDICT_PATH" --set-metadata gc.github.review_outcome=<approve|comment|request_changes|block>`.
+`gc.github.review_report_path` (read by `render-comment.md`,
+`human-gate-comment.md`, and `reuse-current-head.md`) must point at
+`VERDICT_PATH`, never at the raw `REPORT_PATH`.
 
 The adapter does not check out a mutation worktree, push commits, amend
 contributor branches, submit formal GitHub review events, or create follow-up

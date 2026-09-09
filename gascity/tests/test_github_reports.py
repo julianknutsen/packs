@@ -10,6 +10,48 @@ import io
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "assets" / "scripts"))
 
 import github_reports
+import validate_verdict_report
+
+
+FINDINGS_TABLE_MAJOR = (
+    "| ID | Severity | Title | Evidence | Required Fix |\n"
+    "| --- | --- | --- | --- | --- |\n"
+    "| rev-1 | major | Missing null check | src/foo.ts:42 dereferences without a guard | Add a null check before use |\n"
+)
+
+FINDINGS_TABLE_BLOCKER = (
+    "| ID | Severity | Title | Evidence | Required Fix |\n"
+    "| --- | --- | --- | --- | --- |\n"
+    "| rev-1 | blocker | Secret committed | AWS key checked in at config/prod.env:3 | Revoke the key and drop it from history |\n"
+)
+
+
+def build_review_artifact(status: str, findings_body: str = "") -> str:
+    return (
+        "---\n"
+        "schema: gc.build.review.v1\n"
+        "workflow:\n"
+        "  id: wf-1\n"
+        "  formula: review\n"
+        "methodology:\n"
+        "  pack: gascity\n"
+        "  name: build-basic\n"
+        "producer:\n"
+        "  formula: review\n"
+        "  stage: write-report\n"
+        "  attempt: 1\n"
+        f"status: {status}\n"
+        "trace:\n"
+        "  upstream: []\n"
+        "  coverage: []\n"
+        "---\n\n"
+        "## Verdict\n\n"
+        f"Status: {status}.\n\n"
+        "## Findings\n\n"
+        f"{findings_body or 'No findings.'}\n\n"
+        "## Verification\n\n"
+        "Reviewed the diff manually.\n"
+    )
 
 
 class GitHubReportsTests(unittest.TestCase):
@@ -358,6 +400,117 @@ recommended_next_action: ask_reporter
                 summary="done",
                 artifact_ref="artifact\n- forged: yes",
             )
+
+    def test_generic_review_artifact_is_not_a_valid_verdict_report(self) -> None:
+        # A gc.build.review.v1 report (what write-report.md actually produces)
+        # cannot be validated as gc.verdict-report.v1 (what review-outcome
+        # actually expects at the same path) -- this is the schema collision
+        # run-review.md's translator step exists to bridge.
+        report_text = build_review_artifact("changes_required", FINDINGS_TABLE_MAJOR)
+
+        with self.assertRaises(validate_verdict_report.ValidationError):
+            validate_verdict_report.validate_report_text(report_text, expected_kind="review")
+
+    def test_translate_review_report_maps_approved_to_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "review-report.md"
+            path.write_text(build_review_artifact("approved"), encoding="utf-8")
+            translated = github_reports.translate_review_report(path)
+
+        parsed = validate_verdict_report.validate_report_text(translated, expected_kind="review")
+        self.assertEqual(parsed.verdict, "pass")
+        self.assertEqual(parsed.severity, "none")
+        self.assertEqual(parsed.findings, [])
+
+    def test_translate_review_report_maps_changes_required_to_fail_major(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "review-report.md"
+            path.write_text(build_review_artifact("changes_required", FINDINGS_TABLE_MAJOR), encoding="utf-8")
+            translated = github_reports.translate_review_report(path)
+
+        parsed = validate_verdict_report.validate_report_text(translated, expected_kind="review")
+        self.assertEqual(parsed.verdict, "fail")
+        self.assertEqual(parsed.severity, "major")
+        self.assertEqual(len(parsed.findings), 1)
+        self.assertEqual(parsed.findings[0]["id"], "rev-1")
+        self.assertEqual(parsed.findings[0]["severity"], "major")
+        self.assertEqual(parsed.findings[0]["required_fix"], "Add a null check before use")
+        self.assertEqual(github_reports.review_outcome(parsed.verdict, parsed.severity), "request_changes")
+
+    def test_translate_review_report_maps_blocked_to_fail_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "review-report.md"
+            path.write_text(build_review_artifact("blocked", FINDINGS_TABLE_BLOCKER), encoding="utf-8")
+            translated = github_reports.translate_review_report(path)
+
+        parsed = validate_verdict_report.validate_report_text(translated, expected_kind="review")
+        self.assertEqual(parsed.verdict, "fail")
+        self.assertEqual(parsed.severity, "blocker")
+        self.assertEqual(github_reports.review_outcome(parsed.verdict, parsed.severity), "block")
+
+    def test_translate_review_report_rejects_blocked_without_blocker_finding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "review-report.md"
+            path.write_text(build_review_artifact("blocked", FINDINGS_TABLE_MAJOR), encoding="utf-8")
+
+            with self.assertRaisesRegex(github_reports.ValidationError, "blocker"):
+                github_reports.translate_review_report(path)
+
+    def test_translate_review_report_rejects_status_without_findings_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "review-report.md"
+            path.write_text(build_review_artifact("changes_required"), encoding="utf-8")
+
+            with self.assertRaisesRegex(github_reports.ValidationError, "Findings table"):
+                github_reports.translate_review_report(path)
+
+    def test_translate_review_report_rejects_approved_with_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "review-report.md"
+            path.write_text(build_review_artifact("approved", FINDINGS_TABLE_MAJOR), encoding="utf-8")
+
+            with self.assertRaisesRegex(github_reports.ValidationError, "must not carry findings"):
+                github_reports.translate_review_report(path)
+
+    def test_translate_review_report_rejects_unmapped_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "review-report.md"
+            path.write_text(build_review_artifact("draft"), encoding="utf-8")
+
+            with self.assertRaisesRegex(github_reports.ValidationError, "no verdict-report mapping"):
+                github_reports.translate_review_report(path)
+
+    def test_translate_review_report_rejects_invalid_severity_in_table(self) -> None:
+        bad_table = (
+            "| ID | Severity | Title | Evidence | Required Fix |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "| rev-1 | critical | Bad severity | evidence | fix |\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "review-report.md"
+            path.write_text(build_review_artifact("changes_required", bad_table), encoding="utf-8")
+
+            with self.assertRaisesRegex(github_reports.ValidationError, "severity"):
+                github_reports.translate_review_report(path)
+
+    def test_translate_review_report_cli_writes_output_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            report_path = root / "review-report.md"
+            report_path.write_text(build_review_artifact("changes_required", FINDINGS_TABLE_MAJOR), encoding="utf-8")
+            output_path = root / "verdict-report.md"
+
+            with redirect_stdout(io.StringIO()):
+                code = github_reports.main(
+                    ["translate-review-report", str(report_path), "--output", str(output_path)]
+                )
+
+            self.assertEqual(code, 0)
+            parsed = validate_verdict_report.validate_report_text(
+                output_path.read_text(encoding="utf-8"), expected_kind="review"
+            )
+            self.assertEqual(parsed.verdict, "fail")
+            self.assertEqual(parsed.severity, "major")
 
     def test_cli_reports_malformed_triage_yaml_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
