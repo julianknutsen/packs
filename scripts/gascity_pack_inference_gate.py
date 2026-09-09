@@ -69,7 +69,7 @@ GASTOWN_ALWAYS_ON_AGENTS = ("mayor", "deacon", "boot", "witness")
 GASTOWN_FORMULA_CONTRACTS = {
     "mol-review-leg": (
         "write the FULL report into the bead notes",
-        "gc bd update \"$WORK_BEAD_ID\" --notes",
+        "gc bd update \"$WORK_BEAD_ID\" --append-notes",
         "gc mail send \"$COORD\"",
         "gc bd update \"$WORK_BEAD_ID\" --status=closed",
     ),

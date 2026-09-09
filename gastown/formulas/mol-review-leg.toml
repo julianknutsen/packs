@@ -83,11 +83,15 @@ Use a structured report, not a one-line summary. Preserve the substance of
 your findings in the notes so the coordinator can re-read them after your
 session exits.
 
-Suggested pattern:
+Suggested pattern — `--append-notes`, never bare `--notes`. This bead is a
+convoy member you did not create: it carries the coordinator's assignment, and
+`--notes` REPLACES the whole field, so a report written with it deletes the
+instructions the report is answering (and the previous leg's report, on a
+re-served or multi-leg review).
 ```bash
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
-gc bd update "$WORK_BEAD_ID" --notes "$(cat <<'EOF'
+gc bd update "$WORK_BEAD_ID" --append-notes "$(cat <<'EOF'
 # <report title>
 
 ## Summary
