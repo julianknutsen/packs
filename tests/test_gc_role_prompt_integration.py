@@ -185,7 +185,8 @@ def assert_clean_worker_render(prompt: str, persona_heading: str) -> None:
     assert persona_heading in prompt
     assert prompt.count("# GC Role Worker") == 1
     assert '{{ template "gc-role-worker" . }}' not in prompt
-    assert "gc gc claim" in prompt
+    assert "gc hook --claim --drain-ack --json" in prompt
+    assert "gc gc claim" not in prompt
     assert "CLAIMED_BEAD_ID" in prompt
     assert "CLAIMED_ROOT_BEAD_ID" in prompt
     assert "CLAIMED_CONTINUATION_GROUP" in prompt

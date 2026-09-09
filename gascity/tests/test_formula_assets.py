@@ -790,6 +790,7 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, text)
         self.assertNotIn("GC_CLAIM", text)
+        self.assertNotIn("gc gc claim", text)
 
         for agent_name in ROLE_AGENTS:
             prompt = root / "roles" / "agents" / agent_name / "prompt.template.md"

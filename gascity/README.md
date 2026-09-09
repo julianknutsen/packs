@@ -21,7 +21,7 @@ Prerequisites: Gas City installed and a city running (`gc init`, `gc start`),
 and your project added as a rig (`gc rig add .` inside the repo). See the
 [repository README](../README.md) for the from-scratch path.
 
-1. Import formulas, claim command, and rig roles. From city directory:
+1. Import formulas, coordinator skill, and rig roles. From city directory:
 
    ```sh
    gc import add --name gc https://github.com/gastownhall/gascity-packs.git//gascity
@@ -37,10 +37,11 @@ and your project added as a rig (`gc rig add .` inside the repo). See the
    source = "https://github.com/gastownhall/gascity-packs.git//gascity/roles"
    ```
 
-   Both imports are required. The rig-scoped roles pack supplies agents but,
-   by design, rig imports do not register city commands; importing roles alone
-   renders prompts that reference `gc gc claim` without installing that
-   command. Keep the top-level Gas City pack imported at city scope.
+   Both imports are required for the full build pack. The rig-scoped roles pack
+   supplies agents; worker prompts claim through native
+   `gc hook --claim --drain-ack --json`, independent of the top-level pack's
+   import binding. Keep the top-level Gas City pack imported at city scope for
+   formulas and the coordinator skill.
 
    (Contributors hacking on packs can point this source at a local clone.)
 
@@ -174,10 +175,12 @@ the core-injected reserved convoy target; they do not declare `issue`,
 default. Use `same-session` only when preserving one shared worktree and
 conversation is explicitly desired and core shared drain support is available.
 
-The pack ships its city-scoped claim command alongside formulas, plus
-providerless rig role agents under `gascity/roles`. Standalone use requires
-the top-level `gc` import for formulas, mayor skill, and `gc gc claim`, and
-`gascity/roles` on each target rig for `gc.*` role agents.
+The pack retains its city-scoped claim command as a compatibility wrapper and
+ships providerless rig role agents under `gascity/roles`. Worker prompts use
+native `gc hook --claim --drain-ack --json`, so claim correctness does not
+depend on the top-level pack's import binding. Standalone use requires the
+top-level import for formulas and mayor skill, plus `gascity/roles` on each
+target rig for `gc.*` role agents.
 
 Import roles for each target rig. By default agents inherit city/workspace
 provider; advanced users can patch individual roles without overriding formulas:
