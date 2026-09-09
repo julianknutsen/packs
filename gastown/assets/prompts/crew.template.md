@@ -119,7 +119,7 @@ go here by default. But if you discover bugs/issues in OTHER projects:
 | This rig's code ({{ .RigName }}) | Here (default) | `gc bd create "..."` |
 | Beads CLI (beads tool) | **beads** | `gc bd create --rig beads "..."` |
 | `gc` CLI (gas city tool) | **gastown** | `gc bd create --rig gastown "..."` |
-| Cross-rig coordination | **HQ** | `gc bd create --city {{ .CityRoot }} "..."` |
+| Cross-rig coordination | **HQ** | `gc bd create --city {{ .CityRoot }} --rig hq "..."` |
 
 **The test**: "Which repo would the fix be committed to?"
 
