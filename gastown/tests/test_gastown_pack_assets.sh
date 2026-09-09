@@ -20,6 +20,24 @@ for path in sys.argv[1:]:
 PY
 }
 
+# Count the bare wisp assignments in $1 that are actually BACKED by the live
+# assignee query $2 on one of the next few lines. Counting the two halves
+# separately would not do it: a file can carry the bare form everywhere and no
+# query at all, which is what the form-only comparison this replaced scored as
+# a pass. The window is deliberately small -- the fallback is
+# `if [ -z "$CURRENT_WISP" ]; then` on the next line and the query on the one
+# after -- so an unrelated query further down the file cannot pair with it.
+count_paired_wisp_resolutions() {
+    awk -v query="$2" '
+        index($0, "CURRENT_WISP=${GC_BEAD_ID:-}") { window = 3; next }
+        window > 0 {
+            if (index($0, query)) { paired++; window = 0; next }
+            window--
+        }
+        END { print paired + 0 }
+    ' "$1"
+}
+
 test_dog_assets_are_pack_local() {
     [[ -f "$GASTOWN/agents/dog/agent.toml" ]] || fail "missing dog agent config"
     [[ -f "$GASTOWN/agents/dog/prompt.template.md" ]] || fail "missing dog prompt"
@@ -111,7 +129,7 @@ test_shutdown_dance_lifecycle_and_audit_contracts() {
         fail "dog prompt DOG_DONE guidance should use the normalized requester endpoint"
 }
 
-# Five role-surfaces resolve a work bead from the environment, by deliberately
+# Six role-surfaces resolve a work bead from the environment, by deliberately
 # different rules, and the differences are load-bearing. Two properties decide
 # which form is safe -- NOT "pooled vs singleton": the refinery and the deacon
 # carry identical max_active_sessions = 1 + wake_mode = "fresh" pins, so pooling
@@ -128,11 +146,18 @@ test_shutdown_dance_lifecycle_and_audit_contracts() {
 #   refinery patrol formula (singleton too, but re-reads the formula steps
 #     in-session after burning) - bare ${GC_BEAD_ID:-} plus a live assignee
 #     query, never the trigger: the wisp advances while the trigger does not.
-#   refinery / witness / deacon prompt templates - bare ${GC_BEAD_ID:-} plus the
-#     same live query. Exempt from the trigger rule by form, not by luck: a bare
-#     resolution backed by the assignee query cannot mis-select on any role, so
-#     it stays correct even on the singletons. Pinned below so the exemption is
-#     gated rather than conventional.
+#   refinery prompt template  - same rule as the refinery formula.
+#   witness prompt template   - same rule.
+#   deacon prompt template    - same rule, even though the deacon FORMULA may
+#     prefer the trigger: the template is read on wakes the formula does not
+#     drive, so it cannot rely on the formula's one-wisp-per-env property.
+# The three prompt templates are safe by the PAIR they use, not by the bare
+# form alone: providers are not required to export $GC_BEAD_ID at all
+# (the claude provider does not), so the bare half can resolve nothing and the
+# live assignee query is the load-bearing half. That query reaches wisp roots
+# only with --include-infra, since they are ephemeral and gc bd list hides the
+# wisps tier without it. Both halves are pinned below, together, so the
+# exemption is gated rather than conventional.
 # Pin the discriminator, and the rotation property it rests on, so the forms
 # cannot silently converge on the permissive one.
 test_work_bead_resolution_discriminator_is_pinned() {
@@ -201,36 +226,45 @@ test_work_bead_resolution_discriminator_is_pinned() {
         fail "the refinery no longer rotates wisps in-session; that rotation is the recorded reason it must never resolve a wisp from the spawn trigger, so re-derive the per-role rule and this discriminator before relaxing either form"
 
     # Every environment-resolved wisp assignment in the refinery must be the
-    # bare query-backed form. Comparing the two counts catches conversion in
-    # either direction without freezing the number of call sites.
-    local path env_assignments bare_assignments
+    # bare form AND be backed by the live query on the following lines. Pairing
+    # the two, rather than comparing counts of the bare form against itself,
+    # catches conversion in either direction AND the loss of the query -- which
+    # a count of the bare form alone cannot see: measured, deleting the whole
+    # `if [ -z "$CURRENT_WISP" ]` fallback block at every non-witness surface
+    # left this suite green while no refinery or deacon surface could resolve a
+    # wisp at all. Neither count freezes the number of call sites.
+    local wisp_query='gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json'
+    local path env_assignments paired
     for path in "$refinery" "$refinery_prompt"; do
         ! grep -F 'GC_TRIGGER_WORK_BEAD_ID' "$path" >/dev/null ||
             fail "the refinery rotates wisps in-session, so a spawn-fixed trigger goes stale mid-loop; it must resolve every wisp from \$GC_BEAD_ID plus the live assignee query, never the trigger: $path"
         env_assignments="$(grep -cF 'CURRENT_WISP=${GC_BEAD_ID' "$path" || true)"
-        bare_assignments="$(grep -cF 'CURRENT_WISP=${GC_BEAD_ID:-}' "$path" || true)"
+        paired="$(count_paired_wisp_resolutions "$path" "$wisp_query")"
         [[ "$env_assignments" -ge 1 ]] ||
             fail "refinery should resolve its current wisp from \$GC_BEAD_ID: $path"
-        [[ "$env_assignments" -eq "$bare_assignments" ]] ||
-            fail "every refinery wisp resolution must be the bare \${GC_BEAD_ID:-} form backed by the live assignee query ($bare_assignments of $env_assignments): $path"
+        [[ "$paired" -eq "$env_assignments" ]] ||
+            fail "every refinery wisp resolution must be the bare \${GC_BEAD_ID:-} form immediately backed by the live \`--include-infra\` assignee query ($paired of $env_assignments are): $path"
     done
 
-    # The remaining two surfaces of the census in the header comment. They are
-    # correct today by form -- bare plus the live query cannot mis-select on a
-    # singleton -- so gate that exemption instead of leaving it to convention: a
-    # harmonization edit that copies the deacon formula's trigger-preferring
-    # line into either template goes red here rather than passing silently.
+    # The remaining two surfaces of the census in the header comment. Their
+    # exemption rests on the PAIR, not on the bare form: a provider need not
+    # export $GC_BEAD_ID (the claude provider does not), so the bare half alone
+    # resolves nothing and the query is what makes the exemption true. Gate both
+    # halves instead of leaving either to convention: a harmonization edit that
+    # copies the deacon formula's trigger-preferring line into either template,
+    # or that drops the fallback query, goes red here rather than passing
+    # silently.
     local template
     for template in "$GASTOWN/agents/witness/prompt.template.md" \
                     "$GASTOWN/agents/deacon/prompt.template.md"; do
         ! grep -F 'GC_TRIGGER_WORK_BEAD_ID' "$template" >/dev/null ||
             fail "singleton prompt templates stay exempt from the per-role trigger rules by using the bare \${GC_BEAD_ID:-} form; they must not resolve a wisp from the spawn trigger: $template"
         env_assignments="$(grep -cF 'CURRENT_WISP=${GC_BEAD_ID' "$template" || true)"
-        bare_assignments="$(grep -cF 'CURRENT_WISP=${GC_BEAD_ID:-}' "$template" || true)"
+        paired="$(count_paired_wisp_resolutions "$template" "$wisp_query")"
         [[ "$env_assignments" -ge 1 ]] ||
             fail "prompt template should resolve its current wisp from \$GC_BEAD_ID: $template"
-        [[ "$env_assignments" -eq "$bare_assignments" ]] ||
-            fail "every prompt-template wisp resolution must be the bare \${GC_BEAD_ID:-} form backed by the live assignee query ($bare_assignments of $env_assignments): $template"
+        [[ "$paired" -eq "$env_assignments" ]] ||
+            fail "every prompt-template wisp resolution must be the bare \${GC_BEAD_ID:-} form immediately backed by the live \`--include-infra\` assignee query ($paired of $env_assignments are): $template"
     done
 }
 
@@ -302,38 +336,55 @@ test_review_leg_contract_forbids_synthetic_mutation() {
         fail "polecat prompt must not globally forbid review-leg close steps"
 }
 
-test_witness_wisp_queries_pin_include_infra() {
-    local prompt formula total flagged
-    prompt="$GASTOWN/agents/witness/prompt.template.md"
-    formula="$GASTOWN/formulas/mol-witness-patrol.toml"
+test_wisp_queries_pin_include_infra() {
+    local total flagged
+    local -a surfaces=(
+        "$GASTOWN/agents/witness/prompt.template.md"
+        "$GASTOWN/formulas/mol-witness-patrol.toml"
+        "$GASTOWN/agents/refinery/prompt.template.md"
+        "$GASTOWN/formulas/mol-refinery-patrol.toml"
+        "$GASTOWN/agents/deacon/prompt.template.md"
+        "$GASTOWN/formulas/mol-deacon-patrol.toml"
+    )
 
     # Wisp roots are ephemeral, so gc bd list skips the wisps tier unless
-    # --include-infra is passed: a wisp-reconcile query without it returns []
-    # even when a wisp is assigned, and the witness pours a duplicate. That
-    # regressed once already, so pin the flag rather than trust the comments.
-    # Deliberately witness-scoped: the refinery and deacon patrol queries
-    # still carry the bare form and are tracked separately in #252, so a
-    # pack-wide assertion would fail here instead of guarding this contract.
-    total=$(grep -h -- '--type=molecule' "$prompt" "$formula" |
-        grep -c -F 'gc bd list' || true)
-    flagged=$(grep -h -- '--type=molecule' "$prompt" "$formula" |
-        grep -F 'gc bd list' | grep -c -- '--include-infra' || true)
+    # --include-infra is passed: a wisp query without it returns [] even when a
+    # wisp is assigned, so the caller pours a duplicate, or reads no current
+    # wisp and never burns. That regressed once already, so pin the flag rather
+    # than trust the comments.
+    #
+    # This was witness-scoped when it was written, because the refinery and
+    # deacon queries still carried the blind form and were tracked separately in
+    # #252. They no longer do. The pair pin above covers eight of the ten
+    # newly-flagged sites, but it scans only the four files that resolve into
+    # CURRENT_WISP, so mol-deacon-patrol.toml's query and the deacon prompt's
+    # ASSIGNED_WISP query would be left pinned by nothing. The census below is
+    # therefore the whole set of surfaces that resolve a wisp.
+    #
+    # --assignee= is what selects the class, and it is a property of the class
+    # rather than an incidental token: every wisp RESOLUTION is scoped to this
+    # agent. It is what keeps mol-refinery-patrol's prose line -- which names
+    # `gc bd list --type=molecule --status=closed` for predecessor context, not
+    # a resolution, and is deliberately left blind -- out of the count. Do not
+    # narrow on --json or --limit instead: those are formatting choices, so an
+    # unflagged new resolution site written without them would pass silently.
+    total=$(grep -h -- '--type=molecule' "${surfaces[@]}" |
+        grep -F 'gc bd list' | grep -c -F -- '--assignee=' || true)
+    flagged=$(grep -h -- '--type=molecule' "${surfaces[@]}" |
+        grep -F 'gc bd list' | grep -F -- '--assignee=' |
+        grep -c -- '--include-infra' || true)
 
     # -ge, not -eq: the flagged/total assertion below owns the contract, so an
-    # exact count only adds a cardinality pin -- and a legitimate sixth query,
-    # or a prose line that happens to name all three tokens counted above,
-    # then fails the suite with nothing wrong. Measured: -ge holds every
-    # regression mode red (flag stripped from a prompt query, from the formula
-    # query, a query site deleted, an unflagged sixth site) while dropping
-    # both false positives. A prose line carrying the query tokens but not the
-    # flag still fails -- loud, in the safe direction. Requiring --json on
-    # counted lines would silence that last one too, but it is not a
-    # substitute: it stops counting any query that does not pipe to jq, so an
-    # unflagged new site written without --json passes silently.
-    [[ "$total" -ge 5 ]] ||
-        fail "expected at least 5 witness --type=molecule wisp queries (4 prompt + 1 formula), found $total"
+    # exact count only adds a cardinality pin -- and a legitimate new query
+    # would then fail the suite with nothing wrong. Measured: -ge holds every
+    # regression mode red (flag stripped from any one query, a query site
+    # deleted, an unflagged new site) while dropping that false positive. The
+    # floor is what catches deletion, which the ratio alone cannot: delete one
+    # query site and 14/14 satisfies -eq, delete them all and 0/0 does too.
+    [[ "$total" -ge 15 ]] ||
+        fail "expected at least 15 --type=molecule wisp resolution queries across the witness, refinery and deacon surfaces, found $total"
     [[ "$flagged" -eq "$total" ]] ||
-        fail "witness --type=molecule wisp queries must pass --include-infra ($flagged/$total do)"
+        fail "every --type=molecule wisp resolution query must pass --include-infra; wisp roots are ephemeral and gc bd list hides that tier without it ($flagged/$total do)"
 }
 
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed() {
@@ -419,7 +470,7 @@ test_composition_is_documented
 test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
-test_witness_wisp_queries_pin_include_infra
+test_wisp_queries_pin_include_infra
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 
 echo "gastown pack asset tests passed"
