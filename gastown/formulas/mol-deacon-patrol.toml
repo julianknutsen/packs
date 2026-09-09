@@ -509,9 +509,28 @@ gc mail send mayor/ -s "DOCTOR: <finding>" -m "<details>"
 Close this step after check."""
 
 [[steps]]
+id = "convoy-reconciliation"
+title = "Auto-close completed convoys"
+needs = ["system-health"]
+description = """
+Run convoy reconciliation to auto-close any convoys where all children are resolved.
+
+```bash
+gc convoy check
+```
+
+This is a lightweight, idempotent operation that scans open convoy beads and
+closes any where all child issues have status "closed". Run it every patrol cycle.
+
+If errors occur, log them for observability but do not escalate — convoy
+completion is not a blocker for other patrol steps.
+
+Close this step after check."""
+
+[[steps]]
 id = "next-iteration"
 title = "Pour next iteration and loop"
-needs = ["system-health"]
+needs = ["convoy-reconciliation"]
 description = """
 **Config: event_timeout = {{event_timeout}}**
 
