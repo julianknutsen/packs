@@ -25,6 +25,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Slack threads hang off the parent ts, so anchoring at the child
   stranded the reply. Retires the fleet-memory workaround of routing
   threaded replies through `publish-to-channel --thread-ts`.
+  `reply-current` now also reports the anchor it used —
+  `reply_to_message_id` in the result JSON, plus an `inheriting thread
+  <ts> from inbound <mid>` line on stderr when inheritance fires — so a
+  reply that lands in an unexpected thread can be traced to the inbound
+  that donated the anchor. The inherited anchor is the conversation's
+  newest inbound, not provably the message being answered (nothing on
+  the wire identifies which inbound woke the session); the limitation
+  and its `--reply-to` escape hatch are documented in
+  `commands/reply-current/help.md`.
+- `gc slack upload --thread-current` anchors at the thread ROOT too,
+  matching the parity its help text promises with `gc slack
+  reply-current`. It consumed a message-id-only lookup that dropped the
+  thread root, so a file uploaded in answer to a thread reply anchored
+  at the child ts and stranded outside the thread.
+- A *wedged* gc (connection accepted, then stalled) no longer crashes
+  callers whose degrade guards catch `GCAPIError`: the HTTP helper
+  wraps `TimeoutError` — raised bare out of `resp.read()`, an `OSError`
+  rather than a `URLError` — so a stalled lookup degrades like a
+  refused one instead of killing the reply with a traceback. The wrap
+  covers the stall's siblings too: a gc killed mid-response sends an
+  RST and `resp.read()` raises `ConnectionResetError`, so every
+  transport `OSError` now reaches callers in that same currency.
 
 ### Added
 

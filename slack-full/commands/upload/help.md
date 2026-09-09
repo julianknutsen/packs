@@ -47,7 +47,12 @@ gc slack upload --file /tmp/raw.csv --filename results.csv --title "Run 42 metri
 - `--thread-ts TS` — Slack message ts to thread under. Mutually
   exclusive with `--thread-current`.
 - `--thread-current` — thread under the latest inbound for this
-  session, same logic as `gc slack reply-current`.
+  session, at that inbound's thread root when it was itself a thread
+  reply — same logic as `gc slack reply-current`. That anchor is the
+  conversation's newest inbound, not provably the message being
+  answered: in a busy shared channel someone else's threaded message
+  can arrive first and become the anchor. Pass `--thread-ts <ts>` when
+  the anchor has to be exact.
 - `--idempotency-key KEY` — caller-supplied idempotency key for
   retries.
 - `--via {gc,adapter}` — routing path. `gc` (default) records the

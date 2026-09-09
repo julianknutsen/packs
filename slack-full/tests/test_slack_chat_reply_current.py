@@ -478,6 +478,135 @@ def test_inheritance_lookup_failure_degrades_to_channel_level(
     assert "thread-inheritance lookup failed" in capsys.readouterr().err
 
 
+def test_inheritance_lookup_timeout_degrades_to_channel_level(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """A *wedged* gc degrades like a refused one.
+
+    A refused connection reaches the guard as GCAPIError (URLError), but a
+    gc that accepts the connection and then stalls raises a bare
+    TimeoutError out of resp.read() — an OSError, not a GCAPIError. That
+    shape used to escape the degrade guard and kill the reply with a
+    traceback, on a path that made no gc call at all before inheritance
+    existed. _request wraps it so every best-effort caller degrades.
+    """
+    rc, common = _import_modules()
+    published: dict[str, Any] = {}
+
+    def wedged_urlopen(*_args: Any, **_kwargs: Any):
+        raise TimeoutError("timed out")
+
+    # Only the lookup goes over HTTP here; publish is stubbed, so the real
+    # find_latest_inbound_thread_for_session -> _request path runs.
+    monkeypatch.setattr(common.urllib.request, "urlopen", wedged_urlopen)
+    monkeypatch.setattr(
+        common, "publish_via_adapter",
+        lambda **kwargs: published.update(kwargs) or {"delivered": True})
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+        "--via", "adapter",
+    ])
+    assert exit_code == 0
+    assert published["reply_to_message_id"] == ""
+    assert "thread-inheritance lookup failed" in capsys.readouterr().err
+
+
+def test_request_wraps_timeout_as_gcapi_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_request turns a read timeout into GCAPIError for every caller.
+
+    urllib raises TimeoutError (an OSError, not a URLError) when the server
+    accepts the connection and then stalls, so without this wrap it slips
+    past every `except GCAPIError` degrade guard in the pack.
+    """
+    _rc, common = _import_modules()
+
+    def wedged_urlopen(*_args: Any, **_kwargs: Any):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(common.urllib.request, "urlopen", wedged_urlopen)
+    with pytest.raises(common.GCAPIError) as exc:
+        common._request("GET", "http://127.0.0.1:8372/v0/city/test-city/events",
+                        csrf=False)
+    assert "timed out" in str(exc.value)
+
+
+def test_inheritance_lookup_reset_degrades_to_channel_level(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """A gc that dies mid-response degrades like one that stalls.
+
+    The stall arrives as TimeoutError, but a gc killed after the headers
+    sends an RST and resp.read() raises ConnectionResetError — neither a
+    URLError nor a TimeoutError, so it escaped both of _request's wrapping
+    arms and killed the reply with a traceback on the same best-effort path
+    the timeout wrap exists to keep alive.
+    """
+    rc, common = _import_modules()
+    published: dict[str, Any] = {}
+
+    class _ResetResponse:
+        def __enter__(self) -> "_ResetResponse":
+            return self
+
+        def __exit__(self, *_exc: Any) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            raise ConnectionResetError(104, "Connection reset by peer")
+
+    # Headers arrive, then the body read is reset: the shape that reaches
+    # read() rather than urlopen(). Publish is stubbed, so the real
+    # find_latest_inbound_thread_for_session -> _request path runs.
+    monkeypatch.setattr(common.urllib.request, "urlopen",
+                        lambda *_a, **_k: _ResetResponse())
+    monkeypatch.setattr(
+        common, "publish_via_adapter",
+        lambda **kwargs: published.update(kwargs) or {"delivered": True})
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+        "--via", "adapter",
+    ])
+    assert exit_code == 0
+    assert published["reply_to_message_id"] == ""
+    assert "thread-inheritance lookup failed" in capsys.readouterr().err
+
+
+def test_inheritance_logs_the_anchor_and_reports_it(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Inheriting an anchor is announced on stderr and in the result JSON.
+
+    The re-anchor is the one decision on the success path that rewrites
+    where the reply lands, and the anchor is the conversation's newest
+    inbound rather than provably the message being answered — so a reply
+    in an unexpected thread has to be traceable to the inbound that
+    donated the ts, or the report is unreproducible.
+    """
+    rc, common = _import_modules()
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        return {"Receipt": {"Delivered": True}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(
+        common, "find_latest_inbound_thread_for_session",
+        lambda _sid: ("1786291407.960839", "1786250478.963679", _inbound_conv("C0GASTOWN")))
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+    ])
+    assert exit_code == 0
+    streams = capsys.readouterr()
+    assert "inheriting thread 1786250478.963679 from inbound 1786291407.960839" in streams.err
+    assert json.loads(streams.out)["reply_to_message_id"] == "1786250478.963679"
+
+
 # --------------------------------------------------------------------------
 # Company-context awareness (company rooms 2b) — additive to the legacy path.
 # --------------------------------------------------------------------------

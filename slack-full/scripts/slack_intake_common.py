@@ -173,6 +173,23 @@ def _request(method: str, url: str, body: dict[str, Any] | None = None,
         raise GCAPIError(f"{method} {url} -> {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise GCAPIError(f"{method} {url} failed: {exc}") from exc
+    except TimeoutError as exc:
+        # A *wedged* gc — headers sent, body stalled — surfaces here as a
+        # bare TimeoutError out of resp.read(), not as a URLError, so
+        # callers whose degrade guards catch GCAPIError (best-effort
+        # lookups like find_latest_inbound_thread_for_session) would crash
+        # on the one outage shape they exist to survive. socket.timeout is
+        # an alias of TimeoutError on the Python versions this pack runs.
+        raise GCAPIError(f"{method} {url} timed out after {timeout}s") from exc
+    except OSError as exc:
+        # The stall's siblings: a gc that dies mid-response sends an RST and
+        # resp.read() raises ConnectionResetError, which is neither a
+        # URLError nor a TimeoutError and so escapes both arms above. Keep
+        # every transport failure in the one currency best-effort callers
+        # degrade on. This arm must stay last: URLError and TimeoutError are
+        # both OSError subclasses and would otherwise be swallowed here,
+        # losing their more specific messages.
+        raise GCAPIError(f"{method} {url} failed: {exc}") from exc
     if not raw:
         return {}
     try:
@@ -402,12 +419,14 @@ def find_latest_inbound_for_session(session_id: str) -> dict[str, Any] | None:
 def find_latest_inbound_message_id_for_session(
     session_id: str,
 ) -> tuple[str, dict[str, str]] | None:
-    """Find the latest inbound transcript entry routed to this session.
+    """Find the latest inbound in the conversation this session last heard from.
 
     Returns (provider_message_id, conversation_dict) on hit, or None if no
     inbound has reached this session yet. Thin wrapper over
     find_latest_inbound_thread_for_session for callers that only need the
-    message id (react/upload anchoring).
+    message id (react anchoring, which attaches to a specific message and
+    so wants the inbound's own ts rather than its thread root). Inherits
+    that function's anchor caveat.
     """
     match = find_latest_inbound_thread_for_session(session_id)
     if match is None:
@@ -419,7 +438,7 @@ def find_latest_inbound_message_id_for_session(
 def find_latest_inbound_thread_for_session(
     session_id: str,
 ) -> tuple[str, str, dict[str, str]] | None:
-    """Find the latest inbound transcript entry routed to this session.
+    """Find the latest inbound in the conversation this session last heard from.
 
     Returns (provider_message_id, thread_root, conversation_dict) on hit,
     or None if no inbound has reached this session yet. thread_root is the
@@ -435,10 +454,21 @@ def find_latest_inbound_thread_for_session(
          Kind=="inbound", and return its ProviderMessageID +
          ReplyToMessageID.
 
-    Two queries (event + transcript) because the inbound event payload
-    intentionally does NOT carry message_id — that field lives in the
-    transcript and is the canonical source. See engdocs/architecture/
-    api-control-plane.md for the typed-wire rationale.
+    Anchor caveat, deliberate: step 3 resolves the newest inbound of the
+    *conversation*, which is not necessarily the message that woke this
+    session. Every message in a bound room routes to the bound session and
+    is transcribed, so in a busy shared channel a threaded message that
+    lands between the one being answered and the reply becomes the anchor,
+    and the reply joins that newer thread. Binding the pick to a single
+    message would need an identity the wire does not carry: the
+    extmsg.inbound payload is {provider, conversation_id, actor,
+    target_session, target_agent} with no message id — that field lives in
+    the transcript, the canonical source (see engdocs/architecture/
+    api-control-plane.md for the typed-wire rationale), which is why this
+    is two queries — and nothing hands the command the inbound it is
+    answering. Callers that must anchor exactly pass an explicit ts;
+    reply-current exposes that as --reply-to and documents the limitation
+    in commands/reply-current/help.md.
 
     The transcript query MUST be newest-first: the endpoint's oldest-first
     default with a bounded limit hides the most recent inbound on busy

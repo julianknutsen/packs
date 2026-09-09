@@ -9,6 +9,21 @@ thread_ts and lands in the same thread — including when
 --conversation-id names the same conversation explicitly. An
 unthreaded inbound keeps the channel-level reply. Use --no-thread to
 force a channel-level post, or --reply-to <ts> to anchor elsewhere.
+--thread-current threads under that latest inbound either way, at its
+thread root when it was a thread reply and at its own ts when it was
+not.
+
+The inherited anchor is the newest inbound in the conversation, which
+is not always the message being answered: in a shared channel, a
+threaded message from someone else that arrives between that message
+and this reply becomes the anchor, and the reply lands in their thread
+instead. Nothing on the wire identifies which inbound woke the
+session, so the command cannot tell the two apart. Pass --reply-to
+<ts> when the anchor has to be exact, or --no-thread to stay at
+channel level. When inheritance fires it prints `inheriting thread
+<ts> from inbound <mid>` on stderr and reports reply_to_message_id in
+the result JSON, so a reply that lands in an unexpected thread can be
+traced back to the inbound that donated the anchor.
 
 Examples:
   gc slack reply-current --body "ack"
