@@ -1,10 +1,10 @@
 """Run the shipped default-branch resolution against real git repositories.
 
-Four assets resolve a repository's default branch: the `prepare-worktree`
-workflow step in the `gascity` pack, and the guard that refuses to ship from
-the default branch in `contributing` and twice in `pr-pipeline`. All four used
-to do it with `git remote show origin`, which contacts the remote on every
-invocation.
+Five assets resolve a repository's default branch: the `prepare-worktree`
+workflow step and the shared-drain worktree gate in the `gascity` pack, and the
+guard that refuses to ship from the default branch in `contributing` and twice
+in `pr-pipeline`. Four of them used to do it with `git remote show origin`,
+which contacts the remote on every invocation.
 
 This test does not assert that the files contain a particular string. It pulls
 the shell out of the shipped asset and runs it under `sh` against git
@@ -19,6 +19,7 @@ failing one.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -31,6 +32,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 WORKFLOW_STEP = REPO_ROOT / "gascity/assets/workflows/do-work/prepare-worktree.md"
+SHARED_WORKTREE_SCRIPT = (
+    REPO_ROOT / "gascity/assets/scripts/checks/prepare-shared-worktree.sh"
+)
 FORMULAS = (
     REPO_ROOT / "contributing/formulas/mol-contributing-fine-tune.formula.toml",
     REPO_ROOT / "pr-pipeline/formulas/mol-pr-ship.formula.toml",
@@ -59,6 +63,16 @@ WORKFLOW_BLOCK = (
     re.compile(r"```sh\n(\s*DEFAULT_BRANCH=.*?)\n[ \t]*```", re.DOTALL),
     re.compile(r"`(DEFAULT_BRANCH=\$\(git remote show origin[^`]*)`"),
 )
+# The shared-drain gate is a shell script rather than prose, so its block sits
+# inside the create branch and runs git through `-C "$LAUNCHER_ROOT"`. The tests
+# below export that variable, which is why the snippet stays runnable verbatim.
+SCRIPT_BLOCK = (
+    re.compile(
+        r"^([ \t]*DEFAULT_BRANCH=\$\(git -C .*?^[ \t]*fi)$",
+        re.MULTILINE | re.DOTALL,
+    ),
+    re.compile(r"^([ \t]*DEFAULT_BRANCH=\$\(git .*remote show origin.*)$", re.MULTILINE),
+)
 
 # What the four assets replaced. Kept here as an executable control rather than
 # a comment: the `|| echo "main"` reads as a fallback and cannot fire, because
@@ -74,11 +88,25 @@ def git(*args: str, cwd: Path) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
-def run_snippet(snippet: str, variable: str, cwd: Path) -> str:
-    """Execute the snippet in `cwd` and return what it assigned."""
+def run_snippet(
+    snippet: str,
+    variable: str,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    shell: str = "sh",
+    preamble: str = "",
+) -> str:
+    """Execute the snippet in `cwd` and return what it assigned.
+
+    `shell` and `preamble` exist because a block lifted out of a script runs
+    under whatever options that script sets, and `set -e` with `pipefail` turns
+    a `git` that exits non-zero inside an assignment into an abort. Running such
+    a block under a bare `sh` certifies semantics its own file does not have.
+    """
     proc = subprocess.run(
-        ["sh", "-c", f'{snippet}\nprintf "%s" "${variable}"'],
+        [shell, "-c", f'{preamble}{snippet}\nprintf "%s" "${variable}"'],
         cwd=cwd,
+        env=None if env is None else {**os.environ, **env},
         capture_output=True,
         text=True,
         check=False,
@@ -235,6 +263,46 @@ class DefaultBranchResolutionTest(unittest.TestCase):
         self.drop_origin_head()
         self.sever_remote()
         self.assertEqual(run_snippet(snippet, "DEFAULT_BRANCH", self.clone), "")
+
+    # --- the shipped shared-drain worktree gate ---------------------------
+    #
+    # This one is a shell script, not prose, and it runs under
+    # `set -euo pipefail`. Lifting the block out and running it under a bare
+    # `sh` would certify semantics the shipped file does not have: an unset
+    # `refs/remotes/origin/HEAD` makes `git symbolic-ref` exit 128, and under
+    # those options the status propagates out of the assignment and aborts the
+    # script before the refresh below it can run. So the snippet is run under
+    # the shipped options, which is what makes these three cases evidence.
+
+    SHIPPED_OPTIONS = "set -euo pipefail\n"
+
+    def run_gate_snippet(self) -> str:
+        return run_snippet(
+            extract(SHARED_WORKTREE_SCRIPT, SCRIPT_BLOCK),
+            "DEFAULT_BRANCH",
+            self.clone,
+            {"LAUNCHER_ROOT": str(self.clone)},
+            shell="bash",
+            preamble=self.SHIPPED_OPTIONS,
+        )
+
+    def test_shared_worktree_gate_resolves_without_the_remote(self) -> None:
+        self.sever_remote()
+        self.assertEqual(self.run_gate_snippet(), "trunk")
+
+    def test_shared_worktree_gate_refreshes_the_ref_when_a_checkout_lacks_it(
+        self,
+    ) -> None:
+        self.drop_origin_head()
+        self.assertEqual(self.run_gate_snippet(), "trunk")
+
+    def test_shared_worktree_gate_fails_closed_rather_than_guessing(self) -> None:
+        """Same reason as `prepare-worktree`: an entire shared drain lands on
+        whatever branch this resolves to, so a wrong answer is worse than none.
+        """
+        self.drop_origin_head()
+        self.sever_remote()
+        self.assertEqual(self.run_gate_snippet(), "")
 
 
 if __name__ == "__main__":

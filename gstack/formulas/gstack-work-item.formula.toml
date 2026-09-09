@@ -17,6 +17,7 @@ default = "gstack.implementer"
 [[steps]]
 id = "implement-item"
 title = "Implement gstack shared-drain item"
+needs = ["prepare-shared-worktree"]
 metadata = { "gc.run_target" = "{{implementation_target}}", "gc.build.artifact_schema" = "gc.build.implementation-summary.v1", "gc.build.artifact_path_keys" = "gc.implementation.summary_path,gc.build.implementation_summary_path,gc.var.summary_path" }
 description_file = "../assets/workflows/gstack-work-item/implement-item.md"
 

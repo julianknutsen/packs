@@ -1,8 +1,15 @@
 
 Run inside an existing shared worktree lifecycle. Resolve reserved `convoy_id`,
-read `gc.drain_member_id` and `gc.drain_item_index`, validate ownership and
+read `gc.drain_member_id` and `gc.drain_index`, validate ownership and
 verification policy, validate context path {{context_path}} when set, implement
 the item, write an item summary, and close only the source anchor on success.
+
+The required `prepare-shared-worktree` step has already created or reused the
+one deterministic shared worktree for this drain and persisted its absolute path
+on the current source anchor as `work_dir`. Read `work_dir` from the source
+anchor and use it as `WORKTREE`. Require an absolute path that exists on disk
+and is not the launcher checkout. If `work_dir` is missing, invalid, or points
+at the launcher checkout, fail this step before editing.
 
 Do not infer the source anchor from dependency ids. Read the reserved convoy and
 source anchor metadata directly; when `gc bd show --json` returns a one-element

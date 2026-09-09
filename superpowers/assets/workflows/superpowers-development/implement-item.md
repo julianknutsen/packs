@@ -1,6 +1,6 @@
 Inspect the Superpowers shared-drain implementation task.
 
-Resolve `gc.drain_member_id`, `gc.drain_item_index`, the existing shared
+Resolve `gc.drain_member_id`, `gc.drain_index`, the existing shared
 worktree, the approved requirements, approved plan, decomposition artifact, and
 this task bead. The task bead describes the work unit only; the drained
 Superpowers implementation workflow supplies the execution procedure.

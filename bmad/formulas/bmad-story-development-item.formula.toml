@@ -15,6 +15,7 @@ single_lane = true
 [[steps]]
 id = "implement-item"
 title = "Run BMAD story development until clean"
+needs = ["prepare-shared-worktree"]
 metadata = { "gc.run_target" = "gc.run-operator" }
 description_file = "../assets/workflows/bmad-story-development/implement-item.md"
 

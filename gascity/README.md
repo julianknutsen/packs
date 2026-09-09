@@ -768,6 +768,16 @@ The loop can implement, test, repair, and self-review the item, but
 `close-source-anchor` must still be able to verify the source anchor outcome and
 close it with `gc.outcome=pass`.
 
+Overriding `do-work-item`'s `implement-item` has one requirement that is easy to
+miss: keep `needs = ["prepare-shared-worktree"]` on your override. A step
+redeclared in a child formula replaces the inherited one outright rather than
+merging with it, so an override that omits `needs` drops the edge and becomes a
+second root that runs alongside `prepare-shared-worktree` instead of after it.
+That step is what creates the shared worktree and records `work_dir` on the
+source anchor, so without the edge the item reads `work_dir` before anything has
+written it — and the plausible failure is not a clean stop but implementation
+work landing in the launcher checkout.
+
 ### Gap Analysis
 
 Use this when the implementation-vs-plan comparison needs local acceptance

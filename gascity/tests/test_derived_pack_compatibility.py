@@ -417,6 +417,44 @@ class DerivedPackCompatibilityTests(unittest.TestCase):
                     f"{pack_name}/README.md must reference the pack ledger",
                 )
 
+    def test_shared_drain_item_prompts_send_work_to_the_prepared_worktree(self) -> None:
+        """The writer step is inherited; the reader has to be in the pack's prose.
+
+        `prepare-shared-worktree` records the drain's worktree on the source
+        anchor, but an item formula whose own prompts never mention `work_dir`
+        leaves the agent implementing in the launcher checkout, which is the
+        contamination this contract exists to stop. Only prompts the pack itself
+        ships count here -- the inherited gascity prompts say it already, so
+        including them would make this assertion vacuous.
+        """
+        for pack_name, expected in DERIVED_PACKS.items():
+            pack_root = PACKS_ROOT / pack_name
+            resolved = base_contract.resolve_formula_from_dirs(
+                pack_formula_dirs(pack_name),
+                expected["implementation_item_formula"],
+            )
+            own_prompts: list[str] = []
+            for node in base_contract.formula_nodes(resolved):
+                description_file = node.get("description_file")
+                if not description_file:
+                    continue
+                for formula_dir in pack_formula_dirs(pack_name):
+                    candidate = (formula_dir / description_file).resolve()
+                    if not candidate.is_file():
+                        continue
+                    if candidate.is_relative_to(pack_root):
+                        own_prompts.append(candidate.read_text(encoding="utf-8"))
+                    break
+
+            with self.subTest(pack=pack_name):
+                self.assertTrue(own_prompts, f"{pack_name} ships no item prompts")
+                self.assertIn(
+                    "work_dir",
+                    "\n".join(own_prompts),
+                    f"{pack_name}'s shared-drain item prompts never tell the agent "
+                    "to work in the prepared worktree",
+                )
+
     def test_derived_producer_stages_keep_artifact_validation_gates(self) -> None:
         """Step overrides replace base steps wholesale, so every derived
         producer override must re-declare the shared artifact-validation gate

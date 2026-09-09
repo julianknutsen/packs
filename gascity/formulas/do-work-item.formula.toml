@@ -24,8 +24,23 @@ description = "Role target for implementation work."
 default = "gc.implementation-worker"
 
 [[steps]]
+id = "prepare-shared-worktree"
+title = "Prepare shared implementation worktree"
+metadata = { "gc.run_target" = "gc.run-operator" }
+description_file = "../assets/workflows/do-work-item/prepare-shared-worktree.md"
+
+[steps.check]
+max_attempts = 3
+
+[steps.check.check]
+mode = "exec"
+path = ".gc/scripts/checks/prepare-shared-worktree.sh"
+timeout = "5m"
+
+[[steps]]
 id = "implement-item"
 title = "Implement shared-drain item"
+needs = ["prepare-shared-worktree"]
 metadata = { "gc.run_target" = "{{implementation_target}}", "gc.build.artifact_schema" = "gc.build.implementation-summary.v1", "gc.build.artifact_path_keys" = "gc.implementation.summary_path,gc.build.implementation_summary_path,gc.var.summary_path" }
 description_file = "../assets/workflows/do-work-item/implement-item.md"
 

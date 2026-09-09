@@ -1,9 +1,15 @@
 Implement the assigned gstack shared-drain item.
 
-Gas City owns the shared drain and source-anchor lifecycle. Read only the
-assigned item scope, implement the smallest complete change, run focused proof,
-and record intended behavior, first verification command, changed files, proof
-command, and remaining risks.
+Gas City owns the shared drain and source-anchor lifecycle. It also owns the
+lane's worktree: read `work_dir` from the source anchor, require an absolute
+existing path distinct from the launcher checkout, `cd` there, and verify
+`pwd -P` before any source read, edit, proof run, or commit. Fail this step if
+`work_dir` is missing or does not resolve — never fall back to the launcher
+checkout.
+
+Read only the assigned item scope, implement the smallest complete change, run
+focused proof, and record intended behavior, first verification command, changed
+files, proof command, and remaining risks.
 
 Close with `gc.outcome=pass` only after verification.
 

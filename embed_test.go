@@ -31,6 +31,7 @@ func TestGascityEmbedsPackContent(t *testing.T) {
 		"skills/mayor/SKILL.md",
 		"assets/scripts/checks/gap-analysis-approved.sh",
 		"assets/scripts/checks/build-artifact-valid.sh",
+		"assets/scripts/checks/prepare-shared-worktree.sh",
 		"roles/pack.toml",
 	} {
 		if _, err := fs.Stat(pack, rel); err != nil {
