@@ -73,7 +73,7 @@ Every check is idempotent — safe to re-run after crash/restart.
 2. `metadata.target` on the parent convoy chain
 3. the rig repo's default branch
 
-**1. Fetch latest and derive your work bead:**
+**1. Fetch latest, derive your work bead, and resolve the base ref:**
 ```bash
 git fetch --prune origin
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
@@ -92,6 +92,32 @@ fi
 gc bd update "$WORK_BEAD_ID" --unset-metadata handoff_stage
 ```
 
+Then resolve what `{{base_branch}}` means in this clone, remote-first.
+A base that exists on origin is used via its freshly-fetched
+remote-tracking ref. A base that exists only locally (an unpushed
+integration branch) is still a valid pin — use the local branch. If
+neither exists the base configuration is wrong: STOP rather than
+substituting a different base, because silently falling back to the
+repo default is how a rig pinned to an integration branch got polecats
+branched off main (gas-e6r).
+
+```bash
+if git show-ref --verify --quiet "refs/remotes/origin/{{base_branch}}"; then
+    BASE_REF="origin/{{base_branch}}"    # preferred: freshly fetched, no local drift
+elif git show-ref --verify --quiet "refs/heads/{{base_branch}}"; then
+    BASE_REF="{{base_branch}}"           # local-only base (unpushed integration branch)
+    echo "note: base branch {{base_branch}} is local-only — it does not exist on origin"
+else
+    echo "STOP: base branch {{base_branch}} exists neither on origin nor locally."
+    echo "Fix the rig/bead base configuration; do not substitute a different base."
+    gc runtime drain-ack
+    exit 1
+fi
+```
+
+Every later block in this step uses `$BASE_REF` — never assume
+`origin/{{base_branch}}` exists.
+
 **2. Ensure worktree exists.**
 
 Check if `metadata.work_dir` already records your worktree path:
@@ -108,8 +134,9 @@ to create a new one.
 
 **If no worktree** — create one scoped to the bead, not the agent:
 ```bash
+: "${BASE_REF:?base ref not resolved — run step 1 first}"
 WORKTREE_PATH=$(pwd)/worktrees/"$WORK_BEAD_ID"
-git worktree add "$WORKTREE_PATH" --detach origin/{{base_branch}}
+git worktree add "$WORKTREE_PATH" --detach "$BASE_REF"
 cd "$WORKTREE_PATH"
 ```
 Record immediately so restarts and witness recovery can find it:
@@ -162,31 +189,35 @@ If resuming a rejected branch, rebase onto latest base:
 ```bash
 REJECTION=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.rejection_reason // empty')
 if [ -n "$REJECTION" ]; then
-    git rebase origin/{{base_branch}}
+    : "${BASE_REF:?base ref not resolved — run step 1 first}"
+    git rebase "$BASE_REF"
     # If conflicts: resolve them (this is likely the rejection reason)
     # After resolving: git rebase --continue
     gc bd update "$WORK_BEAD_ID" \
       --unset-metadata rejection_reason \
-      --set-metadata fork_sha="$(git rev-parse "origin/{{base_branch}}")"
+      --set-metadata fork_sha="$(git rev-parse "$BASE_REF")"
 fi
 ```
 
 **If no branch** — create one and record it. Always branch from the
-freshly-fetched `origin/{{base_branch}}`, never from local
-{{base_branch}} or whatever branch happens to be checked out.
-Polecat worktrees are reused across beads, so the local copy of
-{{base_branch}} may lag the remote — branching from a stale local ref
-inherits already-merged commits with stale hashes and causes the next
-refinery rebase to reject for spurious "duplicate" conflicts.
+resolved `$BASE_REF`, never from whatever branch happens to be checked
+out. When the base exists on origin, `$BASE_REF` is its freshly-fetched
+remote-tracking ref: polecat worktrees are reused across beads, so the
+local copy of {{base_branch}} may lag the remote — branching from a
+stale local ref inherits already-merged commits with stale hashes and
+causes the next refinery rebase to reject for spurious "duplicate"
+conflicts. When the base is local-only, the local branch IS the tip;
+there is no remote ref to prefer.
 
 ```bash
-git fetch origin {{base_branch}}                     # ensure origin ref is current
+: "${BASE_REF:?base ref not resolved — run step 1 first}"
+git fetch origin {{base_branch}} >/dev/null 2>&1 || true   # best-effort refresh; no-op for a local-only base
 BRANCH="polecat/$WORK_BEAD_ID"
-git branch -D "$BRANCH" 2>/dev/null || true          # drop any stale local branch with the same name
-git checkout -B "$BRANCH" "origin/{{base_branch}}"   # force-create from the freshly-fetched remote tip
+git branch -D "$BRANCH" 2>/dev/null || true                # drop any stale local branch with the same name
+git checkout -B "$BRANCH" "$BASE_REF"                      # force-create from the resolved base tip
 gc bd update "$WORK_BEAD_ID" \
   --set-metadata branch="$BRANCH" \
-  --set-metadata fork_sha="$(git rev-parse "origin/{{base_branch}}")"
+  --set-metadata fork_sha="$(git rev-parse "$BASE_REF")"
 ```
 
 Recording the branch early means:
