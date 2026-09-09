@@ -52,6 +52,37 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--max-peer-triggered-publishes-per-root", type=int, default=None)
     parser.add_argument("--max-total-peer-deliveries-per-root", type=int, default=None)
     parser.add_argument("--max-peer-triggered-publishes-per-session-per-minute", type=int, default=None)
+    parser.add_argument(
+        "--allow-bot-author",
+        action="append",
+        default=None,
+        metavar="USER_ID",
+        help="Accept inbound messages from this bot author in the bound room (repeatable; additive)",
+    )
+    parser.add_argument(
+        "--remove-bot-author",
+        action="append",
+        default=None,
+        metavar="USER_ID",
+        help="Remove a previously allowed bot author (repeatable)",
+    )
+    parser.add_argument("--clear-bot-authors", action="store_true", help="Clear the allowed bot author list")
+    parser.add_argument(
+        "--enable-guild-bot-authors",
+        action="store_true",
+        help="Accept messages from ANY bot able to post in this bound channel (trust boundary = guild membership)",
+    )
+    parser.add_argument(
+        "--disable-guild-bot-authors",
+        action="store_true",
+        help="Disable the guild-wide bot author wildcard",
+    )
+    parser.add_argument(
+        "--max-accepted-bot-author-messages-per-minute",
+        type=int,
+        default=None,
+        help="Anti-loop cap per (binding, bot author); 0 disables acceptance outright",
+    )
     parser.add_argument("conversation_id", help="Discord DM, channel, or thread id")
     parser.add_argument("session_name", nargs="+", help="Gas City session name(s)")
     args = parser.parse_args(argv)
@@ -80,6 +111,12 @@ def main(argv: list[str]) -> int:
         enable_flag="--allow-untargeted-peer-fanout",
         disable_flag="--disallow-untargeted-peer-fanout",
     )
+    guild_bot_authors = _optional_bool(
+        args.enable_guild_bot_authors,
+        args.disable_guild_bot_authors,
+        enable_flag="--enable-guild-bot-authors",
+        disable_flag="--disable-guild-bot-authors",
+    )
 
     room_policy: dict[str, Any] = {}
     if ambient_read is not None:
@@ -96,6 +133,30 @@ def main(argv: list[str]) -> int:
         room_policy["max_total_peer_deliveries_per_root"] = args.max_total_peer_deliveries_per_root
     if args.max_peer_triggered_publishes_per_session_per_minute is not None:
         room_policy["max_peer_triggered_publishes_per_session_per_minute"] = args.max_peer_triggered_publishes_per_session_per_minute
+    if guild_bot_authors is not None:
+        room_policy["allow_guild_bots"] = guild_bot_authors
+    if args.max_accepted_bot_author_messages_per_minute is not None:
+        room_policy["max_accepted_bot_author_messages_per_minute"] = args.max_accepted_bot_author_messages_per_minute
+    if args.clear_bot_authors or args.allow_bot_author or args.remove_bot_author:
+        # additive edit: start from the existing binding's list (set_chat_binding merges
+        # dict keys but replaces list values wholesale)
+        existing = common.resolve_chat_binding(
+            common.load_config(), common.chat_binding_id(args.kind, args.conversation_id)
+        )
+        existing_policy = existing.get("policy") if isinstance(existing, dict) else None
+        current: list[str] = []
+        if not args.clear_bot_authors and isinstance(existing_policy, dict):
+            current = [str(v).strip() for v in (existing_policy.get("allowed_bot_authors") or []) if str(v).strip()]
+        for value in args.allow_bot_author or []:
+            normalized = str(value).strip()
+            if not normalized.isdigit():
+                raise SystemExit(f"--allow-bot-author expects a Discord snowflake, got: {value!r}")
+            if normalized not in current:
+                current.append(normalized)
+        for value in args.remove_bot_author or []:
+            normalized = str(value).strip()
+            current = [v for v in current if v != normalized]
+        room_policy["allowed_bot_authors"] = current
 
     if args.kind != "room" and room_policy:
         raise SystemExit("room policy flags require --kind room")

@@ -551,6 +551,12 @@ def default_room_peer_policy() -> dict[str, Any]:
         "max_peer_triggered_publishes_per_root": 1,
         "max_total_peer_deliveries_per_root": 8,
         "max_peer_triggered_publishes_per_session_per_minute": 5,
+        # Bot-authored inbound messages (cross-gateway mayor bots etc.) are dropped by
+        # default. Opt in per binding: explicit author ids, or trust every bot able to
+        # post in this bound channel (i.e. members your guild admins admitted).
+        "allowed_bot_authors": [],
+        "allow_guild_bots": False,
+        "max_accepted_bot_author_messages_per_minute": 6,
     }
 
 
@@ -584,6 +590,18 @@ def _normalize_peer_policy(policy: dict[str, Any] | None, defaults: dict[str, An
                 raw.get(
                     "max_peer_triggered_publishes_per_session_per_minute",
                     defaults["max_peer_triggered_publishes_per_session_per_minute"],
+                )
+                or 0
+            ),
+        ),
+        "allowed_bot_authors": _normalize_allowlist(raw.get("allowed_bot_authors", defaults["allowed_bot_authors"])),
+        "allow_guild_bots": _coerce_bool(raw.get("allow_guild_bots"), defaults["allow_guild_bots"]),
+        "max_accepted_bot_author_messages_per_minute": max(
+            0,
+            int(
+                raw.get(
+                    "max_accepted_bot_author_messages_per_minute",
+                    defaults["max_accepted_bot_author_messages_per_minute"],
                 )
                 or 0
             ),

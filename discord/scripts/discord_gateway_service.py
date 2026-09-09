@@ -698,6 +698,65 @@ def bound_room_claims_message(
     return False
 
 
+# --- opt-in acceptance of bot-authored messages (default: dropped) -----------------
+# Cross-gateway agent participation: another operator's bot posting in a room bound on
+# this gateway. Off unless the binding's policy opts in via explicit author ids or the
+# guild-scoped wildcard (any bot able to post in the bound channel — the trust boundary
+# is guild membership, which the guild's admins control). The gateway's own bot id is
+# never accepted (hard anti-echo). A per-(binding, author) sliding-window rate limit
+# bounds mention loops; state is in-process (resets on gateway restart by design).
+_BOT_AUTHOR_ACCEPT_WINDOW_SECONDS = 60.0
+_bot_author_accept_times: dict[tuple[str, str], list[tuple[float, str]]] = {}
+
+
+def _bot_author_rate_ok(binding_key: str, author_id: str, per_minute: int, message_id: str) -> bool:
+    # Idempotent per message id: the extmsg and legacy paths may both consult the gate
+    # for the same message — it must count once.
+    if per_minute <= 0:
+        return False
+    now = time.monotonic()
+    key = (binding_key, author_id)
+    window = [(t, mid) for (t, mid) in _bot_author_accept_times.get(key, []) if now - t < _BOT_AUTHOR_ACCEPT_WINDOW_SECONDS]
+    if message_id and any(mid == message_id for (_t, mid) in window):
+        _bot_author_accept_times[key] = window
+        return True
+    if len(window) >= per_minute:
+        _bot_author_accept_times[key] = window
+        return False
+    window.append((now, message_id))
+    _bot_author_accept_times[key] = window
+    return True
+
+
+def bot_author_acceptance(config: dict[str, Any], message: dict[str, Any], bot_user_id: str) -> tuple[bool, str]:
+    """Return (accepted, ignore_reason) for a bot-authored inbound message."""
+    author = message.get("author") or {}
+    author_id = str(author.get("id", "")).strip()
+    if not author_id or author_id == bot_user_id:
+        return False, "bot_message"
+    guild_id = str(message.get("guild_id", "")).strip()
+    channel_id = str(message.get("channel_id", "")).strip()
+    if not guild_id or not channel_id:
+        return False, "bot_message"  # DM-side stays closed (Discord bots cannot DM bots)
+    binding = explicit_room_binding(config, channel_id)
+    if binding is None:
+        parent_id = _resolve_thread_parent(channel_id)
+        if parent_id:
+            binding = explicit_room_binding(config, parent_id)
+    if binding is None:
+        return False, "bot_message"
+    policy = common.binding_peer_policy(binding)
+    allowed = bool(policy.get("allow_guild_bots")) or author_id in (policy.get("allowed_bot_authors") or [])
+    if not allowed:
+        return False, "bot_message"
+    binding_key = str(binding.get("id", "")).strip() or channel_id
+    per_minute = int(policy.get("max_accepted_bot_author_messages_per_minute", 0) or 0)
+    message_id = str(message.get("id", "")).strip()
+    if not _bot_author_rate_ok(binding_key, author_id, per_minute, message_id):
+        return False, "bot_author_rate_limited"
+    return True, ""
+
+
 def ambient_bindings_config_signature() -> tuple[int, int, int] | None:
     try:
         stat_result = os.stat(common.config_path())
@@ -1657,7 +1716,9 @@ def process_inbound_message(
     ingress_id = message_ingress_id(message, normalized_app_name)
     author = message.get("author") or {}
     if bool(author.get("bot")) or str(author.get("id", "")).strip() == bot_user_id:
-        return {"status": "ignored", "reason": "bot_message", "ingress_id": ingress_id}
+        accepted, ignore_reason = bot_author_acceptance(common.load_config(), message, bot_user_id)
+        if not accepted:
+            return {"status": "ignored", "reason": ignore_reason, "ingress_id": ingress_id}
 
     guild_id = str(message.get("guild_id", "")).strip()
     channel_id = str(message.get("channel_id", "")).strip()
@@ -2458,7 +2519,9 @@ class GatewayWorker:
         try:
             author = message.get("author") or {}
             if bool(author.get("bot")) or str(author.get("id", "")).strip() == bot_user_id:
-                return False  # Skip bot messages.
+                accepted, _ignore_reason = bot_author_acceptance(common.load_config(), message, bot_user_id)
+                if not accepted:
+                    return False  # Skip bot messages (legacy path re-drops with a receipt).
             guild_id = str(message.get("guild_id", "")).strip()
             config = common.load_config()
             app_id = str(config.get("app", {}).get("application_id", "")).strip()

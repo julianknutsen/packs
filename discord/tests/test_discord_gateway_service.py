@@ -3474,3 +3474,139 @@ class DiscordGatewayServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BotAuthorOptInTests(unittest.TestCase):
+    """Opt-in acceptance of bot-authored inbound messages (default: dropped)."""
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self._old_environ = os.environ.copy()
+        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        gateway_service.CHANNEL_INFO_CACHE.clear()
+        gateway_service.CHANNEL_INFO_FETCH_LOCKS.clear()
+        gateway_service.STALE_RECLAIM_LOCKS.clear()
+        gateway_service.INGRESS_PROCESS_LOCKS.clear()
+        gateway_service.GC_API_HEALTH_CACHE["checked_at"] = 0.0
+        gateway_service.GC_API_HEALTH_CACHE["reachable"] = True
+        gateway_service.AMBIENT_ROOM_BINDINGS_CACHE["config_signature"] = None
+        gateway_service.AMBIENT_ROOM_BINDINGS_CACHE["bindings"] = {}
+        gateway_service._bot_author_accept_times.clear()
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._old_environ)
+
+    def _bind_room(self, extra_policy: dict | None = None) -> None:
+        policy = {"ambient_read_enabled": True}
+        policy.update(extra_policy or {})
+        common.set_chat_binding(
+            common.load_config(), "room", "22", ["sky"], guild_id="1", policy=policy
+        )
+
+    def _bot_message(self, message_id: str = "801", author_id: str = "77") -> dict:
+        return {
+            "id": message_id,
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "@sky status ping",
+            "mentions": [],
+            "author": {"id": author_id, "username": "peer-mayor", "bot": True},
+        }
+
+    def _process(self, message: dict):
+        with mock.patch.object(
+            common,
+            "session_index_by_name",
+            return_value={"sky": {"session_name": "sky", "state": "active"}},
+        ), mock.patch.object(
+            common, "deliver_session_message", return_value={"status": "accepted"}
+        ):
+            return gateway_service.process_inbound_message(message, bot_user_id="999")
+
+    def test_bot_message_dropped_by_default(self) -> None:
+        self._bind_room()
+        outcome = self._process(self._bot_message())
+        self.assertEqual(outcome["status"], "ignored")
+        self.assertEqual(outcome["reason"], "bot_message")
+
+    def test_explicitly_allowed_bot_author_routes(self) -> None:
+        self._bind_room({"allowed_bot_authors": ["77"]})
+        outcome = self._process(self._bot_message())
+        self.assertEqual(outcome["status"], "delivered")
+
+    def test_guild_bot_wildcard_routes_any_bot_author(self) -> None:
+        self._bind_room({"allow_guild_bots": True})
+        outcome = self._process(self._bot_message(author_id="4242"))
+        self.assertEqual(outcome["status"], "delivered")
+
+    def test_own_bot_id_never_accepted_even_with_wildcard(self) -> None:
+        self._bind_room({"allow_guild_bots": True})
+        outcome = self._process(self._bot_message(author_id="999"))
+        self.assertEqual(outcome["status"], "ignored")
+        self.assertEqual(outcome["reason"], "bot_message")
+
+    def test_unlisted_bot_author_still_dropped(self) -> None:
+        self._bind_room({"allowed_bot_authors": ["4242"]})
+        outcome = self._process(self._bot_message(author_id="77"))
+        self.assertEqual(outcome["status"], "ignored")
+        self.assertEqual(outcome["reason"], "bot_message")
+
+    def test_bot_message_in_unbound_channel_dropped(self) -> None:
+        self._bind_room({"allow_guild_bots": True})
+        message = self._bot_message()
+        message["channel_id"] = "33"  # no binding here; wildcard on "22" must not leak
+        with mock.patch.object(gateway_service, "_resolve_thread_parent", return_value=""):
+            outcome = self._process(message)
+        self.assertEqual(outcome["status"], "ignored")
+        self.assertEqual(outcome["reason"], "bot_message")
+
+    def test_bot_dm_always_dropped(self) -> None:
+        common.set_chat_binding(common.load_config(), "dm", "55", ["sky"])
+        message = {
+            "id": "802",
+            "channel_id": "55",
+            "content": "dm ping",
+            "author": {"id": "77", "username": "peer-mayor", "bot": True},
+        }
+        outcome = self._process(message)
+        self.assertEqual(outcome["status"], "ignored")
+        self.assertEqual(outcome["reason"], "bot_message")
+
+    def test_rate_limit_caps_accepted_bot_messages(self) -> None:
+        self._bind_room(
+            {"allowed_bot_authors": ["77"], "max_accepted_bot_author_messages_per_minute": 2}
+        )
+        self.assertEqual(self._process(self._bot_message("810")).get("status"), "delivered")
+        self.assertEqual(self._process(self._bot_message("811")).get("status"), "delivered")
+        outcome = self._process(self._bot_message("812"))
+        self.assertEqual(outcome["status"], "ignored")
+        self.assertEqual(outcome["reason"], "bot_author_rate_limited")
+
+    def test_rate_charge_idempotent_per_message_id(self) -> None:
+        self._bind_room(
+            {"allowed_bot_authors": ["77"], "max_accepted_bot_author_messages_per_minute": 1}
+        )
+        self.assertEqual(self._process(self._bot_message("820")).get("status"), "delivered")
+        # same message consulted again (extmsg + legacy both gate): not double-charged
+        accepted, reason = gateway_service.bot_author_acceptance(
+            common.load_config(), self._bot_message("820"), "999"
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "")
+
+    def test_zero_rate_disables_acceptance(self) -> None:
+        self._bind_room(
+            {"allowed_bot_authors": ["77"], "max_accepted_bot_author_messages_per_minute": 0}
+        )
+        outcome = self._process(self._bot_message("830"))
+        self.assertEqual(outcome["status"], "ignored")
+        self.assertEqual(outcome["reason"], "bot_author_rate_limited")
+
+    def test_human_messages_unaffected(self) -> None:
+        self._bind_room()
+        message = self._bot_message("840")
+        message["author"] = {"id": "u-1", "username": "alice"}
+        outcome = self._process(message)
+        self.assertEqual(outcome["status"], "delivered")

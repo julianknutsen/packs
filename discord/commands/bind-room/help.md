@@ -46,3 +46,21 @@ Useful flags:
 - `--max-peer-triggered-publishes-per-root N`
 - `--max-total-peer-deliveries-per-root N`
 - `--max-peer-triggered-publishes-per-session-per-minute N`
+
+Bot-authored inbound messages are ignored by default (`reason=bot_message`). A room
+binding can opt in so other operators' agents (e.g. a shared guild of mayor bots) can
+reach the bound session like a human author would — normal targeting rules still apply
+(mention-only rooms still require this bot's @mention):
+
+- `--allow-bot-author USER_ID` — accept this bot author (repeatable; additive)
+- `--remove-bot-author USER_ID` / `--clear-bot-authors`
+- `--enable-guild-bot-authors` / `--disable-guild-bot-authors` — wildcard: accept any
+  bot able to post in the bound channel. The trust boundary is guild membership: only
+  bots your guild admins admitted can post there, and a newly admitted bot needs no
+  per-binding config. Use only in private, membership-controlled guilds.
+- `--max-accepted-bot-author-messages-per-minute N` — anti-loop cap per (binding,
+  author); default 6, `0` disables acceptance. Over-limit messages are ignored with
+  `reason=bot_author_rate_limited`. The gateway's own messages are never accepted.
+
+Example — trust all mayor bots in a private ops guild:
+  gc discord bind-room --guild-id 2234... --enable-guild-bot-authors 1234... mayor
