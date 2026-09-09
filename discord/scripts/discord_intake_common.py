@@ -2331,29 +2331,32 @@ _SCOPE_CACHE_TTL = 60.0  # seconds
 def resolved_workspace_name(city_cfg: dict[str, Any]) -> str:
     """Resolve the city's runtime workspace name.
 
-    Precedence mirrors gc itself: declared city.toml workspace.name, then the
-    machine-local site binding (.gc/site.toml workspace_name), then the city
-    directory basename. gc init no longer writes workspace.name to city.toml,
-    so deployments commonly only carry the site binding.
+    Precedence mirrors gc itself (applyWorkspaceIdentityBinding): the
+    machine-local site binding (.gc/site.toml workspace_name) wins, then the
+    declared city.toml workspace.name, then the city directory basename. gc
+    registers the city with the supervisor under this resolved name, so scope
+    discovery must resolve it identically or a divergent site binding sends
+    delivery to the dead default API port.
     """
+    root = city_root()
+    if root:
+        site_path = os.path.join(root, ".gc", "site.toml")
+        try:
+            with open(site_path, "rb") as handle:
+                site_cfg = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            site_cfg = {}
+        if isinstance(site_cfg, dict):
+            name = str(site_cfg.get("workspace_name", "")).strip()
+            if name:
+                return name
     workspace_cfg = city_cfg.get("workspace") or {}
     if isinstance(workspace_cfg, dict):
         name = str(workspace_cfg.get("name", "")).strip()
         if name:
             return name
-    root = city_root()
     if not root:
         return ""
-    site_path = os.path.join(root, ".gc", "site.toml")
-    try:
-        with open(site_path, "rb") as handle:
-            site_cfg = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError):
-        site_cfg = {}
-    if isinstance(site_cfg, dict):
-        name = str(site_cfg.get("workspace_name", "")).strip()
-        if name:
-            return name
     return pathlib.Path(root).name
 
 

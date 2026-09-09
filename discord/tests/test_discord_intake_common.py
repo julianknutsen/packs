@@ -994,6 +994,44 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         with mock.patch.object(common.urllib.request, "urlopen", return_value=response):
             self.assertEqual(common.gc_api_base_url(), "http://127.0.0.1:8372")
 
+    def test_gc_api_base_url_prefers_site_binding_name_over_city_toml_name(self) -> None:
+        # gc registers the city under the resolved name, where the machine-local
+        # site binding overrides the declared city.toml name. If the pack checks
+        # city.toml first, a divergent site binding makes scope discovery miss
+        # and delivery falls back to the wrong API endpoint.
+        pathlib.Path(self.tempdir.name, "city.toml").write_text(
+            '[workspace]\nname = "legacy"\n[api]\nbind = "0.0.0.0"\nport = 9555\n',
+            encoding="utf-8",
+        )
+        site_dir = pathlib.Path(self.tempdir.name, ".gc")
+        site_dir.mkdir()
+        (site_dir / "site.toml").write_text('workspace_name = "site-wins"\n', encoding="utf-8")
+        common._supervisor_scope_cache.clear()
+        self.addCleanup(common._supervisor_scope_cache.clear)
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(
+            return_value=mock.Mock(read=mock.Mock(return_value=b'{"items":[{"name":"site-wins","running":true}]}'))
+        )
+        response.__exit__ = mock.Mock(return_value=False)
+
+        with mock.patch.object(common.urllib.request, "urlopen", return_value=response):
+            self.assertEqual(common.gc_api_base_url(), "http://127.0.0.1:8372")
+
+    def test_resolved_workspace_name_prefers_site_binding_over_city_toml(self) -> None:
+        site_dir = pathlib.Path(self.tempdir.name, ".gc")
+        site_dir.mkdir()
+        (site_dir / "site.toml").write_text('workspace_name = "site-name"\n', encoding="utf-8")
+
+        self.assertEqual(common.resolved_workspace_name({"workspace": {"name": "declared-name"}}), "site-name")
+
+    def test_resolved_workspace_name_ignores_unreadable_site_binding(self) -> None:
+        site_dir = pathlib.Path(self.tempdir.name, ".gc")
+        site_dir.mkdir()
+        (site_dir / "site.toml").write_text("not [valid toml", encoding="utf-8")
+
+        self.assertEqual(common.resolved_workspace_name({"workspace": {"name": "declared-name"}}), "declared-name")
+        self.assertEqual(common.resolved_workspace_name({}), pathlib.Path(self.tempdir.name).name)
+
     def test_gc_api_base_url_falls_back_to_city_dir_basename_when_no_declared_name(self) -> None:
         pathlib.Path(self.tempdir.name, "city.toml").write_text("", encoding="utf-8")
         common._supervisor_scope_cache.clear()
