@@ -54,22 +54,39 @@ Your formula: `mol-deacon-patrol`
 > **The Universal Propulsion Principle: If you find something on your hook, YOU RUN IT.**
 
 ```bash
-# Step 1: Check for assigned work
+# Resolve your assignee identity once. GC_ALIAS and GC_AGENT are equivalent for
+# a singleton patrol session; resolve a single ASSIGNEE so every wisp lookup
+# and assignment below uses the same value (no GC_ALIAS/GC_AGENT skew).
+ASSIGNEE=${GC_ALIAS:-$GC_AGENT}
+
+# Step 1: Check for assigned in-progress work
 {{ .AssignedInProgressQuery }}
 
-# Step 2: Nothing? Check mail for attached work
+# Step 2: Already have a patrol wisp queued? A prior cycle's next-iteration
+# pours the successor as an OPEN wisp. The in-progress check above does not
+# see an open wisp, so on a fresh restart — without this guard — you would
+# pour a DUPLICATE and the open successor would leak (gc-fph55). Patrol wisps
+# are issue_type=molecule; narrow by title (server prefilter + exact jq match)
+# so this matches only THIS patrol loop, never other molecule work assigned
+# to you.
+EXISTING_WISP=$(gc bd list --assignee="$ASSIGNEE" --status=open,in_progress --type=molecule --title="mol-deacon-patrol" --json | jq -r 'map(select(.title=="mol-deacon-patrol"))[0].id // empty')
+
+# Step 3: Nothing in progress? Check mail for attached work
 gc mail inbox
 
-# Step 3: Still nothing? Create patrol wisp (root-only — no child step beads)
-NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"
+# Step 4: No assigned work AND no queued patrol wisp? Create one (root-only —
+# no child step beads). Skip the pour when a wisp already exists (idempotent).
+if [ -z "$EXISTING_WISP" ]; then
+  NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
+  gc bd update "$NEW_WISP" --assignee="$ASSIGNEE"
+fi
 
-# Step 4: Read the formula recipe — these are the steps to execute
+# Step 5: Read the formula recipe — these are the steps to execute
 # (Use 'gc bd formula show' for the recipe on disk; 'gc bd mol show' is
 #  for poured molecule instances, not formulas, and will say 'not found'.)
 gc bd formula show mol-deacon-patrol
 
-# Step 5: Execute — work through the steps in order
+# Step 6: Execute — work through the steps in order
 ```
 
 **Hook -> Read formula steps (`gc bd formula show <name>`) -> Follow in order -> pour next iteration -> run `gc hook`.**
@@ -87,18 +104,19 @@ without running `next-iteration` (crash recovery or formula misread).
 If `next-iteration` already ran, do not pour again; run `gc hook`.
 
 ```bash
+ASSIGNEE=${GC_ALIAS:-$GC_AGENT}
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+  CURRENT_WISP=$(gc bd list --assignee="$ASSIGNEE" --status=in_progress --type=molecule --title="mol-deacon-patrol" --json | jq -r 'map(select(.title=="mol-deacon-patrol"))[0].id // empty')
 fi
-ASSIGNED_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=1 --json | jq -r '.[0].id // empty')
+ASSIGNED_WISP=$(gc bd list --assignee="$ASSIGNEE" --status=open --type=molecule --title="mol-deacon-patrol" --json | jq -r 'map(select(.title=="mol-deacon-patrol"))[0].id // empty')
 if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
   NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
   if [ -z "$NEXT" ]; then
     echo "Could not pour next deacon wisp; not burning."
     exit 1
   fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+  if ! gc bd update "$NEXT" --assignee="$ASSIGNEE"; then
     echo "Could not assign next deacon wisp; not burning."
     exit 1
   fi
@@ -111,7 +129,7 @@ elif [ -z "$ASSIGNED_WISP" ]; then
     echo "Could not bootstrap next deacon wisp."
     exit 1
   fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
+  if ! gc bd update "$NEXT" --assignee="$ASSIGNEE"; then
     echo "Could not assign bootstrap deacon wisp."
     exit 1
   fi
