@@ -336,6 +336,105 @@ test_witness_wisp_queries_pin_include_infra() {
         fail "witness --type=molecule wisp queries must pass --include-infra ($flagged/$total do)"
 }
 
+test_witness_handoff_recovery_is_guarded_and_fail_closed() {
+    local witness polecat refinery block signature writers
+
+    witness="$GASTOWN/formulas/mol-witness-patrol.toml"
+    polecat="$GASTOWN/formulas/mol-polecat-work.toml"
+    refinery="$GASTOWN/formulas/mol-refinery-patrol.toml"
+    parse_toml "$witness" "$polecat" "$refinery"
+
+    # Witness Step 3a completes the refinery handoff for a polecat that died
+    # between submit-and-exit steps 5 and 6 (gastownhall/gascity-packs#276).
+    # It mutates a bead assigned to a dead actor and then deletes its worktree,
+    # so every property below is one that an edit can silently invert while the
+    # formula still parses and the rest of this suite stays green.
+
+    # Placement. A presence-only grep survives moving 3a after 3b, which makes
+    # it dead code for every bead 3b has already returned to pool. A sequence
+    # signature pins order, count, and cardinality together, and pins the
+    # precondition (Step 3's on-main close) rather than 3a alone.
+    signature=$(awk '
+        /^gc bd close <bead> --force$/ { print "step3-close" }
+        /^\*\*Step 3a:/               { print "step3a" }
+        /^\*\*Step 3b:/               { print "step3b" }
+    ' "$witness" | tr '\n' ' ')
+    [[ "$signature" == "step3-close step3a step3b " ]] ||
+        fail "witness recovery must run Step 3's on-main close, then Step 3a, then Step 3b (got: $signature)"
+
+    # Discriminator. metadata.target is a mint-time sling input that nothing
+    # ever unsets and that survives both refinery rejection paths, so keying on
+    # it fires 3a for beads that never submitted -- shipping an already-rejected
+    # or half-finished tip to a refinery whose only merge gate is tests-pass.
+    block=$(awk '/^\*\*Step 3a:/{f=1} /^\*\*Step 3b:/{f=0} f' "$witness")
+    printf '%s\n' "$block" |
+        grep -F 'if [ "$HANDOFF_STAGE" = "target_recorded" ] && [ -n "$BRANCH_ON_ORIGIN" ]; then' >/dev/null ||
+        fail "Step 3a must key the handoff on handoff_stage and a branch that is really on origin"
+    ! printf '%s\n' "$block" | grep -F '[ -n "$BEAD_TARGET" ]' >/dev/null ||
+        fail "Step 3a must not treat metadata.target as a completion signal"
+    # Both halves of the backstop, in one pin. ls-remote patterns match ref
+    # tails, so the bare "$BRANCH" form is truthy for a branch that is not on
+    # origin whenever a tail-colliding ref (archive/polecat/<id>) survives it;
+    # the fully-qualified form measures the property the message below names.
+    printf '%s\n' "$block" |
+        grep -F '[ -n "$BRANCH" ] && BRANCH_ON_ORIGIN=$(git ls-remote --heads origin "refs/heads/$BRANCH"' >/dev/null ||
+        fail "Step 3a must guard the empty branch and query the fully-qualified ref: ls-remote patterns match ref tails"
+
+    # The claim guard and the fail-closed arm. bd refuses a cross-actor
+    # --assignee write against the dead polecat's live in_progress claim
+    # without --force; unchecked, the witness would then mail success, delete
+    # the worktree, and skip the 3b reset that used to recover the bead.
+    printf '%s\n' "$block" | grep -F -- '--set-metadata gc.routed_to="" --force' >/dev/null ||
+        fail "Step 3a's cross-actor reassignment must pass --force"
+    # Failure policy, pinned separately from the ordering signature below so a
+    # change to either reports as itself. delete-source runs after the
+    # reassignment has already succeeded, so it is best-effort like the
+    # wake/nudge: leaving it bare invites a future editor to read it as
+    # load-bearing and abort a handoff that in fact completed.
+    printf '%s\n' "$block" |
+        grep -F 'gc workflow delete-source <bead> --apply || true' >/dev/null ||
+        fail "Step 3a's subtree cleanup must state its best-effort failure policy (|| true), as the wake/nudge do"
+    printf '%s\n' "$block" |
+        grep -F 'REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"' >/dev/null ||
+        fail "Step 3a must use submit-and-exit step 6's conditional rig prefix for the assignee write"
+
+    # Ordering inside the block, again as a signature: the reassignment's exit
+    # status is the if condition, the subtree cleanup and the success mail,
+    # wake, nudge, and worktree removal all sit inside the success arm ahead of
+    # a real else, and the subtree cleanup precedes the signal so the refinery
+    # is never woken mid-cleanup. Substring pins alone stay green if the mail
+    # is hoisted above the if or the else is dropped -- and every statement
+    # ordered after the if is a statement the failure arm cannot reach, which
+    # is what makes falling through to Step 3b a true no-op.
+    signature=$(printf '%s\n' "$block" | awk '
+        /^  if gc bd update <bead> /                  { print "guarded-update" }
+        /^    gc workflow delete-source <bead> --apply/ { print "delete-source" }
+        /gc mail send mayor\/ -s "ORPHAN_HANDED_OFF/  { print "mail" }
+        /gc session wake "\$REFINERY_TARGET"/         { print "wake" }
+        /gc session nudge "\$REFINERY_TARGET"/        { print "nudge" }
+        /git worktree remove <worktree-path> --force/ { print "worktree-remove" }
+        /^  else$/                                    { print "else" }
+    ' | tr '\n' ' ')
+    [[ "$signature" == "guarded-update delete-source mail wake nudge worktree-remove else " ]] ||
+        fail "Step 3a must check the reassignment's exit status first, then delete the subtree and mail/wake/nudge/clean up in the success arm, and fall through in an else (got: $signature)"
+
+    # The marker contract spans three formulas: one writer, three clearers.
+    # Losing any clearer silently restores the stale-marker over-trigger that
+    # keying on handoff_stage exists to prevent.
+    writers=$(cat "$polecat" "$witness" "$refinery" |
+        grep -c -F -- '--set-metadata handoff_stage=target_recorded' || true)
+    [[ "$writers" -eq 1 ]] ||
+        fail "handoff_stage must be written only by submit-and-exit step 5 (found $writers writers)"
+    grep -F 'gc bd update "$WORK_BEAD_ID" --unset-metadata handoff_stage' "$polecat" >/dev/null ||
+        fail "workspace-setup must clear a stale handoff_stage on every fresh attempt"
+    [[ $(grep -c -F -- '--unset-metadata handoff_stage' "$refinery") -eq 2 ]] ||
+        fail "both refinery rejection paths must clear handoff_stage"
+
+    # 3b keeps its own recovery for everything that falls through.
+    grep -F 'gc workflow delete-source <bead> --apply && gc workflow reopen-source <bead>' "$witness" >/dev/null ||
+        fail "Step 3b must still reopen the source bead for fall-through recoveries"
+}
+
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed() {
     local formula direct_block
     formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
@@ -420,6 +519,7 @@ test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_witness_wisp_queries_pin_include_infra
+test_witness_handoff_recovery_is_guarded_and_fail_closed
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 
 echo "gastown pack asset tests passed"

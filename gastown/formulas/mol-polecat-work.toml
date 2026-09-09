@@ -83,6 +83,13 @@ if [ -z "$WORK_BEAD_ID" ]; then
   gc runtime drain-ack
   exit 1
 fi
+# Clear any stale handoff marker before touching the work. A fresh attempt on
+# this bead means a prior submit-and-exit step 5 no longer describes it, and a
+# leftover marker would let the witness's Step 3a hand un-submitted work to the
+# refinery if this attempt also crashes. Unconditional on purpose: a bead can
+# arrive here carrying the marker with no rejection_reason (witness pool reset,
+# operator re-sling), so clearing only on the rejection path is not enough.
+gc bd update "$WORK_BEAD_ID" --unset-metadata handoff_stage
 ```
 
 **2. Ensure worktree exists.**
@@ -658,6 +665,7 @@ git branch -D "$BRANCH"              # Branch is pushed; refinery owns it now
 # --append-notes, NEVER --notes — see the note under this block.
 gc bd update "$WORK_BEAD_ID" \
   --set-metadata target={{base_branch}} \
+  --set-metadata handoff_stage=target_recorded \
   --append-notes "Implemented: <brief summary>"
 ```
 Branch was recorded in workspace-setup and is already in metadata.
@@ -682,6 +690,18 @@ the very notes a bare `--notes` would have just deleted. The identity-stamped
 bead record is also the city's anchor against nudge-text spoofing, so a rail
 that silently erases it is a P1, not a formatting nit. The same rule holds
 anywhere a formula writes a note onto a bead it did not create: append.
+
+`handoff_stage=target_recorded` is the stage marker the witness's Step 3a
+uses to recognize a polecat that crashed between this step and step 6 and to
+complete the handoff instead of respinning the work. It must be written here
+and nowhere else: `target` cannot carry that meaning because `gc sling`
+accepts it as a mint-time input, nothing ever unsets it, and it survives
+refinery rejection. Every path that invalidates "step 5 completed" clears the
+marker — `workspace-setup` on each fresh attempt, and both `mol-refinery-patrol`
+rejection paths. Every branch-ready halt in the push gate above
+(`auto_push_false`, `metadata_unreadable`, `no_push_rail_unresolved`) returns
+before this step, as do the push-failure paths, so an unpushed branch never
+carries the marker.
 
 **6. Reassign to refinery:**
 ```bash

@@ -230,7 +230,12 @@ Never infer a branch name. If `metadata.branch` is missing, reject the bead.
 
 On rebase conflict or test failure:
 1. Put work bead back in pool:
-   `gc bd update $WORK --status=open --assignee="" --set-metadata rejection_reason="..."`
+   `gc bd update $WORK --status=open --assignee="" --set-metadata rejection_reason="..." --unset-metadata handoff_stage`
+
+   Clearing `handoff_stage` is required, not cosmetic, and belongs in the same
+   update as the pool reset: rejection invalidates the polecat's completed
+   submit, and a bead left carrying the marker is one the witness would hand
+   straight back to you as a crash-recovery handoff.
 2. Branch handling depends on failure type:
    - Conflict: leave branch intact (polecat needs it for rebase)
    - Test failure: delete branch (polecat redoes work)

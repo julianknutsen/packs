@@ -87,7 +87,8 @@ Work beads carry structured metadata for lifecycle tracking and handoff:
 |-------|--------|------|-------------|
 | `work_dir` | polecat (branch-setup) | Early | Absolute path to git worktree |
 | `branch` | polecat (branch-setup) | Early | Source branch name |
-| `target` | polecat (submit) | Late | Target branch (default: {{ .DefaultBranch }}) |
+| `target` | caller (sling) or polecat (submit) | Mint-time or Late | Target branch (default: {{ .DefaultBranch }}). `gc sling` accepts it as a mint-time input and nothing ever unsets it, so its presence is **not** a signal that you submitted |
+| `handoff_stage` | polecat (submit step 5) | Late | `target_recorded` once submit has recorded `target`. This — not `target` — is what says submit ran to completion |
 | `existing_pr` | caller | Before dispatch | Existing PR URL to reuse instead of creating another PR |
 | `pr_url` | refinery | PR handoff | Canonical PR URL recorded after validation |
 | `rejection_reason` | refinery (on failure) | On reject | Why the merge was rejected |
@@ -96,12 +97,21 @@ Work beads carry structured metadata for lifecycle tracking and handoff:
 This enables crash recovery — the witness can find and salvage your work.
 
 **On submission:** You update `branch` (may have changed after rebase),
-set `target`, then reassign to refinery. If `existing_pr` is present, leave
-it for refinery to validate and canonicalize into `pr_url`.
+set `target` and `handoff_stage` in the same update, then reassign to
+refinery. If `existing_pr` is present, leave it for refinery to validate and
+canonicalize into `pr_url`. If you die between those two steps, the witness
+reads `handoff_stage` and completes the reassignment for you instead of
+resetting your finished work to the pool.
 
 **On rejection:** The refinery puts the bead back in the pool with
-`rejection_reason` set and the branch intact. A new polecat picks it up,
-sees the existing branch and reason, and resumes instead of redoing everything.
+`rejection_reason` set, `handoff_stage` cleared, and the branch intact. A new
+polecat picks it up, sees the existing branch and reason, and resumes instead
+of redoing everything. Your own workspace-setup clears `handoff_stage` again
+on every fresh attempt, so a stale marker never survives into new work.
+
+The formulas are the source of truth for this contract:
+`mol-polecat-work` writes the marker, `mol-refinery-patrol` and
+workspace-setup clear it, and `mol-witness-patrol` Step 3a is its only reader.
 
 Read metadata:
 ```bash
