@@ -146,11 +146,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distro Go lands, and which a restricted PATH hides); `GOCACHE` and
   `GOPATH` are defaulted under `TMPDIR` when HOME, `XDG_CACHE_HOME`
   and `GOCACHE` are all unset, which `go build` otherwise rejects
-  outright; and the toolchain is checked against `go.mod`'s `go`
-  directive up front, so a too-old Go under `GOTOOLCHAIN=local` fails
-  with a named remedy instead of a raw compiler error (the default
-  `GOTOOLCHAIN=auto`, which can fetch the required toolchain itself,
-  warns and proceeds).
+  outright — to a per-user, `0700`, ownership-checked directory, since
+  a shared name in world-writable `/tmp` could be pre-created by another
+  local user and Go trusts whatever it finds in those caches; and the
+  toolchain is checked against `go.mod`'s `go` directive up front, so a
+  too-old Go gets a named remedy instead of a raw compiler error (which
+  of warn, refuse, or fail it gets depends on the case — see below).
+
+  **Expect a flap on the first start after a pin bump.** gc gives a
+  starting service about 5 seconds to become ready, then kills it and
+  restarts on a 1-second backoff. A *cold* rebuild does not fit that
+  window (order of 10s on this tree; a warm one is under a second), so
+  the first start after a materialization wiped the binary is normally
+  killed mid-build. It converges on its own: `go build` keeps its
+  per-package results in the build cache, so each retry resumes cheaper
+  until one finishes and publishes the binary. A few
+  `service "slack" did not become ready before timeout` lines right
+  after `gc import install` are expected and self-clearing. Run
+  `cd adapter && go build -o gc-slack-adapter .` once to skip the flap
+  entirely.
+
+  One case cannot converge that way, and is now refused up front: a
+  toolchain *older* than `go.mod` under `GOTOOLCHAIN=auto`, where the
+  build's first act is to download a toolchain. That download keeps no
+  partial progress, so under the supervisor every restart would fetch
+  tens of megabytes from scratch, forever, with no message naming the
+  cause. When `run.sh` detects it is supervised (gc exports
+  `GC_SERVICE_NAME` / `GC_SERVICE_URL_PREFIX`) it now exits immediately
+  with the remedy — install a new enough Go, or prebuild the binary —
+  instead of starting a fetch it cannot finish. Run by hand, where there
+  is no deadline, it still warns and lets Go fetch the toolchain. Under
+  `GOTOOLCHAIN=local`, which cannot fetch at all, it fails as before.
+
+  That refusal is scoped to an actual download, not to the version
+  numbers: an old `go` whose newer toolchain is already in the local
+  module cache builds without touching the network and converges like
+  any other warm rebuild, so refusing it would strand a host that heals
+  fine today. `run.sh` distinguishes the two by asking Go itself,
+  offline — a `GOPROXY=off go version` from the module directory, where
+  the toolchain switch happens — and only refuses when that probe says
+  the toolchain would have to be fetched.
 
 ### Changed
 
@@ -169,16 +204,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hits the same wall.
 - **Behavior change on upgrade:** the slack service now *exits 1 at
   startup* when `GC_SLACK_ADAPTER_ENV` is set to a path that does not
-  exist, where it previously logged one warning and started on the
-  ambient environment. Pointing the variable at a nonexistent path is
-  this pack's own established idiom for "no env file", so a unit file or
-  wrapper using it that way for the **service** will stop starting after
-  this pin bump. Audit before upgrading with
-  `grep -r GC_SLACK_ADAPTER_ENV` across your unit files and wrappers, and
-  either create the file or unset the variable to fall back to the
-  default. The strict rule is service-only: `slack_chat_*` commands
+  exist. Pointing the variable at a nonexistent path is this pack's own
+  established idiom for "no env file", so a unit file or wrapper using
+  it that way for the **service** will stop starting after this pin
+  bump. Audit before upgrading with `grep -r GC_SLACK_ADAPTER_ENV`
+  across your unit files and wrappers, and either create the file or
+  unset the variable to fall back to the default. The strict rule is
+  `run.sh`-only: `slack_chat_*` commands
   (`scripts/slack_intake_common.py`) still treat a missing path as "no
   env file".
+
+  What is new here is *which process* enforces this, not the rule
+  itself. `run.sh` has always exited 1 on a missing explicitly-named env
+  file — it exited 1 on a missing env file of any kind, see below — and
+  the adapter binary never read `GC_SLACK_ADAPTER_ENV` at all. Since the
+  old service command was the binary, the **service** never consulted an
+  env file before this release; it inherits the rule now that `run.sh`
+  is the service command.
+- **Hand-run `run.sh` no longer refuses to start without an env file.**
+  This is the one genuine loosening in this release, and it runs in the
+  opposite direction from the item above. Previously `run.sh` exited 1
+  whenever the env file was absent, *including* the default
+  `~/.config/gc-slack-adapter/env`. It now warns and continues in that
+  case, matching supervised deployments that legitimately inject the
+  environment another way and relying on the adapter's own fail-fast on
+  a missing required key. If you were using `run.sh`'s refusal as a
+  guard, note that it will now start on the ambient environment and can
+  reach a different Slack workspace than you intended; set
+  `GC_SLACK_ADAPTER_ENV` explicitly to keep a hard failure.
 - Renamed the pack directory from `slack-pack/` to `slack-full/` and the
   `pack.toml` name from `slack` to `slack-full` as part of the Slack pack
   tiering split (`gc-yrw`). This pack is now **Tier 3** of the Slack
