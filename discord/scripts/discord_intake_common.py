@@ -62,7 +62,10 @@ ROOM_LAUNCH_IDENTITY_RESOLVE_DELAY_SECONDS = 0.25
 ROOM_LAUNCH_READY_RESOLVE_TIMEOUT_SECONDS = 90.0
 ROOM_LAUNCH_READY_RESOLVE_DELAY_SECONDS = 0.5
 ROOM_LAUNCH_PRIMER_VERSION = 1
-AGENT_HANDLE_SEGMENT = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+# Dots are legal *inside* a segment (pack-qualified names like gasburger.mayor)
+# but never at the end: a mention that closes a sentence ("ask @@sky.") must
+# resolve to `sky`, not `sky.`.
+AGENT_HANDLE_SEGMENT = re.compile(r"^[a-z](?:[a-z0-9_.-]{0,30}[a-z0-9_-])?$")
 DISCORD_APP_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
@@ -3456,6 +3459,149 @@ def _normalize_agent_handle(handle: str) -> str:
     return normalized
 
 
+def resolve_existing_session_for_handle(handle: str) -> dict[str, str]:
+    """Attach-first launcher lookup: return the routable existing session
+    that matches `handle` by alias, session_name, or id. Case-insensitive.
+    Returns {} if none matches. This is what lets @@handle target an
+    already-running session instead of spawning a new one from a template.
+
+    Also matches the pack-qualified aliases the platform stores for named
+    sessions, via the shared _alias_matches_qualified_handle policy: typing
+    @@daytripper/fattony matches a stored daytripper/gasburger.fattony, and
+    the city-scope @@emma matches a stored employees.emma. Neither shape
+    crosses a scope — a bare tail cannot reach into a rig, and a
+    rig-qualified handle cannot leave its own rig.
+    """
+    normalized = str(handle).strip()
+    if not normalized:
+        return {}
+    key = normalized.lower()
+    alias_match: dict[str, Any] | None = None
+    name_match: dict[str, Any] | None = None
+    id_match: dict[str, Any] | None = None
+    tail_alias_match: dict[str, Any] | None = None
+    try:
+        sessions = list_city_sessions(state="all")
+    except GCAPIError:
+        # Attach lookup is best-effort; if the API is unreachable, fall
+        # through to template resolution rather than blocking the launcher.
+        return {}
+    for item in sessions:
+        if not session_record_routable(item):
+            continue
+        alias = str(item.get("alias", "")).strip().lower()
+        session_name = str(item.get("session_name", "")).strip().lower()
+        session_id = str(item.get("id", "")).strip().lower()
+        if alias == key and (
+            alias_match is None or _session_record_preference(item) > _session_record_preference(alias_match)
+        ):
+            alias_match = item
+        if session_name == key and (
+            name_match is None or _session_record_preference(item) > _session_record_preference(name_match)
+        ):
+            name_match = item
+        if session_id == key and (
+            id_match is None or _session_record_preference(item) > _session_record_preference(id_match)
+        ):
+            id_match = item
+        if alias and _alias_matches_qualified_handle(alias, key) and (
+            tail_alias_match is None or _session_record_preference(item) > _session_record_preference(tail_alias_match)
+        ):
+            tail_alias_match = item
+    chosen = alias_match or name_match or id_match or tail_alias_match
+    if not chosen:
+        return {}
+    return _session_identity_fields(chosen)
+
+
+def resolve_named_session_for_handle(handle: str) -> dict[str, str]:
+    """Named-session launcher lookup: is `handle` a declared but not-yet-
+    running named session? Returns {qualified_handle, template, alias,
+    scope, dir, spawn_template} that the caller can use to spawn via
+    create_agent_session. Returns {} on no match. Best-effort: swallows
+    errors reading city.toml so the launcher stays usable.
+
+    Handle matches are case-insensitive. For scope=rig entries the handle
+    is <dir>/<name>; for scope=city it is <name>. Declarations routinely
+    carry neither key, and gc fills both in: an omitted name leaves the
+    template itself as the public identity (config.go NamedSession.
+    IdentityName), so gastown.witness is addressed as @@<rig>/gastown.witness,
+    and a rig-scoped entry that omits dir declares one seat per configured
+    rig rather than a seat in a named rig, so it expands across city.toml's
+    rigs here the way gc expands it internally (config.go,
+    ExpandGenericRigNamedSessions).
+
+    spawn_template is the value to pass as create_agent_session(name=...):
+    rig-scoped templates are qualified with the rig prefix (dir/template)
+    so the platform resolves the correct rig-instance of the template.
+    """
+    normalized = str(handle).strip()
+    if not normalized:
+        return {}
+    key = normalized.lower()
+    try:
+        city_cfg = load_city_toml()
+    except (GCAPIError, OSError):
+        return {}
+    entries = city_cfg.get("named_session")
+    if not isinstance(entries, list):
+        return {}
+    rig_names = _city_rig_names(city_cfg)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        template = str(entry.get("template", "")).strip()
+        if not template:
+            continue
+        raw_name = str(entry.get("name", "")).strip()
+        scope = str(entry.get("scope", "")).strip().lower()
+        dir_name = str(entry.get("dir", "")).strip()
+        alias = raw_name or template.rsplit("/", 1)[-1]
+        if scope == "rig":
+            # A rig-scoped entry that names no dir declares a seat in every
+            # configured rig, so address it as <rig>/<name> for each of them.
+            # Falling back to city scope here would answer a bare @@name with
+            # an unqualified spawn template that resolves outside the rig the
+            # declaration asked for; with no rigs configured the seat simply
+            # has nowhere to live and stays unaddressable.
+            candidate_dirs = [dir_name] if dir_name else rig_names
+        else:
+            candidate_dirs = [""]
+        for candidate_dir in candidate_dirs:
+            if candidate_dir:
+                qualified = f"{candidate_dir}/{alias}".lower()
+                spawn_template = template if "/" in template else f"{candidate_dir}/{template}"
+            else:
+                qualified = alias.lower()
+                spawn_template = template
+            if qualified != key:
+                continue
+            return {
+                "qualified_handle": qualified,
+                "template": template,
+                "alias": alias,
+                "scope": scope,
+                "dir": candidate_dir,
+                "spawn_template": spawn_template,
+            }
+    return {}
+
+
+def _city_rig_names(city_cfg: dict[str, Any]) -> list[str]:
+    """Rig directory names declared in city.toml, in declaration order."""
+    rigs = city_cfg.get("rigs")
+    if not isinstance(rigs, list):
+        return []
+    names: list[str] = []
+    for rig in rigs:
+        if not isinstance(rig, dict):
+            continue
+        name = str(rig.get("name", "")).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def resolve_agent_handle(handle: str) -> tuple[str, str]:
     normalized = _normalize_agent_handle(handle)
     if not normalized:
@@ -3620,7 +3766,87 @@ def resolve_routable_session_identity_eventually(*selectors: str) -> dict[str, s
     return identity
 
 
-def resolve_routable_session_candidate_eventually(*selectors: str) -> tuple[str, dict[str, str]]:
+def resolve_routable_session_candidate_eventually(
+    *selectors: str,
+    suffix_template: str = "",
+    suffix_alias: str = "",
+    timeout: float | None = None,
+) -> tuple[str, dict[str, str]]:
+    candidates = _poll_candidates(selectors)
+    if not candidates and not str(suffix_alias).strip():
+        return "", {}
+    deadline = time.monotonic() + _poll_timeout(timeout, ROOM_LAUNCH_IDENTITY_RESOLVE_TIMEOUT_SECONDS)
+    while True:
+        sessions = list_city_sessions(state="all")
+        matched_selector, identity = resolve_routable_session_candidate_from_sessions(sessions, *candidates)
+        if identity:
+            return matched_selector, identity
+        # Same iteration, deliberately not a second deadline: when the
+        # platform stores the requested alias pack-prefixed, no exact
+        # candidate can ever match, so polling exact-only to exhaustion first
+        # would stall every such spawn for the full timeout while holding the
+        # launch advisory lock.
+        matched_selector, identity = _resolve_launched_session_by_suffix(
+            sessions, suffix_template, suffix_alias, ready=False,
+        )
+        if identity:
+            return matched_selector, identity
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "", {}
+        time.sleep(min(ROOM_LAUNCH_IDENTITY_RESOLVE_DELAY_SECONDS, remaining))
+
+
+def _find_launched_session_by_suffix(
+    sessions: list[dict[str, Any]],
+    qualified_handle: str,
+    requested_alias: str,
+) -> dict[str, Any] | None:
+    """Locate a session created via async /v0/sessions when the platform
+    prefixes the requested alias (e.g. pack namespace) so exact-alias match
+    fails. Uniqueness comes from the sha digest embedded in the requested
+    alias by room_launch_session_alias().
+    """
+    template = str(qualified_handle).strip()
+    alias_suffix = str(requested_alias).strip()
+    if not alias_suffix:
+        return None
+    best: dict[str, Any] | None = None
+    for item in sessions:
+        if template and str(item.get("template", "")).strip() != template:
+            continue
+        alias = str(item.get("alias", "")).strip()
+        if not alias:
+            continue
+        if alias == alias_suffix or alias.endswith("." + alias_suffix) or alias.endswith("-" + alias_suffix) or alias.endswith("/" + alias_suffix):
+            if best is None or _session_record_preference(item) > _session_record_preference(best):
+                best = item
+    return best
+
+
+def _resolve_launched_session_by_suffix(
+    sessions: list[dict[str, Any]],
+    qualified_handle: str,
+    requested_alias: str,
+    *,
+    ready: bool,
+) -> tuple[str, dict[str, str]]:
+    """One suffix-match attempt against an already-fetched session list."""
+    if not str(requested_alias).strip():
+        return "", {}
+    chosen = _find_launched_session_by_suffix(sessions, qualified_handle, requested_alias)
+    if not chosen:
+        return "", {}
+    if not (session_record_ready(chosen) if ready else session_record_routable(chosen)):
+        return "", {}
+    identity = _session_identity_fields(chosen)
+    selector = identity.get("session_name") or identity.get("session_id") or identity.get("alias") or ""
+    if not selector:
+        return "", {}
+    return selector, identity
+
+
+def _poll_candidates(selectors: tuple[str, ...]) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
     for selector in selectors:
@@ -3629,18 +3855,15 @@ def resolve_routable_session_candidate_eventually(*selectors: str) -> tuple[str,
             continue
         seen.add(normalized)
         candidates.append(normalized)
-    if not candidates:
-        return "", {}
-    deadline = time.monotonic() + ROOM_LAUNCH_IDENTITY_RESOLVE_TIMEOUT_SECONDS
-    while True:
-        sessions = list_city_sessions(state="all")
-        matched_selector, identity = resolve_routable_session_candidate_from_sessions(sessions, *candidates)
-        if identity:
-            return matched_selector, identity
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return "", {}
-        time.sleep(min(ROOM_LAUNCH_IDENTITY_RESOLVE_DELAY_SECONDS, remaining))
+    return candidates
+
+
+def _poll_timeout(override: float | None, default_seconds: float) -> float:
+    """Injectable poll deadline: callers (and tests) may pin the timeout,
+    otherwise the module default is read at call time."""
+    if override is None:
+        return float(default_seconds)
+    return max(0.0, float(override))
 
 
 def session_record_ready(item: dict[str, Any] | None) -> bool:
@@ -3694,21 +3917,26 @@ def resolve_ready_session_candidate_from_sessions(
     return "", {}
 
 
-def resolve_ready_session_candidate_eventually(*selectors: str) -> tuple[str, dict[str, str]]:
-    candidates: list[str] = []
-    seen: set[str] = set()
-    for selector in selectors:
-        normalized = str(selector).strip()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        candidates.append(normalized)
-    if not candidates:
+def resolve_ready_session_candidate_eventually(
+    *selectors: str,
+    suffix_template: str = "",
+    suffix_alias: str = "",
+    timeout: float | None = None,
+) -> tuple[str, dict[str, str]]:
+    candidates = _poll_candidates(selectors)
+    if not candidates and not str(suffix_alias).strip():
         return "", {}
-    deadline = time.monotonic() + ROOM_LAUNCH_READY_RESOLVE_TIMEOUT_SECONDS
+    deadline = time.monotonic() + _poll_timeout(timeout, ROOM_LAUNCH_READY_RESOLVE_TIMEOUT_SECONDS)
     while True:
         sessions = list_city_sessions(state="all")
         matched_selector, identity = resolve_ready_session_candidate_from_sessions(sessions, *candidates)
+        if identity:
+            return matched_selector, identity
+        # Folded into this iteration for the same reason as the identity
+        # poll above: a pack-prefixed alias is unreachable by exact match.
+        matched_selector, identity = _resolve_launched_session_by_suffix(
+            sessions, suffix_template, suffix_alias, ready=True,
+        )
         if identity:
             return matched_selector, identity
         remaining = deadline - time.monotonic()
@@ -3767,7 +3995,7 @@ def room_launch_session_alias(guild_id: str, conversation_id: str, root_message_
 
 
 def room_launch_thread_name(qualified_handle: str, source_display: str = "") -> str:
-    handle_label = str(qualified_handle).strip().rsplit("/", 1)[-1] or "agent"
+    handle_label = str(qualified_handle).strip() or "agent"
     display = " ".join(str(source_display).strip().split())
     if display:
         value = f"{handle_label} - {display}"
@@ -3952,12 +4180,47 @@ def _room_launch_participant_matches_session(participant: dict[str, Any], *, ses
     return False
 
 
+def _alias_matches_qualified_handle(alias: str, qualified_handle: str) -> bool:
+    """Does a platform-stored session alias name the seat `qualified_handle`?
+
+    The platform qualifies an explicitly requested alias with the binding it
+    resolves under, so the seat we asked to call `meltron` comes back stored
+    as `docbook/gasburger.meltron` for a rig-scoped binding and as
+    `gasburger.meltron` for a city-scoped one. Both shapes match here, and
+    neither crosses a scope: a rig-qualified handle only matches aliases
+    under the same rig, and a bare handle only matches bare aliases.
+
+    This is the single tail-match policy — the attach lookup
+    (resolve_existing_session_for_handle) and the publish-side re-pin share
+    it so a seat reachable by @@handle is also re-pinnable, and vice versa.
+    """
+    alias_key = str(alias).strip().lower()
+    handle_key = str(qualified_handle).strip().lower()
+    if not alias_key or not handle_key:
+        return False
+    if alias_key == handle_key:
+        return True
+    if ("/" in alias_key) != ("/" in handle_key):
+        return False
+    if "/" in handle_key:
+        alias_rig, alias_tail = alias_key.split("/", 1)
+        handle_rig, handle_tail = handle_key.split("/", 1)
+        if alias_rig != handle_rig:
+            return False
+    else:
+        alias_tail, handle_tail = alias_key, handle_key
+    return alias_tail == handle_tail or alias_tail.endswith("." + handle_tail)
+
+
 def ensure_room_launch_session_for_handle(
     launch: dict[str, Any],
     qualified_handle: str,
     *,
     title: str = "",
     initial_message: str = "",
+    attached_identity: dict[str, str] | None = None,
+    spawn_template_override: str = "",
+    session_alias_override: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     launch_id = str(launch.get("launch_id", "")).strip()
     normalized_handle = str(qualified_handle).strip()
@@ -3969,8 +4232,12 @@ def ensure_room_launch_session_for_handle(
         participants = room_launch_participants(current)
         participant = copy.deepcopy(participants.get(normalized_handle, {}))
         created_new = False
+        # For named-session launches the caller supplies a stable alias
+        # (e.g. "fattony") so subsequent @@handle turns attach to the same
+        # session instead of spawning a fresh per-launch clone.
         session_alias = (
             str(participant.get("session_alias", "")).strip()
+            or str(session_alias_override).strip()
             or room_launch_session_alias(
                 str(current.get("guild_id", "")).strip(),
                 str(current.get("conversation_id", "")).strip(),
@@ -3978,6 +4245,23 @@ def ensure_room_launch_session_for_handle(
                 normalized_handle,
             )
         )
+        spawn_target = str(spawn_template_override).strip() or normalized_handle
+        if attached_identity:
+            # Attach mode: participant is an already-running session; skip
+            # create + prime + poll. Trust the caller's resolved identity.
+            participant["session_alias"] = str(attached_identity.get("alias", "")).strip() or session_alias
+            participant["session_id"] = str(attached_identity.get("session_id", "")).strip()
+            participant["session_name"] = str(attached_identity.get("session_name", "")).strip()
+            participant["delivery_selector"] = (
+                str(participant.get("session_name", "")).strip()
+                or str(participant.get("session_id", "")).strip()
+                or str(participant.get("session_alias", "")).strip()
+            )
+            participant["qualified_handle"] = normalized_handle
+            participant["attached"] = True
+            current = _sync_launch_participant(current, normalized_handle, participant)
+            current = save_room_launch(current)
+            return current, copy.deepcopy(participant)
         existing = None
         if str(participant.get("session_name", "")).strip():
             existing_by_name = session_index_by_name(state="all").get(str(participant.get("session_name", "")).strip())
@@ -3987,14 +4271,27 @@ def ensure_room_launch_session_for_handle(
             existing_by_alias = session_index_by_alias(state="all").get(session_alias)
             if session_record_routable(existing_by_alias):
                 existing = existing_by_alias
+        repinned_identity: dict[str, str] = {}
+        if not session_record_routable(existing):
+            # The stored session identity no longer routes: the seat's old
+            # session retired and it woke as a new one. The qualified handle
+            # is the stable identity, so re-resolve it the same way a fresh
+            # @@mention would before spawning a replacement — the thread
+            # re-pins to the live session instead of going deaf or spawning
+            # a second body for an already-running seat.
+            repinned_identity = resolve_existing_session_for_handle(normalized_handle)
         if session_record_routable(existing):
             participant["session_alias"] = str(existing.get("alias", "")).strip() or session_alias
             participant["session_id"] = str(existing.get("id", "")).strip()
             participant["session_name"] = str(existing.get("session_name", "")).strip()
+        elif repinned_identity:
+            participant["session_alias"] = str(repinned_identity.get("alias", "")).strip() or session_alias
+            participant["session_id"] = str(repinned_identity.get("session_id", "")).strip()
+            participant["session_name"] = str(repinned_identity.get("session_name", "")).strip()
         else:
             created_new = True
             created = create_agent_session(
-                normalized_handle,
+                spawn_target,
                 alias=session_alias,
                 title=title or room_launch_thread_name(normalized_handle, str(current.get("from_display", "")).strip()),
                 initial_message=initial_message,
@@ -4021,11 +4318,18 @@ def ensure_room_launch_session_for_handle(
                 selector_snapshot = created_selector
                 hydrated = created_identity
         if created_new and not selector_snapshot:
+            # Async POST /v0/sessions returns no identity fields, and the
+            # platform may store the alias under a pack-namespace prefix
+            # (e.g. gasburger.dc-...). Each poll tries the exact selectors
+            # and then a suffix match keyed by the unique sha digest baked
+            # into session_alias (or by the supplied named-session alias).
             selector_snapshot, hydrated = resolve_routable_session_candidate_eventually(
                 participant.get("session_name", ""),
                 participant.get("delivery_selector", ""),
                 participant.get("session_alias", ""),
                 participant.get("session_id", ""),
+                suffix_template=spawn_target,
+                suffix_alias=session_alias,
             )
         if hydrated:
             participant["session_alias"] = str(hydrated.get("alias", "")).strip() or str(participant.get("session_alias", "")).strip()
@@ -4061,6 +4365,8 @@ def ensure_room_launch_session_for_handle(
                     participant.get("session_id", ""),
                     participant.get("session_alias", ""),
                     participant.get("delivery_selector", ""),
+                    suffix_template=spawn_target,
+                    suffix_alias=session_alias,
                 )
             if not ready_identity:
                 raise GCAPIError(f"created launch session is not ready yet: {participant['session_alias'] or normalized_handle}")
@@ -4097,6 +4403,9 @@ def ensure_room_launch_session(
     *,
     title: str = "",
     initial_message: str = "",
+    attached_identity: dict[str, str] | None = None,
+    spawn_template_override: str = "",
+    session_alias_override: str = "",
 ) -> dict[str, Any]:
     qualified_handle = str(launch.get("qualified_handle", "")).strip()
     current, _participant = ensure_room_launch_session_for_handle(
@@ -4104,8 +4413,64 @@ def ensure_room_launch_session(
         qualified_handle,
         title=title,
         initial_message=initial_message,
+        attached_identity=attached_identity,
+        spawn_template_override=spawn_template_override,
+        session_alias_override=session_alias_override,
     )
     return current
+
+
+def repin_room_launch_participant_for_session(
+    launch_id: str,
+    qualified_handle: str,
+    *,
+    session_name: str = "",
+    session_id: str = "",
+    session_alias: str = "",
+) -> dict[str, Any] | None:
+    """Re-pin a launch participant to a live session identity.
+
+    A seat's session retires and it wakes as a new one; the qualified handle
+    stays. When the seat publishes into its old launch thread, rebind the
+    stored participant entry to the publishing session so later deliveries
+    reach the live session instead of knocking on the retired one. Returns
+    the updated launch record, or None when nothing changed.
+    """
+    normalized_launch_id = str(launch_id).strip()
+    normalized_handle = str(qualified_handle).strip()
+    normalized_name = str(session_name).strip()
+    normalized_id = str(session_id).strip()
+    if not normalized_launch_id or not normalized_handle:
+        return None
+    if not normalized_name and not normalized_id:
+        return None
+    with advisory_lock(room_launch_lock_path(normalized_launch_id)):
+        current = load_room_launch(normalized_launch_id)
+        if not isinstance(current, dict):
+            return None
+        participant = room_launch_participant(current, normalized_handle)
+        if not participant:
+            return None
+        if _room_launch_participant_matches_session(
+            participant,
+            session_name=normalized_name,
+            session_id=normalized_id,
+        ):
+            return None
+        if normalized_name:
+            participant["session_name"] = normalized_name
+        if normalized_id:
+            participant["session_id"] = normalized_id
+        if str(session_alias).strip():
+            participant["session_alias"] = str(session_alias).strip()
+        participant["delivery_selector"] = (
+            str(participant.get("session_name", "")).strip()
+            or str(participant.get("session_id", "")).strip()
+            or str(participant.get("session_alias", "")).strip()
+        )
+        participant["qualified_handle"] = normalized_handle
+        current = _sync_launch_participant(current, normalized_handle, participant)
+        return save_room_launch(current)
 
 
 def create_thread_from_message(parent_channel_id: str, source_message_id: str, name: str) -> dict[str, Any]:
@@ -4240,11 +4605,16 @@ def extract_agent_handles(body: str) -> list[str]:
             start = j
             while j < len(text):
                 lower = text[j].lower()
-                if ("a" <= lower <= "z") or text[j].isdigit() or text[j] in {"_", "-"}:
+                if ("a" <= lower <= "z") or text[j].isdigit() or text[j] in {"_", "-", "."}:
                     j += 1
                     continue
                 break
-            part = text[start:j]
+            # The scan set carries "." so pack-qualified segments
+            # (gasburger.mayor) survive, but sentence punctuation must not:
+            # "ask @@sky." names the seat `sky`, not `sky.`. Trailing dots are
+            # dropped here rather than terminating the scan so a mention
+            # followed by an ellipsis still resolves.
+            part = text[start:j].rstrip(".")
             if not part:
                 break
             parts.append(part)
@@ -5540,11 +5910,50 @@ def publish_binding_message(
         or str(resolved_source_identity.get("session_id", "")).strip()
         or str(os.environ.get("GC_SESSION_ID", "")).strip()
     )
+    launch_record = launch
+    if launch_record is None and str(source_meta.get("launch_id", "")).strip():
+        launch_record = load_room_launch(str(source_meta.get("launch_id", "")).strip())
     effective_source_qualified_handle = room_launch_participant_handle_for_session(
-        launch or {},
+        launch_record or {},
         session_name=effective_source_session_name,
         session_id=effective_source_session_id,
     )
+    effective_source_alias = str(resolved_source_identity.get("alias", "")).strip()
+    if not effective_source_qualified_handle and launch_record:
+        # The stored participant entries may pin a retired session; match the
+        # publishing session to its participant by alias instead (a seat's
+        # alias is its qualified handle) so the publish can re-pin below.
+        if not effective_source_alias:
+            env_session_id = str(os.environ.get("GC_SESSION_ID", "")).strip()
+            env_session_name = str(os.environ.get("GC_SESSION_NAME", "")).strip()
+            if (effective_source_session_id and effective_source_session_id == env_session_id) or (
+                effective_source_session_name and effective_source_session_name == env_session_name
+            ):
+                effective_source_alias = str(os.environ.get("GC_ALIAS", "")).strip()
+        if not effective_source_alias and (effective_source_session_id or effective_source_session_name):
+            try:
+                effective_source_alias = str(
+                    resolve_session_identity(
+                        effective_source_session_id or effective_source_session_name
+                    ).get("alias", "")
+                ).strip()
+            except GCAPIError:
+                effective_source_alias = ""
+        if effective_source_alias:
+            for handle in room_launch_participants(launch_record):
+                if _alias_matches_qualified_handle(effective_source_alias, handle):
+                    effective_source_qualified_handle = str(handle).strip()
+                    break
+    if effective_source_qualified_handle and launch_record:
+        repinned = repin_room_launch_participant_for_session(
+            str(launch_record.get("launch_id", "")).strip() or str(source_meta.get("launch_id", "")).strip(),
+            effective_source_qualified_handle,
+            session_name=effective_source_session_name,
+            session_id=effective_source_session_id,
+            session_alias=effective_source_alias,
+        )
+        if repinned:
+            launch_record = repinned
     record = save_chat_publish(
         {
             "binding_id": str(binding.get("id", "")).strip(),
@@ -5561,14 +5970,11 @@ def publish_binding_message(
             "source_event_kind": source_meta.get("source_event_kind", ""),
             "root_ingress_receipt_id": source_meta.get("root_ingress_receipt_id", ""),
             "launch_id": source_meta.get("launch_id", ""),
-            "launch_thread_id": str((launch or {}).get("thread_id", "")).strip(),
+            "launch_thread_id": str((launch_record or {}).get("thread_id", "")).strip(),
             "body": body,
             "remote_message_id": remote_message_id,
         }
     )
-    launch_record = launch
-    if launch_record is None and str(source_meta.get("launch_id", "")).strip():
-        launch_record = load_room_launch(str(source_meta.get("launch_id", "")).strip())
     launch_thread_id = str((launch_record or {}).get("thread_id", "")).strip()
     launch_record_id = str((launch_record or {}).get("launch_id", "")).strip() or str(source_meta.get("launch_id", "")).strip()
     if launch_record_id and launch_thread_id and conversation_id == launch_thread_id:
