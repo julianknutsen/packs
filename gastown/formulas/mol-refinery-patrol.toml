@@ -233,9 +233,13 @@ gc workflow delete-source $WORK --apply && gc workflow reopen-source $WORK
 gc bd update $WORK \
   --status=open \
   --assignee="" \
+  --unset-metadata handoff_stage \
   --set-metadata rejection_reason="Conflicts with $TARGET at $(git rev-parse origin/$TARGET)" \
   --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
 ```
+Clearing `handoff_stage` is required, not cosmetic: rejection invalidates the
+polecat's "submit completed" marker, and leaving it set would let the witness's
+Step 3a hand this already-rejected tip straight back here on the next crash.
 4. Do NOT delete the branch (new polecat needs it for conflict resolution).
 5. Clean up temp branch: `git checkout {{target_branch}} && git branch -D temp`
 6. Pour next patrol iteration before burning:
@@ -334,9 +338,13 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      gc bd update $WORK \
        --status=open \
        --assignee="" \
+       --unset-metadata handoff_stage \
        --set-metadata rejection_reason="<failure summary>" \
        --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
      ```
+     `handoff_stage` must be cleared here too: this path also deletes the
+     remote branch, so a stale marker would point the witness's Step 3a at
+     work that no longer exists on origin.
    - Delete branch: `git push origin --delete $BRANCH`
    - Clean up: `git checkout "$TARGET" && git branch -D temp`
    - Pour next patrol iteration before burning:

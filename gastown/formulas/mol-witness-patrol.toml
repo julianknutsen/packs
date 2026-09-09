@@ -341,7 +341,98 @@ gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
 ```
 - Clean up worktree and skip to Step 4.
 
-If the work is NOT on main, proceed with reset:
+If the work is NOT on main, check for a completed-but-unhanded-off submit
+before resetting to pool:
+
+**Step 3a: Was this bead already handed off to the refinery step, just not
+reassigned?** (gastownhall/gascity-packs#276)
+
+`submit-and-exit` records `handoff_stage=target_recorded` in its step 5, then
+reassigns the bead to the refinery in step 6 — two separate,
+independently-interruptible `gc bd update` calls. A polecat killed in that
+exact window (pool reclaim, host restart, context exhaustion) has already
+pushed the branch, run its final clean-state check, and recorded the stage
+marker; the only thing it never did was the reassignment itself. Resetting a
+bead in this state to pool is safe (no data is lost — `workspace-setup`'s
+rejection-aware resume picks the existing branch back up) but wasteful and
+confusing: a fresh polecat spins up just to re-run branch-shape/clean-state
+checks and a no-op push before reaching the same step 6 the witness can
+complete directly, right now, with the information already on hand.
+
+```bash
+HANDOFF_STAGE=$(echo "$META" | jq -r '.handoff_stage // empty')
+BEAD_TARGET=$(echo "$META" | jq -r '.target // empty')
+BRANCH_ON_ORIGIN=""
+# Query the fully-qualified ref. ls-remote patterns match ref *tails*, so the
+# bare "$BRANCH" form stays truthy for a branch that is NOT on origin whenever
+# a tail-colliding ref outlives it (say an archive/polecat/<id> convention):
+# measured on git 2.43, deleting refs/heads/polecat/tst-1 still returns
+# refs/heads/nested/polecat/tst-1 for the pattern, and 0 lines for the
+# refs/heads/ form. Keep the -n guard too: an unset BRANCH must never be
+# mistaken for a live branch.
+[ -n "$BRANCH" ] && BRANCH_ON_ORIGIN=$(git ls-remote --heads origin "refs/heads/$BRANCH" 2>/dev/null)
+```
+
+Key this recovery on `handoff_stage`, **not** on `metadata.target`. `target`
+is not a completion signal: `gc sling` accepts it as a documented mint-time
+input (`mol-polecat-work.toml` workspace-setup resolves `base_branch` from
+`metadata.target` first), nothing in the tree ever unsets it, and it survives
+both `mol-refinery-patrol` rejection paths — so beads that never reached step 5
+already carry it, and keying on it hands already-rejected or never-submitted
+work back to a refinery whose only merge gate is tests-pass.
+`handoff_stage=target_recorded` is written in exactly one place
+(`submit-and-exit` step 5) and cleared in three (`workspace-setup` on every
+fresh attempt, and both refinery rejection paths), so its presence means this
+bead genuinely completed step 5 and nothing has since invalidated that. The
+branch-on-origin conjunct is a fail-closed backstop: there is nothing to hand
+off if the refinery's `--has-metadata-key=branch` query cannot see the work.
+
+```bash
+if [ "$HANDOFF_STAGE" = "target_recorded" ] && [ -n "$BRANCH_ON_ORIGIN" ]; then
+  REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+  # --force: this is a cross-actor write against the dead polecat's live
+  # in_progress claim, which bd refuses without it (the same claim guard
+  # Step 3's close cites, gastownhall/beads#3734). Step 6 needs no --force
+  # only because the polecat runs it as the bead's own actor.
+  if gc bd update <bead> --status=open --assignee="$REFINERY_TARGET" \
+       --set-metadata gc.routed_to="" --force; then
+    # Close the crashed polecat's workflow subtree, as Step 3b does. Only the
+    # delete-source half: reopen-source would clear the assignee just set.
+    # Ordered after the reassignment so the failure arm mutates nothing, and
+    # before the wake/nudge so the refinery is never signalled mid-cleanup.
+    # Best-effort, like the wake/nudge below: the reassignment has already
+    # succeeded by the time this runs, so a failure here leaves inert step
+    # beads behind, never an unhandled handoff, and the mail stays truthful.
+    gc workflow delete-source <bead> --apply || true
+    gc mail send mayor/ -s "ORPHAN_HANDED_OFF: <bead> completed submit, missing only reassignment" \
+      -m "Branch $BRANCH is on origin and handoff_stage=target_recorded was already set (target=$BEAD_TARGET) -- the crashed polecat had finished submit-and-exit through step 5. Completed step 6 (reassign to refinery) instead of resetting to pool."
+    # Wake before nudge, exactly as submit-and-exit step 7: the refinery is
+    # an on_demand session with a 2h idle timeout, and nudge alone leaves a
+    # stopped one asleep with the handoff unprocessed.
+    gc session wake "$REFINERY_TARGET" || true
+    gc session nudge "$REFINERY_TARGET" "Run 'gc prime' to check merge queue and begin processing." || true
+    # Worktree is disposable, same reasoning as Step 3b:
+    cd <rig-root>
+    git worktree remove <worktree-path> --force 2>/dev/null
+    rm -rf <worktree-path> 2>/dev/null  # Fallback
+    git worktree prune
+    # Skip to Step 4 -- do NOT fall through to Step 3b's pool reset.
+  else
+    # The reassignment did not happen, and nothing above it mutated anything.
+    # Never mail ORPHAN_HANDED_OFF and never remove the worktree on this path:
+    # claiming a handoff that failed would strand the bead in_progress under a
+    # dead assignee with its worktree gone, and the next patrol would
+    # re-orphan it every cycle. Fall through to Step 3b, which sees exactly
+    # the state it would have seen without Step 3a, and recovers to pool.
+    echo "Step 3a: reassignment of <bead> failed; falling through to Step 3b."
+  fi
+fi
+```
+
+If `handoff_stage` is unset or the branch is not on origin, fall through to
+Step 3b: the crash landed earlier than step 5, the bead was deliberately left
+branch-ready by an `auto_push=false` halt (which never writes the marker), or
+a rejection cleared it — and pool reset is the correct recovery.
 
 **Step 3b: Clean up worktree and return bead to pool.**
 

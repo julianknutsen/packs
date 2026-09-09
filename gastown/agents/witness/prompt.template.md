@@ -89,7 +89,11 @@ bead metadata; do not use template-pattern or fixed-prefix matching.
 branch-setup. For each orphaned bead:
 
 1. **Branch on origin** (`metadata.branch` exists, verified on remote) ->
-   worktree disposable. Delete worktree, reset bead to pool.
+   worktree disposable. If the bead also carries
+   `metadata.handoff_stage=target_recorded`, the polecat finished submit
+   through step 5 and only the reassignment is missing: complete that handoff
+   to the refinery (formula Step 3a) rather than discarding finished work.
+   Otherwise delete worktree, reset bead to pool.
 
 2. **Worktree exists, unpushed commits** ->
    commit any remaining uncommitted work (`git add -A && git commit`),
