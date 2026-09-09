@@ -261,20 +261,50 @@ contradictory record on the bead.
 `metadata.merge_strategy` controls the terminal handoff:
 
 - `direct` — merge to target and push normally
-- `mr` / `pr` — push the rebased source branch and create or update a GitHub PR
+- `mr` / `pr` — push the rebased source branch and create or update a
+  pull/merge request on the rig's forge
 
 In `mr` mode, this pack treats PR creation as the terminal handoff for the
 direct-bead workflow. Record `pr_url` on the work bead, close the bead, and
 leave the source branch intact for the PR lifecycle.
 
-In `mr` / `pr` mode, if `metadata.existing_pr` is set, reuse that PR URL.
-Do not call `gh pr create` for the work bead. Before pushing or closing
-the bead, verify `gh pr view` reports an open same-repository PR whose
-`headRefName` equals `metadata.branch` and whose `baseRefName` equals
-`metadata.target`; then record the canonical PR URL as `pr_url` and close
-the bead when the branch has been pushed. If validation fails, record a
-durable blocked reason on the bead and escalate to mayor instead of
-closing the work.
+### Select the forge first
+
+`mr` mode is not GitHub-only. Before any PR command, resolve the forge from
+the remote — a GitLab rig has no `gh`, and running it there fails the handoff:
+
+```bash
+FORGE_HOST=$(git remote get-url origin | sed -E 's#^[a-z]+://##; s#^[^@]+@##; s#[:/].*$##')
+case "$FORGE_HOST" in
+  github.com) FORGE=gh ;;
+  *gitlab*)   FORGE=glab ;;   # self-managed GitLab included
+  *) echo "unknown forge $FORGE_HOST"; exit 1 ;;   # escalate, do not guess
+esac
+```
+
+If the forge cannot be determined, or its CLI is not installed and
+authenticated, record a durable blocked reason on the bead and escalate to
+mayor. Never fall back to `direct` — that lands unreviewed work on the target
+branch, which is exactly what `mr` mode exists to prevent.
+
+Self-managed GitLab needs `GITLAB_HOST` exported (for example
+`GITLAB_HOST=gitlab.example.com`) before `glab` will target the right instance.
+
+### Create and verify
+
+In `mr` / `pr` mode, if `metadata.existing_pr` is set, reuse that PR URL and do
+not create a new one. Before pushing or closing the bead, verify the request
+exists, is open, targets the **same repository**, and that its source branch
+equals `metadata.branch` and its target branch equals `metadata.target`:
+
+| | GitHub (`gh`) | GitLab (`glab`) |
+|---|---|---|
+| create | `gh pr create --head "$BRANCH" --base "$TARGET" --fill` | `glab mr create --source-branch "$BRANCH" --target-branch "$TARGET" --fill --yes` |
+| verify | `gh pr view "$BRANCH" --json headRefName,baseRefName,state,url` | `glab mr view "$BRANCH" --output json` (`source_branch`, `target_branch`, `state`, `web_url`) |
+
+Then record the canonical URL as `pr_url` and close the bead once the branch has
+been pushed. If validation fails, record a durable blocked reason on the bead and
+escalate to mayor instead of closing the work.
 
 **GitHub-specific today.** `gh pr view`/`gh pr create` require a
 GitHub-hosted origin. Non-GitHub hosts (e.g. Azure DevOps Repos) are
