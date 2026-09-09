@@ -221,7 +221,7 @@ MODE_VAR_DEFAULTS = {
     "github-pr-review": {"interaction_mode": "interactive", "review_mode": "report"},
 }
 
-BUILD_ARTIFACT_CHECK_SCRIPT = ".gc/scripts/checks/build-artifact-valid.sh"
+BUILD_ARTIFACT_CHECK_SCRIPT = "../assets/scripts/checks/build-artifact-valid.sh"
 
 # One produce attempt plus two bounded schema-repair attempts per artifact stage.
 BUILD_ARTIFACT_GATE_MAX_ATTEMPTS = 3
@@ -3481,6 +3481,15 @@ class FormulaAssetTests(unittest.TestCase):
         for name in FORMULAS:
             with self.subTest(formula=name):
                 self.assertNotIn("gc.source_bead_id", effective_formula_text(root, name))
+
+    def test_formula_check_paths_use_pack_assets(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        formulas_dir = root / "formulas"
+
+        for name in FORMULAS:
+            text = (formulas_dir / f"{name}.formula.toml").read_text(encoding="utf-8")
+            with self.subTest(formula=name):
+                self.assertNotIn('path = ".gc/scripts/checks/', text)
 
     def test_formula_node_descriptions_delegate_to_shadowable_assets(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]

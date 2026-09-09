@@ -34,7 +34,7 @@ max_attempts = 8
 
 [template.check.check]
 mode = "exec"
-path = ".gc/scripts/checks/design-review-approved.sh"
+path = "../assets/scripts/checks/design-review-approved.sh"
 timeout = "10m"
 
 [[template.children]]
