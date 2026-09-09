@@ -24,10 +24,11 @@
 #   * One path, serialized. Every run on a repository takes the lock
 #     <git common dir>/worker-worktree.lock (mkdir) before it reads or changes
 #     anything and releases it on exit. A stale lock (owner dead or a zombie, or
-#     no owner published for two minutes) is reclaimed by an atomic rename, so
-#     two contenders cannot both clear it and a live lock is never removed. Two
-#     sessions preparing lanes at once therefore cannot race on branch
-#     creation, on the same lane, or on the aside destination.
+#     no owner published for two minutes) is cleared only under a second,
+#     atomic reclaim lock and only after re-checking it is still the same stale
+#     lock, so two contenders cannot both clear it and a live lock is never
+#     removed. Two sessions preparing lanes at once therefore cannot race on
+#     branch creation, on the same lane, or on the aside destination.
 #   * The work dir is resolved on the real filesystem: it must exist, or its
 #     parent must exist and its last component must be a plain name (no `.`,
 #     `..`, or deeper missing levels). Symlinks resolve. The rig root itself,
@@ -52,9 +53,9 @@
 #     Create your own branch in this work dir before committing.
 #   * No bead: the work dir is detached at --base, whatever branch it was on
 #     (the branch itself is kept; nothing is deleted).
-#   * Idempotent. Re-running on a work dir that is already on the right branch
-#     changes nothing (besides the fetch). The result is verified before the
-#     script reports success.
+#   * Idempotent for a clean work dir already on the requested branch (or
+#     detached at the requested commit): re-running changes nothing besides
+#     the fetch. The result is verified before the script reports success.
 #   * On success prints one line: WORKTREE <dir> <branch|detached> <head sha>.
 
 set -eu
@@ -142,11 +143,14 @@ git_rig() { git -C "$RIG_ROOT" "$@"; }
 
 # --- lock: one run per repository at a time -----------------------------------------
 # mkdir is the atomic acquire. A stale lock (owner pid dead or a zombie, or no
-# owner published for over two minutes) is reclaimed by RENAMING it to a
-# private name first: rename is atomic, so of two contenders that both saw the
-# same stale lock only one succeeds and only that one removes what it renamed;
-# the other's rename fails and it simply retries mkdir. Nothing ever removes a
-# lock in place, so a live lock cannot be deleted by a late contender.
+# owner published for over two minutes) is cleared only by the contender that
+# wins a second mkdir, the reclaim lock, and only after it re-reads the lock
+# and finds it still stale: a contender that observed the stale lock, lost the
+# race, and arrives late finds a live owner (or no lock) under the reclaim lock
+# and does nothing. So a live lock is never removed by a late contender. A
+# reclaim lock left by a crash ages out after two minutes. Test-only pauses
+# (WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM / _AFTER_ACQUIRE, seconds) exist so
+# the two-contender interleavings can be exercised deterministically.
 
 LOCK="$RIG_COMMON/worker-worktree.lock"
 LOCKED=0
@@ -158,24 +162,41 @@ release_lock() {
     fi
 }
 
+# lock_is_stale: the lock at $LOCK has a dead/zombie owner, or no owner for
+# over two minutes (a run died between mkdir and the pid write; a live run
+# publishes within milliseconds). Sets `owner`.
 lock_is_stale() {
+    [ -d "$LOCK" ] || return 1
     owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
     if [ -n "$owner" ]; then
         ! kill -0 "$owner" 2>/dev/null || owner_is_zombie "$owner"
     else
-        # No owner published: a run died between mkdir and the pid write. Age it
-        # out rather than trusting the gap (a live run publishes within ms).
         [ -n "$(find "$LOCK" -maxdepth 0 -mmin +2 2>/dev/null)" ]
     fi
 }
 
+RECLAIM="$LOCK.reclaim"
+# reclaim_stale_lock: clear $LOCK if, under the reclaim lock, it is still stale.
+# Returns 0 when something was cleared, 1 otherwise (lost the reclaim race, the
+# lock turned out live or gone, or the reclaim lock itself is stuck).
 reclaim_stale_lock() {
-    claimed="$LOCK.stale.$$"
-    if mv "$LOCK" "$claimed" 2>/dev/null; then
-        warn "clearing stale lock $LOCK (owner pid ${owner:-none})"
-        rm -f "$claimed/pid" 2>/dev/null || true
-        rmdir "$claimed" 2>/dev/null || true
+    if ! mkdir "$RECLAIM" 2>/dev/null; then
+        # Someone else is reclaiming; a reclaim lock older than two minutes is a
+        # crash residue and is removed so the next pass can proceed.
+        if [ -n "$(find "$RECLAIM" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
+            rmdir "$RECLAIM" 2>/dev/null || true
+        fi
+        return 1
     fi
+    [ -z "${WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM:-}" ] || sleep "$WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM"
+    cleared=1
+    if lock_is_stale; then
+        warn "clearing stale lock $LOCK (owner pid ${owner:-none})"
+        rm -f "$LOCK/pid" 2>/dev/null || true
+        rmdir "$LOCK" 2>/dev/null && cleared=0
+    fi
+    rmdir "$RECLAIM" 2>/dev/null || true
+    return "$cleared"
 }
 trap 'release_lock' EXIT
 trap 'release_lock; exit 129' HUP
@@ -194,12 +215,13 @@ while :; do
     if mkdir "$LOCK" 2>/dev/null; then
         LOCKED=1
         printf '%s\n' "$$" > "$LOCK/pid"
+        [ -z "${WORKER_WORKTREE_TEST_PAUSE_AFTER_ACQUIRE:-}" ] || sleep "$WORKER_WORKTREE_TEST_PAUSE_AFTER_ACQUIRE"
         break
     fi
-    if lock_is_stale; then
-        reclaim_stale_lock
+    if lock_is_stale && reclaim_stale_lock; then
         continue
     fi
+    # Live lock, or a reclaim that did not clear anything: bounded wait.
     [ "$waited" -lt "$LOCK_WAIT" ] || die "another worker-worktree run (pid ${owner:-unknown}) has held $LOCK for ${LOCK_WAIT}s"
     [ "$waited" -gt 0 ] || log "waiting for another run on this repository (pid ${owner:-unknown})"
     sleep 1
@@ -241,7 +263,10 @@ bead_branches() {
     {
         git_rig for-each-ref --format='%(refname:short)' refs/heads
         git_rig for-each-ref --format='%(refname:short)' "refs/remotes/$REMOTE" \
-            | grep -v "^$REMOTE/HEAD\$" | sed "s|^$REMOTE/||"
+            | while IFS= read -r ref; do
+                [ "$ref" != "$REMOTE/HEAD" ] || continue
+                printf '%s\n' "${ref#"$REMOTE/"}"
+            done
     } | grep -E -- "(^|[^A-Za-z0-9])${id_re}([^A-Za-z0-9]|\$)" | sort -u || true
 }
 

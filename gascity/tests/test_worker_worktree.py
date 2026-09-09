@@ -71,6 +71,11 @@ class Fixture:
         git(scratch, "push", "--quiet", "origin", name)
         return sha
 
+    def push_branch_on(self, remote: str, name: str, filename: str) -> str:
+        sha = self.push_branch(name, filename)
+        git(self.rig, "fetch", "--quiet", remote)
+        return sha
+
     def run(self, workdir: pathlib.Path, bead: str | None, *extra: str, check: bool = True, mkdir: bool = True, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         env = {
             **os.environ,
@@ -430,6 +435,68 @@ class WorkerWorktreeTests(unittest.TestCase):
         self.assertEqual(self.branch_of(self.lane), "gp-abc1")
         self.assertFalse(self.lock_dir().exists())
         self.assertEqual(sorted(self.fx.rig.joinpath(".git").glob("worker-worktree.lock*")), [])
+
+    def test_two_contenders_reclaiming_one_stale_lock_do_not_run_concurrently(self) -> None:
+        """B sees the stale lock and pauses inside its reclaim; A reclaims, acquires
+        and holds; B must find A's live lock under re-check and wait, not clear it."""
+        self.lock_dir().mkdir()
+        (self.lock_dir() / "pid").write_text("999999\n", encoding="utf-8")
+        lane_a = self.fx.city / "lane-a"
+        lane_b = self.fx.city / "lane-b"
+        for lane in (lane_a, lane_b):
+            lane.mkdir(parents=True)
+        base_env = {**os.environ, "GC_RIG_ROOT": str(self.fx.rig), "WORKER_WORKTREE_LOCK_WAIT": "20"}
+        base_env.pop("GC_TRIGGER_BEAD_ID", None)
+        b = subprocess.Popen(
+            ["sh", str(SCRIPT), "--no-fetch", "--bead", "gp-bbb1"],
+            cwd=str(lane_b), env={**base_env, "GC_DIR": str(lane_b), "WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM": "3"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        time.sleep(0.7)
+        a_started = time.monotonic()
+        a = subprocess.run(
+            ["sh", str(SCRIPT), "--no-fetch", "--bead", "gp-aaa1"],
+            cwd=str(lane_a), env={**base_env, "GC_DIR": str(lane_a), "WORKER_WORKTREE_TEST_PAUSE_AFTER_ACQUIRE": "4"},
+            capture_output=True, text=True,
+        )
+        a_finished = time.monotonic()
+        b_out, b_err = b.communicate(timeout=60)
+        b_finished = time.monotonic()
+        self.assertEqual(a.returncode, 0, a.stderr)
+        self.assertEqual(b.returncode, 0, b_err)
+        # Exactly one contender cleared the stale lock, both prepared their lanes,
+        # and B (paused inside its reclaim while A acquired and held) finished
+        # only after A released: it found A's live lock under re-check and waited.
+        cleared = (a.stderr + b_err).count("clearing stale lock")
+        self.assertEqual(cleared, 1, a.stderr + b_err)
+        self.assertGreaterEqual(b_finished, a_finished)
+        self.assertEqual(self.branch_of(lane_a), "gp-aaa1")
+        self.assertEqual(self.branch_of(lane_b), "gp-bbb1")
+        self.assertFalse(self.lock_dir().exists())
+        self.assertFalse((self.fx.rig / ".git" / "worker-worktree.lock.reclaim").exists())
+        self.assertGreater(a_finished - a_started, 3.5)  # A really held the lock
+
+    def test_stuck_reclaim_lock_bounds_the_wait_and_ages_out(self) -> None:
+        self.lock_dir().mkdir()
+        (self.lock_dir() / "pid").write_text("999999\n", encoding="utf-8")
+        reclaim = self.fx.rig / ".git" / "worker-worktree.lock.reclaim"
+        reclaim.mkdir()
+        proc = self.fx.run(self.lane, "gp-abc1", check=False, env_extra={"WORKER_WORKTREE_LOCK_WAIT": "2"})
+        self.assertNotEqual(proc.returncode, 0)  # bounded, not an infinite loop
+        self.assertIn("has held", proc.stderr)
+        os.utime(reclaim, (time.time() - 300, time.time() - 300))
+        proc = self.fx.run(self.lane, "gp-abc1")
+        self.assertIn("clearing stale lock", proc.stderr)
+        self.assertEqual(self.branch_of(self.lane), "gp-abc1")
+        self.assertFalse(reclaim.exists())
+
+    def test_remote_name_with_metacharacters_still_matches_remote_bead_branches(self) -> None:
+        git(self.fx.rig, "remote", "rename", "origin", "team|origin")
+        git(self.fx.rig, "remote", "set-head", "team|origin", "main")
+        sha = self.fx.push_branch_on("team|origin", "fix/gp-meta1-x", "m.txt")
+        self.fx.run(self.lane, "gp-meta1", "--remote", "team|origin")
+        self.assertEqual(self.branch_of(self.lane), "fix/gp-meta1-x")
+        self.assertEqual(git(self.lane, "rev-parse", "HEAD"), sha)
 
     # --- refusals ----------------------------------------------------------------------------
 
