@@ -3641,6 +3641,12 @@ class FormulaAssetTests(unittest.TestCase):
 
         close_source = node_description(root, steps["close-source-anchor"])
         for fragment in (
+            "gc.root_bead_id",
+            "gc.source_anchor_id",
+            "DO NOT re-derive",
+            "FALLBACK — only if the root has NO `gc.source_anchor_id`",
+            "gc.synthetic_kind=drain-unit-convoy",
+            "gc.drain_member_id",
             "Read `work_dir` from the source anchor",
             "close only `<source-anchor-id>`",
             "handle both an object and a",
@@ -3654,6 +3660,28 @@ class FormulaAssetTests(unittest.TestCase):
             "Do not close this step with pass while the source anchor remains open",
         ):
             with self.subTest(step="close-source-anchor", fragment=fragment):
+                self.assertIn(fragment, close_source)
+
+    def test_pack_close_source_anchor_overrides_read_root_stamped_anchor(self) -> None:
+        gascity_root = pathlib.Path(__file__).resolve().parents[1]
+        pack_root = gascity_root.parent / "superpowers"
+
+        resolved = resolve_formula_from_dirs(
+            [gascity_root / "formulas", pack_root / "formulas"],
+            "superpowers-development",
+        )
+        steps = {step["id"]: step for step in resolved["steps"]}
+        close_source = node_description(pack_root, steps["close-source-anchor"])
+        for fragment in (
+            "gc.root_bead_id",
+            "gc.source_anchor_id",
+            "DO NOT re-derive",
+            "FALLBACK — only if the root has NO `gc.source_anchor_id`",
+            "gc.synthetic_kind=drain-unit-convoy",
+            "gc.drain_member_id",
+            "close only the source anchor with `gc.outcome=pass`",
+        ):
+            with self.subTest(pack="superpowers", fragment=fragment):
                 self.assertIn(fragment, close_source)
 
     def test_wrapper_formulas_route_role_agents(self) -> None:
