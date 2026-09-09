@@ -394,19 +394,45 @@ TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_bran
      ```
    - Close this step after the current wisp is burned.
 
-3. If pre-existing on target:
-   - Check for duplicates first:
+3. If you judge it pre-existing on target: PROVE IT before acting on that
+   judgment. "Pre-existing" is not something you get to assert — it is
+   something you must reproduce.
+   - Re-run the SAME failing check against $TARGET itself (not the rebased
+     `temp` branch), at the exact commit this branch would merge onto. Prefer
+     the full gate command (`{{test_command}}`) over a hand-picked subset, so
+     the comparison is apples-to-apples:
+     ```bash
+     TARGET_SHA=$(git rev-parse origin/$TARGET)
+     git checkout "$TARGET_SHA"
+     {{test_command}}
+     TARGET_RESULT=$?
+     git checkout temp
+     ```
+   - If the re-run FAILS on target too (`TARGET_RESULT != 0`): genuinely
+     pre-existing. Check for duplicates first:
      ```bash
      gc bd list --type=bug --status=open --search "<failure summary>"
      ```
-   - If a matching bug already exists: note its ID and proceed with merge.
-   - If no duplicate: file a new bead:
+     If a matching bug already exists: note its ID. If no duplicate: file a
+     new bead:
      ```bash
      gc bd create --type=bug --priority=1 --title="Pre-existing failure: <summary>"
      ```
-   - Proceed with merge (failure not caused by this branch)
+     Record the target-side reproduction as evidence on the bug bead (the
+     command run, $TARGET_SHA, and the failing output) — this is the proof,
+     not a formality. Proceed with merge (failure not caused by this branch).
+   - If the re-run PASSES on target (`TARGET_RESULT == 0`): your "pre-existing"
+     judgment was wrong. The branch caused it. Do NOT file a pre-existing bug
+     bead. Take branch 2 (reject) instead.
+   - If the re-run cannot be performed for any reason (target checkout fails,
+     the command errors out for infra reasons, etc.): that is a REJECT, not a
+     merge. Take branch 2 (reject) instead.
 
-**GATE**: Cannot merge without all checks passing OR pre-existing bug filed/found.
+**GATE**: Branch 3 (merge despite a failing check) is unreachable without a
+recorded target-side re-run of the SAME check showing it fails on $TARGET at
+$TARGET_SHA too. No re-run, a re-run that passes on target, or a re-run that
+cannot be performed all route to branch 2 (reject, rejection_reason set, bead
+returns to the pool) — never to merge.
 **FORBIDDEN**: Writing code to fix failures. You are a merge processor."""
 
 [[steps]]
