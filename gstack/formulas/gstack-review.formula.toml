@@ -3,11 +3,13 @@ gstack implementation of the code-review-base methodology contract.
 """
 formula = "gstack-review"
 version = 1
-contract = "graph.v2"
 extends = ["code-review-base"]
 target_required = false
 internal = true
 mode = "report"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.implementation_target]

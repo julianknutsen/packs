@@ -7,7 +7,9 @@ review lanes, including gap analysis, with synthesis and fix application.
 formula = "bmad-code-review-flow"
 type = "expansion"
 version = 1
-contract = "graph.v2"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.implementation_target]

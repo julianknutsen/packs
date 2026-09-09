@@ -6,9 +6,11 @@ Think -> Plan -> Build -> Review -> Test -> Ship -> Reflect.
 """
 formula = "gstack-build"
 version = 1
-contract = "graph.v2"
 extends = ["build-base"]
 target_required = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [catalog]
 name = "gstack-build"

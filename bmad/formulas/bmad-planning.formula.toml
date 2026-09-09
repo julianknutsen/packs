@@ -3,10 +3,12 @@ BMAD implementation of the planning-base methodology contract.
 """
 formula = "bmad-planning"
 version = 1
-contract = "graph.v2"
 extends = ["planning-base"]
 target_required = false
 internal = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [[steps]]
 id = "requirements"

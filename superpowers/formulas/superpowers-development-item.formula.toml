@@ -7,11 +7,13 @@ the task scope; this formula carries the execution process.
 """
 formula = "superpowers-development-item"
 version = 1
-contract = "graph.v2"
 extends = ["do-work-item"]
 target_required = true
 internal = true
 single_lane = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.implementation_target]

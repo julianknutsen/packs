@@ -10,9 +10,11 @@ Launch inputs:
 """
 formula = "do-work"
 version = 1
-contract = "graph.v2"
 extends = ["implementation-base"]
 target_required = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.context_path]

@@ -12,7 +12,9 @@ Launch inputs:
 """
 formula = "profile-analyze"
 version = 2
-contract = "graph.v2"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [catalog]
 name = "profile-analyze"

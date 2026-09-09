@@ -3,10 +3,12 @@ BMAD implementation of the decomposition-base methodology contract.
 """
 formula = "bmad-decomposition"
 version = 1
-contract = "graph.v2"
 extends = ["decomposition-base"]
 target_required = false
 internal = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [[steps]]
 id = "decompose"

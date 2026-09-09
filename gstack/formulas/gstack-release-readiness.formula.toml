@@ -7,7 +7,9 @@ explicit Gas City readiness lanes before the build finalize and publish stages.
 formula = "gstack-release-readiness"
 type = "expansion"
 version = 1
-contract = "graph.v2"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.review_mode]

@@ -6,9 +6,11 @@ implementation and review lanes.
 """
 formula = "bmad-story-development"
 version = 1
-contract = "graph.v2"
 extends = ["do-work"]
 target_required = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [[steps]]
 id = "implement"

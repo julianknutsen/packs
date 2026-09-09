@@ -105,7 +105,7 @@ top-level stages only as anchored extensions:
   delegates to the next suffix through an inherited handoff step.
 - `build-from-*` formulas are cataloged default Gas City wrappers around the
   matching continuation suffix bases.
-- All formulas use `contract = "graph.v2"` and do not redeclare reserved
+- All formulas require `formula_compiler = ">=2.0.0"` and do not redeclare reserved
   runtime variables: `issue`, `bead_id`, or `convoy_id`.
 - Raw-framework subagents are converted to Gas City fanouts, drains, or formula
   steps. The base pack must not preserve subagent functionality as opaque
