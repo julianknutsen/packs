@@ -27,8 +27,9 @@
 #     no owner published for two minutes) is cleared only under a second,
 #     atomic reclaim lock and only after re-checking it is still the same stale
 #     lock, so two contenders cannot both clear it and a live lock is never
-#     removed. Two sessions preparing lanes at once therefore cannot race on
-#     branch creation, on the same lane, or on the aside destination.
+#     removed; a reclaim lock stuck for two minutes fails the run closed. Two
+#     sessions preparing lanes at once therefore cannot race on branch
+#     creation, on the same lane, or on the aside destination.
 #   * The work dir is resolved on the real filesystem: it must exist, or its
 #     parent must exist and its last component must be a plain name (no `.`,
 #     `..`, or deeper missing levels). Symlinks resolve. The rig root itself,
@@ -148,7 +149,9 @@ git_rig() { git -C "$RIG_ROOT" "$@"; }
 # and finds it still stale: a contender that observed the stale lock, lost the
 # race, and arrives late finds a live owner (or no lock) under the reclaim lock
 # and does nothing. So a live lock is never removed by a late contender. A
-# reclaim lock left by a crash ages out after two minutes. Test-only pauses
+# reclaim lock left by a crash is never removed automatically (removing it by
+# age would reopen the same race one level down): after two minutes the script
+# fails closed and names the directory for an operator. Test-only pauses
 # (WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM / _AFTER_ACQUIRE, seconds) exist so
 # the two-contender interleavings can be exercised deterministically.
 
@@ -181,14 +184,14 @@ RECLAIM="$LOCK.reclaim"
 # lock turned out live or gone, or the reclaim lock itself is stuck).
 reclaim_stale_lock() {
     if ! mkdir "$RECLAIM" 2>/dev/null; then
-        # Someone else is reclaiming; a reclaim lock older than two minutes is a
-        # crash residue and is removed so the next pass can proceed.
+        # Someone else is reclaiming. A reclaim lock older than two minutes is a
+        # crash residue; it is not removed here (two contenders removing it would
+        # race exactly like the primary lock) — fail closed and name it.
         if [ -n "$(find "$RECLAIM" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
-            rmdir "$RECLAIM" 2>/dev/null || true
+            die "stale reclaim lock $RECLAIM is older than two minutes; remove it by hand after checking no worker-worktree run is alive"
         fi
         return 1
     fi
-    [ -z "${WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM:-}" ] || sleep "$WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM"
     cleared=1
     if lock_is_stale; then
         warn "clearing stale lock $LOCK (owner pid ${owner:-none})"
@@ -218,8 +221,11 @@ while :; do
         [ -z "${WORKER_WORKTREE_TEST_PAUSE_AFTER_ACQUIRE:-}" ] || sleep "$WORKER_WORKTREE_TEST_PAUSE_AFTER_ACQUIRE"
         break
     fi
-    if lock_is_stale && reclaim_stale_lock; then
-        continue
+    if lock_is_stale; then
+        [ -z "${WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM:-}" ] || sleep "$WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM"
+        if reclaim_stale_lock; then
+            continue
+        fi
     fi
     # Live lock, or a reclaim that did not clear anything: bounded wait.
     [ "$waited" -lt "$LOCK_WAIT" ] || die "another worker-worktree run (pid ${owner:-unknown}) has held $LOCK for ${LOCK_WAIT}s"
