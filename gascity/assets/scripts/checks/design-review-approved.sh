@@ -44,10 +44,12 @@ if [ -z "$BEAD_ID" ]; then
 fi
 
 GC_ERR="$(mktemp)"
-# EXIT alone does not fire on an untrapped signal, and check gates run under a
-# documented 10m dispatcher budget -- timeout kills are an expected path, not a
-# hypothetical one, so each would leak this capture file. SIGKILL leaks either way.
-trap 'rm -f "$GC_ERR"' EXIT INT TERM HUP
+# EXIT only, and that suffices: bash runs the EXIT trap before re-raising an
+# untrapped fatal signal, so INT/TERM/HUP already reclaim this file while still
+# exiting 130/143/129. Listing them here would only ABSORB them -- the gate would
+# run on and report its own verdict where it used to die. The dispatcher's
+# 10m-budget kill is an untrappable SIGKILL, which no trap list can catch.
+trap 'rm -f "$GC_ERR"' EXIT
 BEAD_JSON=$(gc bd show "$BEAD_ID" --json 2>"$GC_ERR") || {
     echo "ERROR: gc bd show $BEAD_ID failed: $(tail -c 400 "$GC_ERR" | tr '\n' ' ')" >&2
     exit 1

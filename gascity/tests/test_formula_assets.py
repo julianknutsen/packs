@@ -4,8 +4,10 @@ import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import tempfile
+import time
 import tomllib
 import unittest
 
@@ -6217,7 +6219,76 @@ description = "Override sink that writes the base triage report contract."
         self.assertEqual(result.returncode, 1)
         self.assertIn("ERROR: gc bd show design-bead failed", result.stderr)
         self.assertIn("DESIGN_SHOW_FAILURE", result.stderr)
-        # `trap 'rm -f "$GC_ERR"' EXIT INT TERM HUP` actually reclaims the file.
+        # `trap 'rm -f "$GC_ERR"' EXIT` actually reclaims the file.
+        self.assertEqual(leaked, [])
+
+    def test_design_review_check_dies_on_signal_instead_of_absorbing_it(self) -> None:
+        # The capture-file trap must stay EXIT-only. Naming INT/TERM/HUP on it
+        # without exiting from the handler absorbs those signals: the gate
+        # survives, runs to completion and reports a verdict of its own where it
+        # previously died, and the handler unlinks $GC_ERR before the error path
+        # can read it. EXIT alone still reclaims the file, because bash runs the
+        # EXIT trap before re-raising an untrapped fatal signal -- so this pins
+        # the signal half of the trap that the file-cleanup assertions cannot.
+        root = pathlib.Path(__file__).resolve().parents[1]
+        script = root / "assets" / "scripts" / "checks" / "design-review-approved.sh"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            tmpdir = pathlib.Path(tmp) / "tmpdir"
+            tmpdir.mkdir()
+            fake_gc = bin_dir / "gc"
+            # Slow, so the signal lands while the gate is blocked in its first
+            # `gc bd show` -- where a kill would realistically find it. Bounded
+            # at 10s because this child is orphaned once the gate dies; the
+            # signal is sent within ~50ms of the capture file appearing.
+            fake_gc.write_text("#!/bin/sh\nsleep 10\n", encoding="utf-8")
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "GC_BEAD_ID": "design-bead",
+                "TMPDIR": str(tmpdir),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            # DEVNULL rather than PIPE: the `gc` child inherits the pipe and
+            # holds it open after the gate dies, so reading to EOF would outlast
+            # the gate itself and read as absorption when it is not.
+            proc = subprocess.Popen(
+                [str(script)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            try:
+                deadline = time.monotonic() + 15
+                captured = []
+                while time.monotonic() < deadline:
+                    captured = sorted(p.name for p in tmpdir.iterdir())
+                    if captured:
+                        break
+                    time.sleep(0.05)
+                proc.send_signal(signal.SIGTERM)
+                try:
+                    returncode = proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    returncode = None
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            leaked = sorted(p.name for p in tmpdir.iterdir())
+
+        # Positive control: the capture file was present when the signal landed,
+        # so an empty TMPDIR below means "reclaimed", not "never created".
+        self.assertEqual(len(captured), 1)
+        self.assertIsNotNone(
+            returncode,
+            "gate absorbed SIGTERM and kept running instead of dying",
+        )
+        # Killed *by* the signal, exactly as it was before stderr capture was
+        # added -- not exiting through its own verdict logic.
+        self.assertEqual(returncode, -signal.SIGTERM)
         self.assertEqual(leaked, [])
 
     def test_implementation_review_check_notes_parent_show_stderr(self) -> None:
