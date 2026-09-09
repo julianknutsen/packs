@@ -341,7 +341,7 @@ When blocked, you MUST escalate. Do NOT wait for human input.
 - Tests fail and you can't determine why after 2-3 attempts
 - Need credentials, secrets, or external access
 
-**How:**
+**How when you can continue:**
 ```bash
 # Blocking issues
 WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness"
@@ -351,7 +351,59 @@ gc mail send "$WITNESS_TARGET" -s "ESCALATION: Brief description [HIGH]" -m "Det
 gc mail send mayor/ -s "BLOCKED: <topic>" -m "Context"
 ```
 
-After escalating: continue if possible, otherwise `gc bd update <bead> --status=escalated && gc runtime drain-ack && exit`.
+If you must stop, do **not** send the standalone mail above first. Use the
+single block below; it records the blocker on the bead, sends the one allowed
+witness mail, marks the bead blocked, and then drains.
+
+Mail is addressed to the witness, not attached to the bead, and there is no
+bead-to-mail lookup — so it does not reach whoever picks this bead up next.
+Write the reason **on the bead**, and write it before the status flip: a bead
+left `blocked` with nothing on it is indistinguishable from a crash.
+
+```bash
+BLOCKED_BEAD="<the id printed as CLAIMED_BEAD_ID>"
+BLOCKED_REASON="<what blocked you, and what would unblock it>"
+WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness"
+# BEGIN POLECAT_BLOCKED_CONTRACT
+if [ -z "$BLOCKED_BEAD" ] || [ -z "$BLOCKED_REASON" ]; then
+  echo "BLOCK_REFUSED: no bead id or no reason; bead NOT modified"
+  exit 2
+fi
+gc bd update "$BLOCKED_BEAD" \
+  --set-metadata blocked_reason="$BLOCKED_REASON" \
+  --append-notes "BLOCKED: $BLOCKED_REASON" || true   # the read-back decides, not this exit code
+RECORDED=$(gc bd show "$BLOCKED_BEAD" --json 2>/dev/null | jq -r '.[0].metadata.blocked_reason // empty')
+if [ "$RECORDED" != "$BLOCKED_REASON" ]; then
+  echo "BLOCK_REFUSED $BLOCKED_BEAD: blocked_reason did not persist; status NOT changed"
+  gc mail send "$WITNESS_TARGET" -s "ESCALATION: cannot record blocked_reason on $BLOCKED_BEAD [HIGH]" \
+    -m "Could not persist blocked_reason on $BLOCKED_BEAD, so its status was left unchanged rather than blocked with no explanation. Intended reason: $BLOCKED_REASON"
+  exit 1
+fi
+if ! gc bd update "$BLOCKED_BEAD" --status=blocked; then
+  echo "BLOCK_REFUSED $BLOCKED_BEAD: status transition failed; session NOT drain-acked"
+  gc mail send "$WITNESS_TARGET" -s "ESCALATION: cannot mark $BLOCKED_BEAD blocked [HIGH]" \
+    -m "blocked_reason persisted on $BLOCKED_BEAD, but the status transition to blocked failed. Session was not drain-acked. Reason: $BLOCKED_REASON"
+  exit 1
+fi
+RECORDED_STATUS=$(gc bd show "$BLOCKED_BEAD" --json 2>/dev/null | jq -r '.[0].status // empty')
+if [ "$RECORDED_STATUS" != "blocked" ]; then
+  echo "BLOCK_REFUSED $BLOCKED_BEAD: status transition did not read back; session NOT drain-acked"
+  gc mail send "$WITNESS_TARGET" -s "ESCALATION: blocked status did not persist on $BLOCKED_BEAD [HIGH]" \
+    -m "blocked_reason persisted on $BLOCKED_BEAD, but status read back as '${RECORDED_STATUS:-missing}' instead of blocked. Session was not drain-acked. Reason: $BLOCKED_REASON"
+  exit 1
+fi
+if ! gc mail send "$WITNESS_TARGET" -s "ESCALATION: $BLOCKED_BEAD blocked [HIGH]" \
+  -m "Blocked $BLOCKED_BEAD. Reason: $BLOCKED_REASON"; then
+  echo "BLOCK_REFUSED $BLOCKED_BEAD: witness escalation failed; session NOT drain-acked"
+  exit 1
+fi
+if ! gc runtime drain-ack; then
+  echo "BLOCK_REFUSED $BLOCKED_BEAD: drain acknowledgement failed"
+  exit 1
+fi
+exit 0
+# END POLECAT_BLOCKED_CONTRACT
+```
 
 ---
 

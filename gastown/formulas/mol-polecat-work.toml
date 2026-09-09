@@ -39,7 +39,7 @@ refinery. Resume the existing branch — don't redo all the work.
 | Situation | Action |
 |-----------|--------|
 | Tests fail | Fix them. Do not proceed with failures. |
-| Blocked on external | Mail Witness, mark yourself stuck |
+| Blocked on external | Mail Witness, then stop via Escalation in your prompt (records `blocked_reason` before the status flip) |
 | Context filling | `gc runtime request-restart` (blocks until controller kills you) |
 | Unsure what to do | Mail Witness, don't guess |"""
 formula = "mol-polecat-work"
