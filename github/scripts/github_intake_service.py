@@ -1471,14 +1471,39 @@ def execute_rule_action(
     payload: dict[str, Any],
     payload_file: str,
     app_cfg: dict[str, Any],
+    rules_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = common.utcnow()
     action_type = str(action.get("type", "")).strip()
+    dispatch_route: dict[str, str] = {}
     if action_type == "order":
-        command = ["gc", "order", "run", render_template(str(action.get("name", "")), payload)]
-        rig = str(action.get("rig", "")).strip()
-        if rig:
-            command.extend(["--rig", render_template(rig, payload)])
+        order_name = render_template(str(action.get("name", "")), payload)
+        if bool(action.get("route_from_repo")):
+            repository = str((payload.get("repository") or {}).get("full_name", ""))
+            dispatch_route = common.github_repo_dispatch_route(repository, rules_config)
+            if not dispatch_route:
+                return {
+                    "type": action_type,
+                    "status": "failed",
+                    "reason": "repository_route_not_configured",
+                    "started_at": started,
+                    "finished_at": common.utcnow(),
+                }
+            command = [
+                "gc",
+                "--city",
+                dispatch_route["city"],
+                "order",
+                "run",
+                order_name,
+                "--rig",
+                dispatch_route["rig"],
+            ]
+        else:
+            command = ["gc", "order", "run", order_name]
+            rig = str(action.get("rig", "")).strip()
+            if rig:
+                command.extend(["--rig", render_template(rig, payload)])
     elif action_type == "command":
         raw_command = action.get("command") or []
         if not isinstance(raw_command, list) or not raw_command:
@@ -1501,6 +1526,9 @@ def execute_rule_action(
 
     try:
         env, token_env = action_env(action, event, delivery_id, payload, payload_file, app_cfg)
+        if dispatch_route:
+            env["GC_GITHUB_DISPATCH_CITY"] = dispatch_route["city"]
+            env["GC_GITHUB_DISPATCH_RIG"] = dispatch_route["rig"]
         result = run_subprocess(command, common.city_root() or ".", env=env)
     except Exception as exc:  # noqa: BLE001
         return {
@@ -1565,7 +1593,16 @@ def process_event_rules(event: str, delivery_id: str, payload: dict[str, Any], a
             "actions": [],
         }
         for index, action in enumerate(rule.get("action") or []):
-            outcome = execute_rule_action(rule, action, event, delivery_id, payload, payload_file, app_cfg)
+            outcome = execute_rule_action(
+                rule,
+                action,
+                event,
+                delivery_id,
+                payload,
+                payload_file,
+                app_cfg,
+                rules_config,
+            )
             outcome["index"] = index
             result["actions"].append(outcome)
             if outcome.get("status") != "success":

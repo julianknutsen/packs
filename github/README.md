@@ -45,6 +45,92 @@ gc github release-workflow owner/repo 42
 source = "../packs/github"
 ```
 
+## Bidirectional Work Sync
+
+Work sync is opt-in per Rig. The City-level `github` import owns ingress,
+credentials and the existing GitHub service data directory; it deliberately
+does **not** register a City-wide work-sync order. Import the service-free
+`github/work-sync` subpack on each participating Rig:
+
+```toml
+# city.toml
+[[rigs]]
+name = "product"
+
+[rigs.imports.github_work_sync]
+source = "../packs/github/work-sync"
+```
+
+Bind that Rig's repository path in `.gc/site.toml`, as for any native Rig.
+For remote imports, use
+`https://github.com/gastownhall/gascity-packs.git//github/work-sync`, run
+`gc import install`, and pin ingress and work-sync to the **same accepted
+repository commit** in `packs.lock`. The subpack reuses
+`github/scripts/github_work_sync.py` and the intake helpers from that checkout;
+it does not copy credentials, start a second service, or import the City-only
+service pack into a Rig.
+
+The one `work-sync` order uses Gas City's existing five-minute cooldown,
+tracking and history. Two importing Rigs get independent scoped instances.
+Webhook actions with `route_from_repo = true` invoke this same order. Always
+select the exact Rig for a manual run:
+
+```sh
+gc order list
+gc order run work-sync --rig product
+gc order history work-sync --rig product
+```
+
+Provide these non-secret runtime settings to the controller/order environment:
+
+- `GC_WORK_SYNC_POLICY_BIN`: absolute path to the work-sync policy provider executable.
+- `GC_WORK_SYNC_POLICY_ROOT`: absolute path to the policy contract root.
+- `GC_GITHUB_WORK_SYNC_DRY_RUN=1`: optional additional read-only guard.
+
+The runner reads the configured provider’s `--json work-sync runtime-contract` and uses
+the pure `work-sync plan` command. The canonical contract's
+`live_mutations = false` always forces dry-run, even if the environment flag
+is absent. Dry-run performs authenticated reads and reports planned operation
+counts, but does not apply Beads or GitHub changes. Supply the same supported
+GitHub App identity resolver/routing configuration as ingress; periodic runs
+mint short-lived installation tokens through the existing intake helpers.
+Do not configure a PAT or widen the intake App to delivery permissions.
+
+The runtime owns Issues/Projects v2 projection, reconciliation and receipts; the configured provider supplies policy and a pure plan, not another worker or store.
+It reads the exact Rig via native `gc beads snapshot` and applies incoming
+changes through whole-row `gc beads update-cas`. A native snapshot/CAS-capable
+Gas City build is required; comment imports additionally require transactional
+comment support in the selected Beads provider. Unsupported capabilities,
+unknown/mismatched routes, schema drift, identity collisions and concurrent
+edits fail closed. There is no direct database fallback. The experimental
+Beads proxied-server mode is not required.
+
+The runtime accepts exactly one current managed-block contract from the policy
+provider. A legacy or unknown marker fails before planning or writing; the Pack
+does not contain a compatibility migration writer.
+
+Stable node IDs bind Issues and Projects items to Beads; replay receipts stay
+under the target City's existing `.gc/services/github/data` root. Cross-City
+webhook dispatch must not inherit the ingress City's receipt location.
+Writes require readback, ambiguous
+transport outcomes are reconciled before retry, and conflicts prevent unsafe
+overwrite. A successful reconciliation requires a final zero-operation plan.
+Receipts distinguish the projected Bead revision from the revision proven by
+an incoming CAS; importing a request does not imply it was projected back.
+Output exposes counts and reason codes, not issue bodies or credentials.
+
+Run the native composition regression against a candidate Gas City binary:
+
+```sh
+GC_TEST_BIN=/absolute/path/to/gc \
+  python3 -m unittest discover -s github/tests -p test_github_work_sync_order.py -v
+```
+
+It imports the actual packs into two temporary file-store Rigs, checks that
+ingress creates no Rig-less reconciler, and exercises real order dispatch,
+per-Rig history and cooldown. Only the external Python runner is substituted;
+the test starts no supervisor and contacts neither GitHub nor a live store.
+
 ## Publication
 
 This pack expects helper-backed published services. After the workspace starts,
@@ -55,6 +141,13 @@ This pack expects helper-backed published services. After the workspace starts,
 
 Open the tenant-visible `github-admin` URL to register the GitHub App from the
 hosted manifest helper.
+
+The generated intake manifest follows the least-privilege work-sync contour:
+repository metadata read, Issues write, Pull requests read (required for the
+subscribed webhook), organization Projects write, and organization Issue Types
+and Issue Fields read. It does not request Contents, Actions, Administration,
+or Workflows. Branch push and PR creation therefore require a separately
+scoped delivery identity instead of broadening the organization intake App.
 
 ## Bugflow Routing
 
@@ -99,6 +192,28 @@ name = "pr-review-request"
 github_app_token_env = "GH_TOKEN"
 ```
 
+For organization ingress that owns repositories in more than one registered
+City, declare the exact owning City and Rig once in the repo topology and opt
+the action into topology routing:
+
+```toml
+[[repo]]
+full_name = "owner/repo"
+city = "product-city"
+rig = "product"
+
+[[rule.action]]
+type = "order"
+name = "work-sync"
+route_from_repo = true
+```
+
+That action runs as
+`gc --city product-city order run work-sync --rig product`. Unknown repositories
+and incomplete City/Rig mappings fail closed before a subprocess starts; there
+is no fallback queue or repository-local work store. Rules without
+`route_from_repo = true` retain their existing local-City behavior.
+
 Rules ignore events sent by the configured GitHub App bot by default. Set
 `allow_self = true` on a rule when bot-authored label changes are intentional
 triggers, such as a GitHub Action adding `status/needs-triage`.
@@ -123,6 +238,7 @@ version = 1
 
 [[repo]]
 full_name = "owner/repo"
+city = "product-city"
 rig = "product"
 authorized_users = ["alice", "bob"]
 installation_id = "123456"

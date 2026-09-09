@@ -1,0 +1,6 @@
+[order]
+description = "Reconcile one Rig Beads store with its native GitHub Issues and Projects v2"
+trigger = "cooldown"
+interval = "5m"
+exec = '"$ORDER_DIR/scripts/work-sync.sh"'
+timeout = "15m"

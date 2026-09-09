@@ -174,6 +174,66 @@ class GitHubIntakeServiceTests(unittest.TestCase):
         self.assertEqual(env["GH_TOKEN"], "token-123")
         self.assertTrue(outcome["github_app_token_injected"])
 
+    def test_order_action_routes_exact_repository_to_owning_city_and_rig(self) -> None:
+        payload = {
+            "repository": {"full_name": "Owner/Repo"},
+            "issue": {"number": 42, "html_url": "https://github.com/owner/repo/issues/42"},
+        }
+        rules = {
+            "repos": [
+                {
+                    "full_name": "owner/repo",
+                    "city": "product-city",
+                    "rig": "product",
+                }
+            ]
+        }
+        action = {"type": "order", "name": "work-sync", "route_from_repo": True}
+        completed = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+
+        with mock.patch.object(service, "run_subprocess", return_value=completed) as run_subprocess:
+            outcome = service.execute_rule_action(
+                {"id": "rule"},
+                action,
+                "issues",
+                "delivery-1",
+                payload,
+                "/tmp/payload.json",
+                {},
+                rules,
+            )
+
+        self.assertEqual(outcome["status"], "success")
+        command, cwd = run_subprocess.call_args.args[:2]
+        env = run_subprocess.call_args.kwargs["env"]
+        self.assertEqual(
+            command,
+            ["gc", "--city", "product-city", "order", "run", "work-sync", "--rig", "product"],
+        )
+        self.assertEqual(cwd, self.tempdir.name)
+        self.assertEqual(env["GC_GITHUB_DISPATCH_CITY"], "product-city")
+        self.assertEqual(env["GC_GITHUB_DISPATCH_RIG"], "product")
+
+    def test_order_action_repo_route_fails_closed_without_exact_mapping(self) -> None:
+        payload = {"repository": {"full_name": "owner/unknown"}}
+        action = {"type": "order", "name": "work-sync", "route_from_repo": True}
+
+        with mock.patch.object(service, "run_subprocess") as run_subprocess:
+            outcome = service.execute_rule_action(
+                {"id": "rule"},
+                action,
+                "issues",
+                "delivery-1",
+                payload,
+                "/tmp/payload.json",
+                {},
+                {"repos": []},
+            )
+
+        self.assertEqual(outcome["status"], "failed")
+        self.assertEqual(outcome["reason"], "repository_route_not_configured")
+        run_subprocess.assert_not_called()
+
     def test_process_event_rules_executes_matching_order_rule_and_persists_result(self) -> None:
         rules_dir = pathlib.Path(self.tempdir.name) / "config" / "github-intake"
         rules_dir.mkdir(parents=True)

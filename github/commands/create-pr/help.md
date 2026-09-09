@@ -1,8 +1,10 @@
-Create a pull request using the workspace-owned GitHub App installation.
+Create a pull request using a workspace-owned GitHub App installation. Prefer
+a separately scoped delivery identity; the least-privilege intake App has only
+Pull requests read permission.
 
 Example:
   gc github create-pr owner/repo \
-    --installation-id 123456 \
+    --github-app-identity delivery \
     --base main \
     --head fix-42 \
     --title "fix: correct widget behavior" \
@@ -12,7 +14,8 @@ Arguments:
   <repository> owner/repo
 
 Flags:
-  --installation-id <id>    GitHub App installation id
+  --github-app-identity <id> separately scoped delivery App identity
+  --installation-id <id>    override the identity's installation id
   --base <branch>           base branch for the PR
   --head <branch>           head branch for the PR
   --title <text>            PR title

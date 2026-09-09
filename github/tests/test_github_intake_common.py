@@ -62,8 +62,17 @@ class GitHubIntakeCommonTests(unittest.TestCase):
         self.assertIn("issue_comment", manifest["default_events"])
         self.assertIn("issues", manifest["default_events"])
         self.assertIn("pull_request", manifest["default_events"])
-        self.assertEqual(manifest["default_permissions"]["contents"], "write")
-        self.assertEqual(manifest["default_permissions"]["pull_requests"], "write")
+        self.assertEqual(
+            manifest["default_permissions"],
+            {
+                "issues": "write",
+                "metadata": "read",
+                "pull_requests": "read",
+                "organization_projects": "write",
+                "issue_types": "read",
+                "issue_fields": "read",
+            },
+        )
 
     def test_effective_config_merges_github_app_env_secrets(self) -> None:
         os.environ["GITHUB_APP_ID"] = "123"
@@ -176,6 +185,7 @@ version = 1
 
 [[repo]]
 full_name = "Owner/Repo"
+city = "product-city"
 rig = "product"
 authorized_users = ["Alice"]
 
@@ -191,10 +201,27 @@ formula = "github-addressed-message"
 
         repo = rules["repos"][0]
         self.assertEqual(repo["full_name"], "owner/repo")
+        self.assertEqual(repo["city"], "product-city")
         self.assertEqual(repo["github_rig"], "github-owner-repo")
         self.assertEqual(repo["rig"], "product")
         self.assertEqual(repo["addresses"][0]["target"], "product/mayor")
         self.assertEqual(common.github_repo_dispatch_rig("Owner/Repo", rules), "product")
+        self.assertEqual(
+            common.github_repo_dispatch_route("Owner/Repo", rules),
+            {"city": "product-city", "rig": "product"},
+        )
+
+    def test_github_repo_dispatch_route_requires_exact_city_and_rig_mapping(self) -> None:
+        rules = {
+            "repos": [
+                {"full_name": "owner/missing-city", "city": "", "rig": "product"},
+                {"full_name": "owner/missing-rig", "city": "product-city", "rig": ""},
+            ]
+        }
+
+        self.assertEqual(common.github_repo_dispatch_route("owner/unknown", rules), {})
+        self.assertEqual(common.github_repo_dispatch_route("owner/missing-city", rules), {})
+        self.assertEqual(common.github_repo_dispatch_route("owner/missing-rig", rules), {})
 
     def test_load_rules_rejects_path_like_github_app_identity(self) -> None:
         rules_dir = pathlib.Path(self.tempdir.name) / "config" / "github-intake"
@@ -268,6 +295,23 @@ formula = "github-addressed-message"
         )
 
         with self.assertRaisesRegex(ValueError, "rig must be a local rig name"):
+            common.load_rules()
+
+    def test_load_rules_rejects_city_route_without_explicit_rig(self) -> None:
+        rules_dir = pathlib.Path(self.tempdir.name) / "config" / "github-intake"
+        rules_dir.mkdir(parents=True)
+        (rules_dir / "rules.toml").write_text(
+            """
+version = 1
+
+[[repo]]
+full_name = "owner/repo"
+city = "product-city"
+""",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "city requires an explicit rig"):
             common.load_rules()
 
     def test_extract_addressed_comment_requests_repo_scoped_matches(self) -> None:

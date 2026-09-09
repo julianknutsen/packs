@@ -25,7 +25,12 @@ def read_body(args: argparse.Namespace) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create a pull request via the workspace GitHub App")
     parser.add_argument("repository", help="owner/repo")
-    parser.add_argument("--installation-id", required=True, help="GitHub App installation id")
+    parser.add_argument("--installation-id", default="", help="GitHub App installation id")
+    parser.add_argument(
+        "--github-app-identity",
+        default="",
+        help="separately scoped delivery GitHub App identity",
+    )
     parser.add_argument("--base", required=True, help="base branch")
     parser.add_argument("--head", required=True, help="head branch")
     parser.add_argument("--title", required=True, help="PR title")
@@ -34,14 +39,19 @@ def main() -> int:
     group.add_argument("--body-file", default="", help="path to a markdown file")
     args = parser.parse_args()
 
-    config = common.load_config()
-    app_cfg = config.get("app", {})
+    try:
+        app_cfg = common.github_app_config_for_identity(args.github_app_identity)
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
     if not isinstance(app_cfg, dict) or not app_cfg.get("app_id") or not app_cfg.get("private_key_pem"):
         raise SystemExit("GitHub App configuration is incomplete")
+    installation_id = str(args.installation_id or app_cfg.get("installation_id", "")).strip()
+    if not installation_id:
+        raise SystemExit("GitHub App installation id is required")
     owner, repo = split_repository(args.repository)
     pull_request = common.create_pull_request(
         app_cfg,
-        args.installation_id,
+        installation_id,
         owner,
         repo,
         args.title,
