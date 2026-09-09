@@ -109,6 +109,9 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "{{lint_command}}",
         "{{build_command}}",
         "{{test_command}}",
+        'COMMITS_AHEAD=$(git rev-list --count "origin/{{base_branch}}..HEAD" 2>/dev/null)',
+        "''|*[!0-9]*) HALT_REASON=content_gate_error ;;",
+        "0) HALT_REASON=no_commits ;;",
         "git push origin HEAD",
         "gc bd update \"$WORK_BEAD_ID\" \\",
         "--set-metadata target={{base_branch}}",
@@ -159,6 +162,55 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "gc bd dep add",
     ),
 }
+# Position pins for the polecat branch-content gate, checked in submit-and-exit's
+# parsed order. The gate only prevents a phantom handoff where it stands: after
+# the clean-state check has committed any leftovers (so it cannot fire on work
+# that merely had not been committed yet) and before the push that would create
+# the ref and let the handoff be stamped.
+POLECAT_BRANCH_CONTENT_GATE_ORDER = (
+    ("clean-state commit", 'git commit -m "chore: capture remaining work ($WORK_BEAD_ID)"'),
+    ("branch-content count", 'COMMITS_AHEAD=$(git rev-list --count "origin/{{base_branch}}..HEAD" 2>/dev/null)'),
+    ("branch push", "git push origin HEAD"),
+)
+# Required between the count and the push. `git rev-list` failing must halt on
+# its own reason instead of falling through to the push, and the halt must
+# escalate: it parks the bead open, unassigned and unrouted, which no dispatcher
+# tier serves and witness orphan recovery skips, and it pre-empts the refinery's
+# `halt_false_completion`, which does nudge mayor and witness.
+POLECAT_BRANCH_CONTENT_GATE_HALT_PATH = (
+    ("unmeasurable-count arm", "''|*[!0-9]*) HALT_REASON=content_gate_error ;;"),
+    ("empty-branch arm", "0) HALT_REASON=no_commits ;;"),
+    # The two arms above are containment checks, so they pin arm *presence*
+    # only. `case` takes the first match, so a catch-all inserted ahead of
+    # either arm routes past it with both arms still literally present -- and
+    # one placed between them kills `no_commits`, the phantom handoff this gate
+    # exists to catch, while `content_gate_error` keeps working and the gate
+    # still looks alive. Pin the dispatch as one block so arm *order* is fixed
+    # too, and keep the trailing `esac\nif` so nothing can be inserted between
+    # deciding to halt and halting.
+    (
+        "case dispatch",
+        'case "$COMMITS_AHEAD" in\n'
+        "    ''|*[!0-9]*) HALT_REASON=content_gate_error ;;\n"
+        "    0) HALT_REASON=no_commits ;;\n"
+        'esac\nif [ -n "$HALT_REASON" ]; then',
+    ),
+    # Subsumed by the dispatch pin above (which ends with these same two
+    # lines), and kept deliberately: it names the adjacency specifically when
+    # that is what drifted, instead of reporting the whole dispatch as missing.
+    ("halt guard", 'esac\nif [ -n "$HALT_REASON" ]; then'),
+    ("halt_reason stamp", '--set-metadata halt_reason="$HALT_REASON"'),
+    ("mayor and witness escalation", 'for ESCALATE_TARGET in mayor "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"; do'),
+    ("escalation nudge", 'gc session nudge "$ESCALATE_TARGET"'),
+    # Anchored to the escalation loop's `done`, which occurs only in this gate.
+    # The checked window runs to the push, so it also spans the auto_push=false
+    # halt further down: a bare "gc runtime drain-ack" fragment is satisfied by
+    # that sibling's copy, and stayed green with this gate's own copy deleted.
+    # The same anchor pins the `exit 1` -- without it the fence ends rc=0 and
+    # the agent walks on to the push it just refused, having already released
+    # the bead.
+    ("halt exit", "    done\n    gc runtime drain-ack\n    exit 1"),
+)
 METHODOLOGY_FLOW_CONTRACTS = {
     "superpowers": {
         "review_expansion": "superpowers-code-review",
@@ -2822,6 +2874,55 @@ def validate_gastown_orchestration_contract(pack_source: Path) -> None:
                 missing.append(f"{formula_name}: missing contract fragment {fragment!r}")
     if missing:
         raise GateError("Gastown orchestration contract drifted:\n" + "\n".join(f"- {item}" for item in missing))
+    validate_polecat_branch_content_gate(pack_source)
+
+
+def validate_polecat_branch_content_gate(pack_source: Path) -> None:
+    """Pin the branch-content gate's position and its halt path, not just its text.
+
+    The fragment pins above are substring containment over the whole file, so
+    they catch deletion and nothing else: a gate moved below `git push origin
+    HEAD`, or a halt path that quietly drops its escalation, keeps every pinned
+    fragment while gating nothing. Parse the step instead and require that the
+    commit count is taken after the clean-state commit and before the push, and
+    that everything between the count and the push still fails closed on an
+    unmeasurable branch and still escalates the halt.
+    """
+    problems: list[str] = []
+    path = pack_source / "formulas" / "mol-polecat-work.toml"
+    if not path.is_file():
+        raise GateError(f"mol-polecat-work: missing formula file {path}")
+    try:
+        payload = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise GateError(f"mol-polecat-work: invalid TOML: {exc}") from exc
+
+    steps = [step for step in list_dicts(payload.get("steps")) if step.get("id") == "submit-and-exit"]
+    if len(steps) != 1:
+        raise GateError(f"mol-polecat-work: expected exactly one submit-and-exit step, found {len(steps)}")
+    description = str(steps[0].get("description") or "")
+
+    ordered = [(label, description.find(fragment)) for label, fragment in POLECAT_BRANCH_CONTENT_GATE_ORDER]
+    for label, index in ordered:
+        if index < 0:
+            problems.append(f"submit-and-exit is missing the {label}")
+    if not problems:
+        indexes = [index for _, index in ordered]
+        if indexes != sorted(indexes):
+            found = " then ".join(label for label, _ in sorted(ordered, key=lambda item: item[1]))
+            problems.append(
+                "the branch-content gate must run after the clean-state commit and before the push; found "
+                + found
+            )
+        else:
+            gate_block = description[indexes[1] : indexes[2]]
+            for label, fragment in POLECAT_BRANCH_CONTENT_GATE_HALT_PATH:
+                if fragment not in gate_block:
+                    problems.append(f"the branch-content gate halt path is missing the {label}")
+    if problems:
+        raise GateError(
+            "Gastown polecat branch-content gate drifted:\n" + "\n".join(f"- {item}" for item in problems)
+        )
 
 
 def stop_city(gc_bin: str, workspace: GateWorkspace, *, env: Mapping[str, str]) -> None:

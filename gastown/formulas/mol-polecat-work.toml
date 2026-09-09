@@ -364,6 +364,92 @@ BODY
 This is a belt-and-suspenders check — self-review should have caught this,
 but we never push with untracked work left behind.
 
+**2b. Branch-content gate (fails closed — non-negotiable).**
+
+The branch-shape gate proves the branch is *named* right; it does not prove
+it *contains* anything. A branch created at the base tip and never committed
+to passes every other gate here: the name matches, the tree is clean, and
+`git push` of zero commits succeeds and creates the ref, so push verification
+sees origin == HEAD. The handoff is then stamped and the bead moves forward
+looking like success — a phantom handoff. Only the refinery's own
+no-work-on-branch check catches it, one gate slot later; without that check
+it merges as a no-op and the bead closes with the work undone. An idle worker
+is visible, this is not.
+
+The predicate is deliberately commit-count-only, measured against the
+`origin/{{base_branch}}` tip: it catches the phantom handoff — a branch with
+nothing on it — at the cheapest point, before any push. It is weaker than the
+refinery's canonical `branch_has_real_change`, which also requires a non-empty
+`git diff` against the merge-base and therefore additionally catches a net-zero
+branch (commit plus revert). That split is intentional: the refinery stays the
+backstop for net-zero work. Do not "fix" only one side of the pair.
+
+`git rev-list` failing is not the same answer as "zero commits", and neither is
+a licence to hand off: a count that is not a plain number halts under its own
+`halt_reason=content_gate_error` rather than falling through to the push. That
+is why the count is matched with `case` instead of `[ "$COMMITS_AHEAD" -eq 0 ]`,
+which evaluates false — and so fails open — on an empty value.
+
+```bash
+COMMITS_AHEAD=$(git rev-list --count "origin/{{base_branch}}..HEAD" 2>/dev/null)
+HALT_REASON=""
+case "$COMMITS_AHEAD" in
+    ''|*[!0-9]*) HALT_REASON=content_gate_error ;;
+    0) HALT_REASON=no_commits ;;
+esac
+if [ -n "$HALT_REASON" ]; then
+    echo "BRANCH CONTENT GATE FAILED ($HALT_REASON)"
+    echo "  branch:  $EXPECTED_BRANCH"
+    if [ "$HALT_REASON" = content_gate_error ]; then
+        echo "  commits ahead of origin/{{base_branch}}: could not be measured"
+        echo ""
+        echo "The count could not be taken (missing or corrupt origin/{{base_branch}},"
+        echo "a concurrent prune). A tool error is a suspect, not a licence to merge:"
+        echo "an unmeasurable branch is not pushed and no handoff is stamped."
+    else
+        echo "  commits ahead of origin/{{base_branch}}: 0"
+        echo ""
+        echo "There is nothing to hand off. Do NOT push and do NOT reassign to the"
+        echo "refinery — an empty branch is a phantom handoff, not a completion."
+        echo ""
+        echo "Uncommitted leftovers are not the cause: the clean-state check above"
+        echo "already committed them. Either the work is sitting on another branch,"
+        echo "or no change was produced at all."
+        echo ""
+        echo "If the honest answer is that no code change is warranted (an"
+        echo "investigation that concluded 'no', a bead already satisfied by main),"
+        echo "that is a legitimate outcome — but it is reported, not handed off."
+    fi
+    echo ""
+    echo "The bead goes back to the pool with this halt recorded; do not re-run"
+    echo "submit-and-exit from this session, whose claim is released below."
+    gc bd update "$WORK_BEAD_ID" \
+      --status=open --assignee="" \
+      --set-metadata gc.routed_to="" \
+      --set-metadata halt_reason="$HALT_REASON" \
+      --append-notes "Halted at submit ($HALT_REASON): no handoff stamped.
+$(cat <<'BODY'
+<State what you investigated and why no code change is warranted, what blocked
+you from producing one, or — for content_gate_error — what left the branch
+unmeasurable. A coordinator reads this to decide next steps.>
+BODY
+)"
+    for ESCALATE_TARGET in mayor "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"; do
+      gc session nudge "$ESCALATE_TARGET" "POLECAT HANDOFF HALT ($HALT_REASON): $WORK_BEAD_ID on $EXPECTED_BRANCH — no handoff stamped; bead returned to the pool open and unassigned. Needs a coordinator decision." \
+        || echo "WARNING: could not nudge $ESCALATE_TARGET about $WORK_BEAD_ID; escalate by hand."
+    done
+    gc runtime drain-ack
+    exit 1
+fi
+```
+
+The halt parks the bead `open` + unassigned + unrouted, which no dispatcher
+tier serves and which witness orphan recovery skips (it filters for beads that
+*have* an assignee). Left at that, this gate would silently displace the
+refinery's `halt_false_completion`, which escalates the same failure class to
+mayor and witness. The nudges above keep that escalation, so moving the catch
+one gate earlier does not make it quieter.
+
 **3. Push gate — FAIL CLOSED, then push:**
 
 Absent metadata is not consent. A rail expressed only in prose is enforced by

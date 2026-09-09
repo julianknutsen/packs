@@ -1084,6 +1084,151 @@ def test_validate_gastown_orchestration_contract_rejects_missing_refinery_false_
         gascity_pack_inference_gate.validate_gastown_orchestration_contract(tmp_path / "gastown")
 
 
+def gastown_formulas_copy(tmp_path: Path) -> Path:
+    pack_source = tmp_path / "gastown"
+    shutil.copytree(
+        gascity_pack_inference_gate.PACK_SPECS["gastown"].source / "formulas",
+        pack_source / "formulas",
+    )
+    return pack_source
+
+
+def test_validate_polecat_branch_content_gate_accepts_current_pack() -> None:
+    gascity_pack_inference_gate.validate_polecat_branch_content_gate(
+        gascity_pack_inference_gate.PACK_SPECS["gastown"].source
+    )
+
+
+def test_validate_polecat_branch_content_gate_rejects_gate_moved_after_the_push(tmp_path) -> None:
+    pack_source = gastown_formulas_copy(tmp_path)
+    path = pack_source / "formulas" / "mol-polecat-work.toml"
+    text = path.read_text(encoding="utf-8")
+    start = text.index("**2b. Branch-content gate")
+    # Anchored on the step-3 heading PREFIX, not its title: the title is prose
+    # and has been reworded once already ("Push your branch" -> "Push gate --
+    # FAIL CLOSED, then push"), which silently turned this slice into a
+    # ValueError rather than a failed assertion.
+    end = text.index("**3. ", start)
+    gate = text[start:end]
+    remainder = text[:start] + text[end:]
+    push_line = "git push origin HEAD\n"
+    anchor = remainder.index(push_line) + len(push_line)
+    path.write_text(remainder[:anchor] + gate + remainder[anchor:], encoding="utf-8")
+
+    # A relocated gate is invisible to the fragment pins: they are containment
+    # checks over the whole file, so every one of them still passes on a gate
+    # that now runs after the push it was supposed to prevent.
+    relocated = path.read_text(encoding="utf-8")
+    for fragment in gascity_pack_inference_gate.GASTOWN_BUILD_WORKFLOW_CONTRACTS["mol-polecat-work"]:
+        assert fragment in relocated
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="before the push"):
+        gascity_pack_inference_gate.validate_polecat_branch_content_gate(pack_source)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement", "expected"),
+    [
+        pytest.param(
+            "''|*[!0-9]*) HALT_REASON=content_gate_error ;;",
+            "",
+            "unmeasurable-count arm",
+            id="deleted-fail-closed-arm",
+        ),
+        pytest.param(
+            "0) HALT_REASON=no_commits ;;",
+            "1) HALT_REASON=no_commits ;;",
+            "empty-branch arm",
+            id="inverted-empty-branch-arm",
+        ),
+        pytest.param(
+            'esac\nif [ -n "$HALT_REASON" ]; then',
+            'esac\nHALT_REASON=""\nif [ -n "$HALT_REASON" ]; then',
+            "halt guard",
+            id="disarmed-between-decision-and-halt",
+        ),
+        pytest.param(
+            'for ESCALATE_TARGET in mayor "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness"; do',
+            'for ESCALATE_TARGET in mayor; do',
+            "mayor and witness escalation",
+            id="dropped-witness-escalation",
+        ),
+        # `case` takes the first match, so a catch-all ahead of an arm disarms
+        # it while leaving the arm itself -- and every other fragment -- in
+        # place. Both positions are probed: ahead of the fail-closed arm
+        # (disarms both reasons) and between the arms, which kills only
+        # `no_commits` and is the likeliest accidental edit of the two, since
+        # an explicit default arm is harmless written *after* arm 2.
+        pytest.param(
+            "    ''|*[!0-9]*) HALT_REASON=content_gate_error ;;",
+            '    *) HALT_REASON="" ;;\n'
+            "    ''|*[!0-9]*) HALT_REASON=content_gate_error ;;",
+            "case dispatch",
+            id="catch-all-arm-ahead-of-the-fail-closed-arm",
+        ),
+        pytest.param(
+            "    0) HALT_REASON=no_commits ;;",
+            '    *) HALT_REASON="" ;;\n    0) HALT_REASON=no_commits ;;',
+            "case dispatch",
+            id="catch-all-arm-between-the-two-arms",
+        ),
+        pytest.param(
+            'case "$COMMITS_AHEAD" in',
+            'case "x$COMMITS_AHEAD" in',
+            "case dispatch",
+            id="dispatch-subject-that-can-never-match",
+        ),
+        # Without `exit 1` the fence ends rc=0, so the agent goes on to the
+        # step-3 push gate and pushes a branch this gate just declared unfit,
+        # after the halt has already released the bead.
+        pytest.param(
+            "    done\n    gc runtime drain-ack\n    exit 1",
+            "    done\n    gc runtime drain-ack",
+            "halt exit",
+            id="deleted-halt-exit",
+        ),
+    ],
+)
+def test_validate_polecat_branch_content_gate_rejects_disarmed_halt_path(
+    tmp_path, original, replacement, expected
+) -> None:
+    pack_source = gastown_formulas_copy(tmp_path)
+    path = pack_source / "formulas" / "mol-polecat-work.toml"
+    text = path.read_text(encoding="utf-8")
+    assert text.count(original) == 1
+    path.write_text(text.replace(original, replacement), encoding="utf-8")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=expected):
+        gascity_pack_inference_gate.validate_polecat_branch_content_gate(pack_source)
+
+
+def test_validate_polecat_branch_content_gate_rejects_deleting_the_gates_own_drain_ack(
+    tmp_path,
+) -> None:
+    """The halt-path window ends at the push, so it spans the next halt too.
+
+    An unanchored ``gc runtime drain-ack`` fragment is therefore satisfied by
+    the auto_push=false halt's own copy, and deleting the branch-content gate's
+    drain-ack left the validator green. The fragment is anchored to the
+    escalation loop's ``done`` instead, which occurs only in this gate.
+    """
+    pack_source = gastown_formulas_copy(tmp_path)
+    path = pack_source / "formulas" / "mol-polecat-work.toml"
+    text = path.read_text(encoding="utf-8")
+    original = "    done\n    gc runtime drain-ack\n    exit 1"
+    assert text.count(original) == 1
+    mutated = text.replace(original, "    done\n    exit 1")
+    path.write_text(mutated, encoding="utf-8")
+
+    # The precondition that makes the rejection below meaningful: the bare
+    # fragment is still present elsewhere in the checked window, so a
+    # containment check on it alone cannot tell the two halts apart.
+    assert "gc runtime drain-ack" in mutated
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="halt exit"):
+        gascity_pack_inference_gate.validate_polecat_branch_content_gate(pack_source)
+
+
 def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
     for pack_name in gascity_pack_inference_gate.METHODOLOGY_PACKS:
         gascity_pack_inference_gate.validate_methodology_flow_contract(
@@ -1137,6 +1282,12 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
         "mol-idea-to-plan",
     }
     assert "gc session wake \"$REFINERY_TARGET\"" in contracts["mol-polecat-work"]
+    assert (
+        'COMMITS_AHEAD=$(git rev-list --count "origin/{{base_branch}}..HEAD" 2>/dev/null)'
+        in contracts["mol-polecat-work"]
+    )
+    assert "''|*[!0-9]*) HALT_REASON=content_gate_error ;;" in contracts["mol-polecat-work"]
+    assert "0) HALT_REASON=no_commits ;;" in contracts["mol-polecat-work"]
     assert 'git worktree add --detach "$MERGE_WT" "origin/$TARGET"' in contracts["mol-refinery-patrol"]
     assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in contracts["mol-refinery-patrol"]
     assert "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"" in contracts["mol-refinery-patrol"]
