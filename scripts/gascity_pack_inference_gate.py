@@ -117,7 +117,7 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "gc runtime drain-ack",
     ),
     "mol-refinery-patrol": (
-        "gc bd list ${GC_RIG:+--rig=\"$GC_RIG\"} --assignee=$GC_AGENT --status=open",
+        "gc bd list ${GC_RIG:+--rig=\"$GC_RIG\"} --assignee=$GC_AGENT --status=open,in_progress",
         "git rebase origin/$TARGET",
         "{{typecheck_command}}",
         "{{lint_command}}",
