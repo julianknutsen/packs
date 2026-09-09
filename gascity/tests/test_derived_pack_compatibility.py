@@ -480,12 +480,17 @@ class DerivedPackCompatibilityTests(unittest.TestCase):
                             step["check"]["max_attempts"],
                             base_contract.BUILD_ARTIFACT_GATE_MAX_ATTEMPTS,
                         )
-                        self.assertEqual(
-                            step["check"]["check"],
+                        check = step["check"]["check"]
+                        self.assertEqual(check["mode"], "exec")
+                        self.assertEqual(check["timeout"], "5m")
+                        # A derived step may either inherit the gascity
+                        # formula's pack-relative asset or replace the whole
+                        # step with its existing launcher-compatibility path.
+                        self.assertIn(
+                            check["path"],
                             {
-                                "mode": "exec",
-                                "path": base_contract.BUILD_ARTIFACT_CHECK_SCRIPT,
-                                "timeout": "5m",
+                                base_contract.BUILD_ARTIFACT_CHECK_SCRIPT,
+                                base_contract.GASCITY_BUILD_ARTIFACT_CHECK_SCRIPT,
                             },
                         )
                         self.assertEqual(

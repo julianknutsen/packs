@@ -193,6 +193,12 @@ The base pack owns machine-readable schemas for base artifacts. The human
 requirements ledger is normative, and schema files are the enforcement target
 for formula checks. Base schemas are expected at stable paths:
 
+Formula checks owned by this pack use paths relative to the defining formula
+layer, such as `../assets/scripts/checks/build-artifact-valid.sh`. Gas City
+resolves those paths to the winning pack layer before instantiation. They are
+not launcher- or store-relative `.gc/scripts` paths, and a target rig is not
+required to install a copy of the validator.
+
 | Schema | Expected path |
 | --- | --- |
 | `gc.build.requirements.v1` | `gascity/schemas/build/requirements.v1.yaml` |

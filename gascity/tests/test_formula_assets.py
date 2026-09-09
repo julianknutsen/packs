@@ -221,7 +221,11 @@ MODE_VAR_DEFAULTS = {
     "github-pr-review": {"interaction_mode": "interactive", "review_mode": "report"},
 }
 
+# Derived packs still use the launcher-installed compatibility path in their
+# explicit step overrides. The base gascity pack owns and resolves its script
+# from the sibling asset tree.
 BUILD_ARTIFACT_CHECK_SCRIPT = ".gc/scripts/checks/build-artifact-valid.sh"
+GASCITY_BUILD_ARTIFACT_CHECK_SCRIPT = "../assets/scripts/checks/build-artifact-valid.sh"
 
 # One produce attempt plus two bounded schema-repair attempts per artifact stage.
 BUILD_ARTIFACT_GATE_MAX_ATTEMPTS = 3
@@ -4159,6 +4163,29 @@ description = "Override sink that writes the base triage report contract."
             self.assertNotIn("/data/projects", text)
             self.assertNotIn("gascity-packs-worktrees", text)
 
+    def test_formula_checks_resolve_from_versioned_pack_assets(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        formula_paths = sorted((root / "formulas").glob("*.formula.toml"))
+        referenced_checks: set[pathlib.Path] = set()
+
+        for formula_path in formula_paths:
+            text = formula_path.read_text(encoding="utf-8")
+            with self.subTest(formula=formula_path.name):
+                self.assertNotIn(
+                    '.gc/scripts/checks/',
+                    text,
+                    "pack-owned validators must not depend on launcher-local .gc files",
+                )
+                for relative_path in re.findall(
+                    r'path = "(\.\./assets/scripts/checks/[^\"]+\.sh)"', text
+                ):
+                    script = (formula_path.parent / relative_path).resolve()
+                    self.assertTrue(script.is_file(), f"missing pack check asset: {script}")
+                    self.assertTrue(os.access(script, os.X_OK), f"{script} must be executable")
+                    referenced_checks.add(script)
+
+        self.assertTrue(referenced_checks, "expected formulas to reference pack check assets")
+
     def test_producer_stages_gate_artifacts_with_bounded_repair(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
 
@@ -4184,7 +4211,7 @@ description = "Override sink that writes the base triage report contract."
                     step["check"]["check"],
                     {
                         "mode": "exec",
-                        "path": BUILD_ARTIFACT_CHECK_SCRIPT,
+                        "path": GASCITY_BUILD_ARTIFACT_CHECK_SCRIPT,
                         "timeout": "5m",
                     },
                 )

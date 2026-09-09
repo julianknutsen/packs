@@ -33,7 +33,7 @@ max_attempts = 6
 
 [template.check.check]
 mode = "exec"
-path = ".gc/scripts/checks/implementation-review-approved.sh"
+path = "../assets/scripts/checks/implementation-review-approved.sh"
 timeout = "10m"
 
 [[template.children]]
@@ -84,5 +84,5 @@ max_attempts = 3
 
 [template.check.check]
 mode = "exec"
-path = ".gc/scripts/checks/build-artifact-valid.sh"
+path = "../assets/scripts/checks/build-artifact-valid.sh"
 timeout = "5m"
