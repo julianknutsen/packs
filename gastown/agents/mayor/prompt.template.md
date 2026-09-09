@@ -159,12 +159,16 @@ Record one of the six words; do not record `null` expecting a halt.
 `mol-polecat-work` fails closed on the mismatch — a bead whose prose asserts a
 no-push rail with no `auto_push` key halts at branch-ready and escalates rather
 than pushing. That is a backstop, not a substitute: it costs a round trip and a
-human read every time, it can only see DESCRIPTION and NOTES, so a rail that
-lives in a comment is invisible to it, and it only covers the polecat's own
-submit-and-exit. A polecat that DIES mid-work is recovered by the witness's
+human read every time, it can only see DESCRIPTION, NOTES, DESIGN and
+ACCEPTANCE_CRITERIA, so a rail that lives in a comment is invisible to it, and
+it only covers the polecat's own submit-and-exit. A polecat that DIES mid-work
+is recovered by the witness's
 orphan salvage, which pushes the branch without consulting `auto_push` or the
 prose at all — so on a bead that must not reach the remote, the metadata is the
-record that survives the crash, and even it is not enforced on that path.
+record that survives the crash, and even it is not enforced on that path
+(tracked as gp-urpkw; `mol-witness-patrol` salvage Cases C/D carry the matching
+warning). Until that lands, a frozen-tenant bead needs a human watching the
+witness, not just a correct `auto_push`.
 
 **Rule**: if a rail changes what the polecat DOES, it belongs in metadata. Use
 `--set-metadata` (never bare `--metadata`) so `branch` and `gc.routed_to`
@@ -183,8 +187,15 @@ else
             elif type == "null" then {}
             else . end)
          | if type != "object" then "unreadable"
+           else with_entries(.key |= ascii_downcase) end
+         | if type != "object" then .
            elif has("auto_push")
-           then (if .auto_push == null then "absent" else (.auto_push | tostring) end)
+           then (if .auto_push == null then "absent"
+                 else (.auto_push | tostring | ascii_downcase
+                       | if   . == "false" or . == "no"  or . == "0" then "false"
+                         elif . == "true"  or . == "yes" or . == "1" then "true"
+                         else "unreadable (value outside vocabulary)" end)
+                 end)
            else "absent" end
     end'
 fi
@@ -194,7 +205,16 @@ fi
 `has("auto_push")` ERRORS on a `metadata` payload served as a JSON string — jq
 exits 5 printing nothing, so the read shows up as "no key" on the beads most
 worth checking. That is the same shape trap `mol-polecat-work`'s own probe
-normalises; the three answers above are its three outcomes.
+normalises; the answers above are its outcomes, reported in the gate's own
+words rather than yours. The value branch therefore applies the gate's closed
+vocabulary as well as its shape normalisation: `no`/`0`/`False` read back as
+`false` because that is what the gate decides, and a value the vocabulary does
+not contain reads back as `unreadable (value outside vocabulary)` because the
+gate answers it with the `metadata_unreadable` halt. Reporting a recorded
+`maybe` back to you as `maybe` at exit 0 was the divergence this closes: it
+looks like a settled answer on exactly the beads worth checking, and the gate
+will refuse it. The key is case-folded here for the same reason it is in the
+gate — a hand-typed `AUTO_PUSH` is a recorded decision, not an absent one.
 
 The guards around the jq are the rest of that mirror, and they exist because a
 FAILED READ must not be reportable as a settled answer. `jq` prints nothing and

@@ -434,6 +434,14 @@ BRANCH=$(git branch --show-current)
 #             the OPPOSITE default to the (b) prose scan's empty INPUT case:
 #             there, nothing said is a legitimate "no rail"; here, nothing read
 #             is a failure to retrieve a decision that may well exist.
+#             The KEY is case-folded for the same reason the VALUE is, and it
+#             was not until 2026-09-09: `has()` folded the value while the key
+#             stayed literal, so a hand-typed `AUTO_PUSH=false` (env-var habit,
+#             and the key is hand-written by exactly the humans who make that
+#             typo) read as ABSENT, fell through to the prose scan, and pushed
+#             despite a recorded opt-out. Folding collapses a bead carrying
+#             both spellings onto one entry — an ambiguity so rare it is not
+#             worth a fourth halt, and either spelling is an explicit decision.
 AUTO_PUSH=""
 META_UNREADABLE=""
 if [ -z "$WORK_JSON" ]; then
@@ -447,7 +455,8 @@ elif ! AUTO_PUSH=$(printf '%s' "$WORK_JSON" | jq -r '
               elif type == "string" then (fromjson? // "unparseable")
               else "not-an-object" end)
            | if type != "object" then error("metadata is not an object")
-             elif has("auto_push") then (.auto_push | tostring | ascii_downcase
+             else with_entries(.key |= ascii_downcase) end
+           | if has("auto_push") then (.auto_push | tostring | ascii_downcase
                    | if   . == "false" or . == "no"  or . == "0" then "false"
                      elif . == "true"  or . == "yes" or . == "1" then "true"
                      elif . == "null" then ""
@@ -555,9 +564,20 @@ fi
 #      auto_push and re-slings) where a missed rail is not, so this is left as a
 #      halt rather than narrowed.
 #
-# Comments are deliberately out of scope: they are discussion, not standing
-# instructions, and they self-match on any bead that merely talks about
-# no-push rails.
+# The scan reads the four STANDING-INSTRUCTION fields — description, notes,
+# design and acceptance_criteria. The last two were blind until 2026-09-09: a
+# rail written in either was invisible and the gate PUSHED, the unrecoverable
+# direction, and it is not a hypothetical shape — measured read-only against
+# this rig, 20 of the last 200 beads carry non-empty content in one of them,
+# and the suite's own in-use rail wording ("ACCEPTANCE: ... HALT branch-ready
+# — do NOT deploy") is acceptance-shaped text that only halted while it
+# happened to sit in the description.
+#
+# Comments are deliberately out of scope, and the four fields above are why
+# that exclusion is narrow rather than arbitrary: comments are discussion, so
+# they self-match on any bead that merely talks about no-push rails. design and
+# acceptance_criteria are the opposite — standing instructions the requester
+# wrote for the implementer, exactly like description and notes.
 if [ -z "$AUTO_PUSH" ]; then
   # Extract, downcase and strip in CHECKED stages. grep -c prints a count
   # whenever it runs, so a failure INSIDE one long pipe arrives at the match
@@ -566,7 +586,7 @@ if [ -z "$AUTO_PUSH" ]; then
   # treated as an asserted one. ${RAIL_HIT:-1} then covers the last stage,
   # where an empty result can only mean grep itself never ran.
   RAIL_HIT=""
-  if ! PROSE=$(printf '%s' "$WORK_JSON" | jq -r '(.[0].description // ""), (.[0].notes // "")' 2>/dev/null); then
+  if ! PROSE=$(printf '%s' "$WORK_JSON" | jq -r '(.[0].description // ""), (.[0].notes // ""), (.[0].design // ""), (.[0].acceptance_criteria // "")' 2>/dev/null); then
     RAIL_HIT=1
   elif ! LOWER=$(printf '%s' "$PROSE" | tr '[:upper:]' '[:lower:]'); then
     RAIL_HIT=1
@@ -579,9 +599,28 @@ if [ -z "$AUTO_PUSH" ]; then
     # `never push` for consistency, though a modal cannot take the -es/-ed form
     # that guard exists for, so on those two arms it only catches ungrammatical
     # prose. The value arm takes the FULL closed vocabulary — `no` and `0` are
-    # the same word as `false` at :450-455, and reading them as consent here
-    # while halting on them there is the mismatch this gate is about.
-    RAIL_HIT=$(printf '%s' "$SCAN" | grep -Eic 'no[- ]push([^e]|$)|do not push|don.t push|never push([^e]|$)|(must|should) not push([^e]|$)|(mayor|operator|human) publishes|halt[- ]*(at[- ]+)?branch[- ]ready|branch[- ]ready[- ]+halt|auto_push[[:space:]]*=[[:space:]]*(false|no|0)')
+    # the same word as `false` in the metadata probe's closed vocabulary above,
+    # and reading them as consent here while halting on them there is the
+    # mismatch this gate is about. (Cite the construct, not a line number: a
+    # self-referential `:NNN` in a prose-heavy step is accurate the day it is
+    # written and silently wrong after the next edit, with no test to notice.)
+    #
+    # `no[- ]push` takes `(ing)?` and a NON-ALPHANUMERIC boundary rather than
+    # the old `([^e]|$)`. `[^e]` only excluded pushes/pushed, so the ordinary
+    # idiom "no pushback on the approach" halted and paged a human on a
+    # majority-path bead — the cry-wolf failure this gate's own rationale says
+    # makes a gate get routed around. The `(ing)?` is load-bearing and not
+    # decoration: the bare `no[- ]push([^[:alnum:]]|$)` narrowing silently
+    # flips the real rail "no pushing to this repo" back to a PUSH, and the
+    # suite stays green while it does, so a row now pins that form.
+    #
+    # The passive arm `(not|never) be push(ed)?` exists because every other arm
+    # is active-voice adjacency: "this branch must not be pushed to main" and
+    # "should never be pushed to origin" scored ZERO hits and pushed. Do NOT
+    # "fix" that by widening the strip alternation above to push(ing|es|ed)? —
+    # the strip runs BEFORE this match, so it would eat "pushed to main" out of
+    # the primary case and return it to a push even with this arm present.
+    RAIL_HIT=$(printf '%s' "$SCAN" | grep -Eic 'no[- ]push(ing)?([^[:alnum:]]|$)|do not push|don.t push|never push([^e]|$)|(must|should) not push([^e]|$)|(not|never) be push(ed)?|(mayor|operator|human) publishes|halt[- ]*(at[- ]+)?branch[- ]ready|branch[- ]ready[- ]+halt|auto_push[[:space:]]*=[[:space:]]*(false|no|0)')
   fi
   if [ "${RAIL_HIT:-1}" -gt 0 ]; then
     echo "NO-PUSH RAIL IN PROSE + auto_push ABSENT — halting at branch-ready (fail closed) and escalating."
@@ -595,15 +634,16 @@ if [ -z "$AUTO_PUSH" ]; then
       --set-metadata branch_ready=true \
       --set-metadata halt_reason=no_push_rail_unresolved \
       --set-metadata gc.routed_to="" \
-      --append-notes "Branch ready: DESCRIPTION/NOTES assert a no-push rail but the bead carries no auto_push metadata, so the rail is unenforceable. Halted instead of guessing. Whoever owns the rail: set auto_push=false to confirm the halt, or auto_push=true to authorise the push, then re-sling."
+      --append-notes "Branch ready: DESCRIPTION/NOTES/DESIGN/ACCEPTANCE_CRITERIA assert a no-push rail but the bead carries no auto_push metadata, so the rail is unenforceable. Halted instead of guessing. Whoever owns the rail: set auto_push=false to confirm the halt, or auto_push=true to authorise the push, then re-sling."
     gc mail send "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" \
       -s "HELP: no-push rail unresolved on $WORK_BEAD_ID [HIGH]" \
       -m "Halted at branch-ready instead of pushing.
 
 Bead:   $WORK_BEAD_ID
 Branch: $BRANCH (local only — NOT pushed)
-Reason: DESCRIPTION/NOTES assert a no-push rail, but metadata.auto_push is
-        absent. The push gate cannot tell 'halt' from 'go', so it halted.
+Reason: DESCRIPTION/NOTES/DESIGN/ACCEPTANCE_CRITERIA assert a no-push rail, but
+        metadata.auto_push is absent. The push gate cannot tell 'halt' from
+        'go', so it halted.
 
 Resolve: read the rail, then record the decision as metadata —
   gc bd update $WORK_BEAD_ID --set-metadata auto_push=false   # confirm the halt

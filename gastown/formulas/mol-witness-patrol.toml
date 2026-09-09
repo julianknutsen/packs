@@ -282,6 +282,16 @@ git ls-remote --heads origin $BRANCH
 If branch IS on origin → skip to Step 3.
 If branch is NOT on origin → fall through to Case C.
 
+**KNOWN GAP, Cases C and D (gp-urpkw).** Both publish with `git push origin
+HEAD` unconditionally: no `metadata.auto_push` probe, no prose scan. The
+polecat's own push gate (`mol-polecat-work`, `submit-and-exit`) fails CLOSED on
+exactly this decision — a bead asserting a no-push rail with no recorded
+`auto_push` halts at branch-ready rather than pushing — but that gate only
+covers the polecat's own exit. Salvage runs on beads whose polecat DIED, so a
+bead that must not reach the remote is published here anyway. Until gp-urpkw
+lands, `metadata.auto_push=false` is not enforced on this path: check it by
+hand before salvaging a bead on a frozen or customer-owned tenant.
+
 **Case C: Worktree exists with unpushed commits.**
 Work is committed locally but never pushed. Branch is not yet canonical.
 ```bash
