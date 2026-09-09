@@ -22,10 +22,12 @@
 #
 # Contract:
 #   * One path, serialized. Every run on a repository takes the lock
-#     <git common dir>/worker-worktree.lock before it reads or changes anything
-#     and releases it on exit; a lock whose owning pid is gone is cleared. So
-#     two sessions preparing lanes at once cannot race on branch creation, on
-#     the same lane, or on the aside destination.
+#     <git common dir>/worker-worktree.lock (mkdir) before it reads or changes
+#     anything and releases it on exit. A stale lock (owner dead or a zombie, or
+#     no owner published for two minutes) is reclaimed by an atomic rename, so
+#     two contenders cannot both clear it and a live lock is never removed. Two
+#     sessions preparing lanes at once therefore cannot race on branch
+#     creation, on the same lane, or on the aside destination.
 #   * The work dir is resolved on the real filesystem: it must exist, or its
 #     parent must exist and its last component must be a plain name (no `.`,
 #     `..`, or deeper missing levels). Symlinks resolve. The rig root itself,
@@ -92,9 +94,10 @@ done
 [ -d "$RIG_ROOT" ] || die "rig root is not a directory: $RIG_ROOT"
 command -v git >/dev/null 2>&1 || die "git is required on PATH"
 
-# abs DIR: absolute, symlink-resolved path of an existing directory. Callers
-# check the exit status; a failure is never silently folded into a path.
-abs() { (cd "$1" 2>/dev/null && pwd -P); }
+# abs DIR: absolute, symlink-resolved path of an existing directory, with `..`
+# resolved physically (cd -P), so "<symlink>/.." lands where the kernel puts it.
+# Callers check the exit status; a failure is never silently folded into a path.
+abs() { (cd -P "$1" 2>/dev/null && pwd -P); }
 
 # --- resolve and check paths, before anything else --------------------------------
 
@@ -138,6 +141,12 @@ RIG_COMMON="$(abs "$RIG_COMMON")" || die "cannot resolve the rig's git dir"
 git_rig() { git -C "$RIG_ROOT" "$@"; }
 
 # --- lock: one run per repository at a time -----------------------------------------
+# mkdir is the atomic acquire. A stale lock (owner pid dead or a zombie, or no
+# owner published for over two minutes) is reclaimed by RENAMING it to a
+# private name first: rename is atomic, so of two contenders that both saw the
+# same stale lock only one succeeds and only that one removes what it renamed;
+# the other's rename fails and it simply retries mkdir. Nothing ever removes a
+# lock in place, so a live lock cannot be deleted by a late contender.
 
 LOCK="$RIG_COMMON/worker-worktree.lock"
 LOCKED=0
@@ -146,6 +155,26 @@ release_lock() {
         rm -f "$LOCK/pid" 2>/dev/null || true
         rmdir "$LOCK" 2>/dev/null || true
         LOCKED=0
+    fi
+}
+
+lock_is_stale() {
+    owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ]; then
+        ! kill -0 "$owner" 2>/dev/null || owner_is_zombie "$owner"
+    else
+        # No owner published: a run died between mkdir and the pid write. Age it
+        # out rather than trusting the gap (a live run publishes within ms).
+        [ -n "$(find "$LOCK" -maxdepth 0 -mmin +2 2>/dev/null)" ]
+    fi
+}
+
+reclaim_stale_lock() {
+    claimed="$LOCK.stale.$$"
+    if mv "$LOCK" "$claimed" 2>/dev/null; then
+        warn "clearing stale lock $LOCK (owner pid ${owner:-none})"
+        rm -f "$claimed/pid" 2>/dev/null || true
+        rmdir "$claimed" 2>/dev/null || true
     fi
 }
 trap 'release_lock' EXIT
@@ -167,13 +196,8 @@ while :; do
         printf '%s\n' "$$" > "$LOCK/pid"
         break
     fi
-    owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
-    # Dead owner: no such process, or a zombie its parent never reaped (kill -0
-    # still succeeds on a zombie; ps reports state Z).
-    if [ -n "$owner" ] && { ! kill -0 "$owner" 2>/dev/null || owner_is_zombie "$owner"; }; then
-        warn "clearing stale lock $LOCK left by pid $owner"
-        rm -f "$LOCK/pid" 2>/dev/null || true
-        rmdir "$LOCK" 2>/dev/null || true
+    if lock_is_stale; then
+        reclaim_stale_lock
         continue
     fi
     [ "$waited" -lt "$LOCK_WAIT" ] || die "another worker-worktree run (pid ${owner:-unknown}) has held $LOCK for ${LOCK_WAIT}s"
@@ -202,7 +226,9 @@ if [ -z "$BASE" ]; then
         warn "no $REMOTE/HEAD, $REMOTE/main or $REMOTE/master; new branches start at the rig root's HEAD"
     fi
 fi
-git_rig rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || die "base ref does not resolve: $BASE"
+# Pin the base to a commit once, in the rig: a symbolic name such as HEAD would
+# otherwise be re-read inside the lane, where it means something else.
+BASE_SHA="$(git_rig rev-parse --verify --quiet "$BASE^{commit}")" || die "base ref does not resolve: $BASE"
 
 # --- helpers ------------------------------------------------------------------------------
 
@@ -262,40 +288,6 @@ move_aside() {
     warn "moved aside $1 -> $aside ($2); nothing was deleted"
 }
 
-# --- resolve what the work dir should have checked out --------------------------------------
-# MODE: local (check out TARGET), remote (track TARGET from the remote),
-# new (create TARGET from BASE), detached (detach at DETACH_AT).
-MODE=""
-TARGET=""
-DETACH_AT=""
-if [ -z "$BEAD" ]; then
-    MODE="detached"
-    DETACH_AT="$BASE"
-else
-    candidates="$(bead_branches)"
-    count="$(printf '%s\n' "$candidates" | grep -c . || true)"
-    if [ "$count" -gt 1 ]; then
-        die "several branches name bead $BEAD; pass --bead with a unique id, or --base and no bead: $(printf '%s\n' "$candidates" | tr '\n' ' ')"
-    elif [ "$count" -eq 0 ]; then
-        MODE="new"
-        TARGET="$BEAD"
-    else
-        TARGET="$candidates"
-        if git_rig show-ref --verify --quiet "refs/heads/$TARGET"; then
-            elsewhere="$(checked_out_at "$TARGET" | grep -v -x -F -- "$WORKDIR" || true)"
-            if [ -n "$elsewhere" ]; then
-                MODE="detached"
-                DETACH_AT="$TARGET"
-                warn "branch $TARGET is checked out at $elsewhere; leaving $WORKDIR detached at its tip. Create your own branch in this work dir before committing."
-            else
-                MODE="local"
-            fi
-        else
-            MODE="remote"
-        fi
-    fi
-fi
-
 # --- classify the work dir ------------------------------------------------------------------
 IS_WORKTREE=0
 if [ -d "$WORKDIR" ]; then
@@ -310,13 +302,50 @@ if [ -d "$WORKDIR" ]; then
     fi
 fi
 
+# --- resolve what the work dir should have checked out --------------------------------------
+# Runs AFTER classification so a worktree just moved aside (which still holds
+# its branch) is seen as "checked out elsewhere" and the detached fallback
+# applies instead of a failing worktree add.
+# MODE: local (check out TARGET), remote (track TARGET from the remote),
+# new (create TARGET from BASE_SHA), detached (detach at DETACH_AT, a commit).
+MODE=""
+TARGET=""
+DETACH_AT=""
+if [ -z "$BEAD" ]; then
+    MODE="detached"
+    DETACH_AT="$BASE_SHA"
+else
+    candidates="$(bead_branches)"
+    count="$(printf '%s\n' "$candidates" | grep -c . || true)"
+    if [ "$count" -gt 1 ]; then
+        die "several branches name bead $BEAD; pass --bead with a unique id, or --base and no bead: $(printf '%s\n' "$candidates" | tr '\n' ' ')"
+    elif [ "$count" -eq 0 ]; then
+        MODE="new"
+        TARGET="$BEAD"
+    else
+        TARGET="$candidates"
+        if git_rig show-ref --verify --quiet "refs/heads/$TARGET"; then
+            elsewhere="$(checked_out_at "$TARGET" | grep -v -x -F -- "$WORKDIR" || true)"
+            if [ -n "$elsewhere" ]; then
+                MODE="detached"
+                DETACH_AT="$(git_rig rev-parse --verify "refs/heads/$TARGET^{commit}")"
+                warn "branch $TARGET is checked out at $elsewhere; leaving $WORKDIR detached at its tip. Create your own branch in this work dir before committing."
+            else
+                MODE="local"
+            fi
+        else
+            MODE="remote"
+        fi
+    fi
+fi
+
 # --- act --------------------------------------------------------------------------------------
 add_worktree() {
     [ -d "$WORKDIR" ] || mkdir -p "$WORKDIR"
     case "$MODE" in
         local)    git_rig worktree add --quiet "$WORKDIR" "$TARGET" ;;
         remote)   git_rig worktree add --quiet --track -b "$TARGET" "$WORKDIR" "$REMOTE/$TARGET" ;;
-        new)      git_rig worktree add --quiet -b "$TARGET" "$WORKDIR" "$BASE" ;;
+        new)      git_rig worktree add --quiet -b "$TARGET" "$WORKDIR" "$BASE_SHA" ;;
         detached) git_rig worktree add --quiet --detach "$WORKDIR" "$DETACH_AT" ;;
     esac
 }
@@ -328,7 +357,7 @@ switch_worktree() {
     case "$MODE" in
         local)    git -C "$WORKDIR" switch --quiet --no-overwrite-ignore "$TARGET" ;;
         remote)   git -C "$WORKDIR" switch --quiet --no-overwrite-ignore -c "$TARGET" --track "$REMOTE/$TARGET" ;;
-        new)      git -C "$WORKDIR" switch --quiet --no-overwrite-ignore -c "$TARGET" "$BASE" ;;
+        new)      git -C "$WORKDIR" switch --quiet --no-overwrite-ignore -c "$TARGET" "$BASE_SHA" ;;
         detached) git -C "$WORKDIR" switch --quiet --no-overwrite-ignore --detach "$DETACH_AT" ;;
     esac
 }
@@ -338,8 +367,7 @@ if [ "$IS_WORKTREE" -eq 1 ]; then
     need_switch=1
     case "$MODE" in
         local)    [ "$current" != "$TARGET" ] || need_switch=0 ;;
-        detached) if [ "$current" = "HEAD" ] \
-                     && [ "$(git -C "$WORKDIR" rev-parse HEAD)" = "$(git_rig rev-parse "$DETACH_AT^{commit}")" ]; then
+        detached) if [ "$current" = "HEAD" ] && [ "$(git -C "$WORKDIR" rev-parse HEAD)" = "$DETACH_AT" ]; then
                       need_switch=0
                   fi ;;
     esac
@@ -360,7 +388,8 @@ is_our_worktree "$WORKDIR" || die "$WORKDIR is not a worktree of $RIG_ROOT after
 branch="$(git -C "$WORKDIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 case "$MODE" in
     local|remote|new) [ "$branch" = "$TARGET" ] || die "$WORKDIR is on $branch, expected $TARGET" ;;
-    detached)         [ "$branch" = "HEAD" ] || die "$WORKDIR is on $branch, expected a detached HEAD" ;;
+    detached)         [ "$branch" = "HEAD" ] || die "$WORKDIR is on $branch, expected a detached HEAD"
+                      [ "$(git -C "$WORKDIR" rev-parse HEAD)" = "$DETACH_AT" ] || die "$WORKDIR is detached at $(git -C "$WORKDIR" rev-parse --short HEAD), expected $DETACH_AT" ;;
 esac
 [ "$branch" != "HEAD" ] || branch="detached"
 sha="$(git -C "$WORKDIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"

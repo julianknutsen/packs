@@ -394,6 +394,43 @@ class WorkerWorktreeTests(unittest.TestCase):
         self.assertIn("clearing stale lock", proc.stderr)
         self.assertEqual(self.branch_of(self.lane), "gp-abc1")
 
+    def test_dirty_lane_on_the_same_bead_restarts_detached_at_its_tip(self) -> None:
+        self.fx.run(self.lane, "gp-old1")
+        sha = commit(self.lane, "work.txt", "committed\n", "bead work")
+        (self.lane / "README.md").write_text("uncommitted edit\n", encoding="utf-8")
+        proc = self.fx.run(self.lane, "gp-old1")
+        asides = self.asides()
+        self.assertEqual(len(asides), 1)
+        self.assertEqual(self.branch_of(asides[0]), "gp-old1")
+        self.assertEqual((asides[0] / "README.md").read_text(encoding="utf-8"), "uncommitted edit\n")
+        self.assertEqual(self.branch_of(self.lane), "HEAD")
+        self.assertEqual(git(self.lane, "rev-parse", "HEAD"), sha)
+        self.assertIn("checked out at", proc.stderr)
+        self.assertEqual(proc.stdout.split()[2], "detached")
+
+    def test_base_head_fallback_means_the_rig_head_not_the_lane_head(self) -> None:
+        # No usable remote: BASE falls back to HEAD, which must be the rig's.
+        self.fx.run(self.lane, "gp-old1")
+        commit(self.lane, "ahead.txt", "x\n", "lane moved ahead")
+        proc = self.fx.run(self.lane, None, "--remote", "nosuch", "--no-fetch")
+        self.assertIn("new branches start at the rig root's HEAD", proc.stderr)
+        self.assertEqual(self.branch_of(self.lane), "HEAD")
+        self.assertEqual(git(self.lane, "rev-parse", "HEAD"), self.fx.main_sha)
+        proc = self.fx.run(self.lane, "gp-new2", "--remote", "nosuch", "--no-fetch")
+        self.assertEqual(self.branch_of(self.lane), "gp-new2")
+        self.assertEqual(git(self.lane, "rev-parse", "HEAD"), self.fx.main_sha)
+
+    def test_ownerless_old_lock_is_reclaimed_but_a_fresh_one_is_respected(self) -> None:
+        self.lock_dir().mkdir()  # no pid file: a run died between mkdir and publishing
+        proc = self.fx.run(self.lane, "gp-abc1", check=False, env_extra={"WORKER_WORKTREE_LOCK_WAIT": "2"})
+        self.assertNotEqual(proc.returncode, 0)  # fresh: respected
+        os.utime(self.lock_dir(), (time.time() - 300, time.time() - 300))
+        proc = self.fx.run(self.lane, "gp-abc1")
+        self.assertIn("clearing stale lock", proc.stderr)
+        self.assertEqual(self.branch_of(self.lane), "gp-abc1")
+        self.assertFalse(self.lock_dir().exists())
+        self.assertEqual(sorted(self.fx.rig.joinpath(".git").glob("worker-worktree.lock*")), [])
+
     # --- refusals ----------------------------------------------------------------------------
 
     def test_workdir_inside_rig_root_is_refused_even_if_it_does_not_exist(self) -> None:
@@ -440,6 +477,17 @@ class WorkerWorktreeTests(unittest.TestCase):
         proc = self.fx.run(alias / "nested", "gp-abc1", check=False, mkdir=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("inside the rig root", proc.stderr)
+
+    def test_symlink_then_dot_dot_resolves_physically(self) -> None:
+        # city/tunnel -> rig/sub; "city/tunnel/../nested" is rig/nested on disk,
+        # which is where the kernel (and gc's MkdirAll) would put the session.
+        (self.fx.rig / "sub").mkdir()
+        (self.fx.city / "tunnel").symlink_to(self.fx.rig / "sub")
+        proc = self.fx.run(self.fx.city / "tunnel" / ".." / "nested", "gp-abc1", check=False, mkdir=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("inside the rig root", proc.stderr)
+        self.assertFalse((self.fx.rig / "nested").exists())
+        self.assertFalse((self.fx.city / "nested").exists())
 
     def test_flags_override_environment(self) -> None:
         lane = self.fx.city / "elsewhere"
