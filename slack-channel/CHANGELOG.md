@@ -5,6 +5,45 @@ All notable changes to slack-channel are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Socket Mode transport** (`adapter/socketmode.go`), an ingress-free
+  alternative to the public Events API listener: the adapter opens an
+  outbound WebSocket to Slack instead of receiving webhooks, so the pack
+  runs on networks that cannot accept inbound connections (corporate
+  firewalls, laptops, anywhere a tunnel is blocked). Ported from the
+  slack-mini (Tier 1) transport of the same name.
+  - Selected by `SLACK_APP_TOKEN` (an `xapp-…` app-level token with the
+    `connections:write` scope). When set, `LISTEN_PUBLIC` is never bound
+    and `SLACK_SIGNING_SECRET` is no longer required — Socket Mode has no
+    request signatures, so the trust boundary is the app-token-authenticated
+    connection the adapter itself opens.
+  - Envelopes are handed to `routeEvent`, so channel bindings, handle
+    aliases, the `app_mention` fallback, and per-session identity behave
+    identically to the HTTP path.
+  - Supervised reconnect with capped exponential backoff (1s → 30s), a 30s
+    keepalive ping as the liveness check, and an overlap on Slack's advance
+    disconnect warning so in-flight envelopes are still acked.
+  - Events from a workspace other than `SLACK_WORKSPACE_ID` are dropped
+    rather than filed under the wrong account or matched against another
+    workspace's channel bindings.
+  - Dialled through Go's default HTTP client, so `HTTPS_PROXY`/`NO_PROXY`
+    are honoured.
+  - **Interactivity is not carried over Socket Mode.** Tier 2 ships
+    interactivity disabled and `/slack/interactions` is an opt-in extra
+    that still needs a public URL; `interactive` envelopes are dropped with
+    an explanatory log line.
+- `manifest/app-socket.json`, the Socket Mode variant of the app manifest
+  (identical to `manifest/app.json` but with `socket_mode_enabled: true`).
+
+### Changed
+
+- The adapter now depends on `github.com/coder/websocket` v1.8.15, which
+  has no dependencies of its own. The HTTP transport is unchanged and still
+  verifies request signatures exactly as before.
+
 ## [0.1.0] — Tier 2
 
 Initial release. slack-channel is Tier 2 of the Slack pack family — the

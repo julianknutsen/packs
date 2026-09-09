@@ -26,9 +26,17 @@ type publishToChannelRequest struct {
 }
 
 type replyCurrentRequest struct {
-	SessionID      string `json:"session_id"`
-	Body           string `json:"body"`
-	ReplyTo        string `json:"reply_to,omitempty"`
+	SessionID string `json:"session_id"`
+	Body      string `json:"body"`
+	ReplyTo   string `json:"reply_to,omitempty"`
+	// ConversationID optionally asserts which conversation the caller
+	// believes it is replying to. reply-current always targets the session's
+	// latest inbound, so this is redundant by construction — but slack-full
+	// and discord both accept the flag, and gc's injected reply instruction
+	// passes it, so rejecting it stranded Tier 2 agents with a command that
+	// looked right and failed. Validated rather than ignored: a mismatch
+	// means the agent is replying to a conversation it no longer owns.
+	ConversationID string `json:"conversation_id,omitempty"`
 	ThreadCurrent  bool   `json:"thread_current,omitempty"`
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
@@ -192,6 +200,16 @@ func (s *server) handleReplyCurrent() http.HandlerFunc {
 			}
 			channel = channels[0]
 			threadTS = req.ReplyTo // thread_current has no message to thread under here
+		}
+		// An asserted conversation that does not match the resolved target
+		// means the session's latest inbound moved on (or the caller copied
+		// an id from elsewhere). Failing here is the point: the alternative
+		// is a reply delivered into the wrong channel.
+		if req.ConversationID != "" && req.ConversationID != channel {
+			writeJSONError(w, http.StatusConflict, fmt.Sprintf(
+				"conversation_id %q does not match this session's current reply target %q",
+				req.ConversationID, channel))
+			return
 		}
 		// Derive a deterministic key when the caller supplied none, so a
 		// retry of the same reply dedupes instead of double-posting after a

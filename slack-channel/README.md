@@ -45,15 +45,42 @@ flags.
 
 ## Install
 
+## Choose a transport
+
+Inbound messages reach the adapter one of two ways. Pick one before you
+create the app — the choice is baked into the app manifest.
+
+| | **Socket Mode** | **HTTP (Events API)** |
+| --- | --- | --- |
+| Public ingress | none | public HTTPS URL required |
+| How events arrive | outbound WebSocket the adapter opens to Slack | Slack POSTs to your Request URL |
+| Credentials | app-level token (`xapp-…`) | signing secret |
+| Manifest | [`manifest/app-socket.json`](./manifest/app-socket.json) | [`manifest/app.json`](./manifest/app.json) |
+| Interactivity (opt-in) | not supported | `/slack/interactions` |
+
+**Socket Mode is the right default if you cannot expose an inbound port** —
+behind a corporate firewall, on a laptop, or anywhere a tunnel is blocked.
+It needs only outbound HTTPS to `slack.com`. Bindings, handle aliases,
+identities, and every outbound verb behave identically on both.
+
+The one thing Socket Mode cannot carry is interactivity. Tier 2 ships it
+disabled, so this only matters if you deliberately turned on
+`/slack/interactions` — that half still needs a public URL.
+
 ### 1. Create the Slack app
 
-Create an app from the shipped manifest at
-[`manifest/app.json`](./manifest/app.json):
+Create an app from the shipped manifest — `manifest/app-socket.json` for
+Socket Mode, `manifest/app.json` for HTTP:
 
 1. <https://api.slack.com/apps> → **Create New App** → **From a manifest**.
-2. Pick your workspace, paste `manifest/app.json`, create.
+2. Pick your workspace, paste the manifest, create.
 3. **Install to Workspace** and copy the **Bot User OAuth Token** (`xoxb-…`).
-4. From **Basic Information**, copy the **Signing Secret**.
+4. From **Basic Information**:
+   - **Socket Mode:** under **App-Level Tokens**, **Generate Token and
+     Scopes**, add the **`connections:write`** scope, and copy the token
+     (`xapp-…`). App-level tokens cannot be declared in a manifest, so this
+     step is manual.
+   - **HTTP:** copy the **Signing Secret**.
 
 The manifest requests the scopes Tier 2 needs: `app_mentions:read`,
 `channels:history`, `groups:history`, `im:history`, `mpim:history`,
@@ -77,22 +104,32 @@ Provide the adapter's environment:
 
 ```sh
 SLACK_BOT_TOKEN=xoxb-...          # from step 1
-SLACK_SIGNING_SECRET=...          # from step 1
+SLACK_APP_TOKEN=xapp-...          # Socket Mode only — selects the transport
+SLACK_SIGNING_SECRET=...          # HTTP only
 SLACK_WORKSPACE_ID=T0123ABCD      # your Slack team id
 GC_CITY_NAME=<your-city-name>     # the gc city to bridge into
 GC_CITY_PATH=/path/to/your/city   # on-disk city root (for the registries)
 ```
 
+Setting `SLACK_APP_TOKEN` is the whole switch: the adapter runs Socket
+Mode, never binds `LISTEN_PUBLIC`, and stops requiring
+`SLACK_SIGNING_SECRET` (Socket Mode has no request signatures to verify).
+
 `GC_CITY_PATH` is where the three registries live
 (`<GC_CITY_PATH>/.gc/slack-channel/`). Override the directory with
 `SLACK_CHANNEL_REGISTRY_DIR` if needed.
 
-### 3. Expose the events endpoint and start
+### 3. Start
 
-The adapter listens for Slack events on public TCP (`LISTEN_PUBLIC`,
-default `0.0.0.0:8775`). Terminate TLS in front of it and give Slack a
-public URL — [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) is the
-easy path:
+**Socket Mode — nothing to expose.** The adapter dials out to Slack, so
+there is no listener to publish, no TLS to terminate, and no Request URL to
+register. Start your city; the log line to look for is
+`socket mode: connected`.
+
+**HTTP — expose the events endpoint.** The adapter listens for Slack events
+on public TCP (`LISTEN_PUBLIC`, default `0.0.0.0:8775`). Terminate TLS in
+front of it and give Slack a public URL —
+[Tailscale Funnel](https://tailscale.com/kb/1223/funnel) is the easy path:
 
 ```sh
 tailscale funnel 8775
@@ -160,12 +197,13 @@ The built binary is git-ignored; the `[[service]]` block runs it in place.
 | Variable | Required | Default | Purpose |
 | --- | :---: | --- | --- |
 | `SLACK_BOT_TOKEN` | ✓ | — | Bot token for `chat.postMessage` + `reactions.add`. |
-| `SLACK_SIGNING_SECRET` | ✓ | — | HMAC secret for verifying Slack requests. |
+| `SLACK_SIGNING_SECRET` | HTTP only | — | HMAC secret for verifying Slack requests. Required unless `SLACK_APP_TOKEN` is set. |
+| `SLACK_APP_TOKEN` | Socket Mode | — | App-level token (`xapp-…`) with `connections:write`. Setting it selects Socket Mode: no public listener, no signing secret. |
 | `SLACK_WORKSPACE_ID` | ✓ | — | Slack team id (extmsg account id + registry key). |
 | `GC_CITY_NAME` | ✓ | — | gc city to bridge into. |
 | `GC_CITY_PATH` | ✓* | — | City root; registry dir defaults under it. |
 | `SLACK_CHANNEL_REGISTRY_DIR` | | `<GC_CITY_PATH>/.gc/slack-channel` | Override the registry directory. |
-| `LISTEN_PUBLIC` | | `0.0.0.0:8775` | Public bind for `/slack/events` + `/slack/interactions`. |
+| `LISTEN_PUBLIC` | | `0.0.0.0:8775` | Public bind for `/slack/events` + `/slack/interactions`. Not bound in Socket Mode. |
 | `LISTEN_INTERNAL` | | `127.0.0.1:8776` | TCP bind for the verb endpoints when not a gc proxy_process. |
 | `REGISTER_ON_START` | | `true` | Self-register as an extmsg adapter on start. |
 | `SLACK_CHANNEL_INBOUND_TARGET` | | `mayor` | Fallback session for an unbound, unaliased `app_mention`. |

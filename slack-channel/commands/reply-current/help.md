@@ -15,6 +15,7 @@ Usage:
   gc slack-channel reply-current [--session <id>]
                                  (--body <text> | --body-file <path>)
                                  [--thread-current | --reply-to <ts>]
+                                 [--conversation-id <id>]
                                  [--idempotency-key <key>]
 
 Flags:
@@ -23,6 +24,13 @@ Flags:
   --body-file       Read the message body from a file (must be a regular file).
   --thread-current  Thread under the latest inbound message. Mutually
                     exclusive with --reply-to.
+  --conversation-id Assert which conversation the reply is for. Optional and
+                    redundant — the target is always the session's latest
+                    inbound — but if given it must match, so a stale reply
+                    fails loudly instead of landing in the wrong channel.
+                    Accepted for parity with slack-full and discord, whose
+                    reply-current take the same flag; gc's injected reply
+                    instruction passes it.
   --reply-to        Slack message ts to thread under.
   --idempotency-key Caller-supplied key to dedupe retries. When omitted, the
                     adapter derives a deterministic key from the resolved

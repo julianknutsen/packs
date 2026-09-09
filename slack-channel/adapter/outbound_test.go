@@ -166,6 +166,31 @@ func TestHandleReplyCurrent(t *testing.T) {
 			t.Fatalf("status=%d", rec.Code)
 		}
 	})
+
+	// gc's injected reply instruction passes --conversation-id, and both
+	// slack-full and discord accept it. Tier 2 rejecting it left agents with
+	// a command that looked correct and failed.
+	t.Run("matching conversation_id is accepted", func(t *testing.T) {
+		rec := doJSON(srv.handleReplyCurrent(), `{"session_id":"s1","body":"ack","conversation_id":"C1"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if last := slack.posts[len(slack.posts)-1]; last.Channel != "C1" {
+			t.Errorf("post channel = %q, want C1", last.Channel)
+		}
+	})
+
+	t.Run("mismatched conversation_id is refused", func(t *testing.T) {
+		before := len(slack.posts)
+		rec := doJSON(srv.handleReplyCurrent(), `{"session_id":"s1","body":"oops","conversation_id":"C_OTHER"}`)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status=%d, want 409 body=%s", rec.Code, rec.Body.String())
+		}
+		// The whole point: a stale assertion must not post anywhere.
+		if len(slack.posts) != before {
+			t.Errorf("posted %d message(s) despite a conversation mismatch", len(slack.posts)-before)
+		}
+	})
 }
 
 func TestHandleReplyCurrentFallbackToBinding(t *testing.T) {

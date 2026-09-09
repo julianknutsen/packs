@@ -14,9 +14,12 @@
 #     also owns three on-disk registries under
 #     <GC_CITY_PATH>/.gc/slack-channel/. The [[service]] block below has gc
 #     supervise it as a proxy_process: it binds a Unix domain socket at
-#     $GC_SERVICE_SOCKET for the verb endpoints + /healthz, and a public TCP
-#     port for /slack/events + /slack/interactions (terminate TLS in front
-#     of it, e.g. Tailscale Funnel).
+#     $GC_SERVICE_SOCKET for the verb endpoints + /healthz. Inbound arrives
+#     one of two ways, chosen by env: with SLACK_APP_TOKEN set it runs
+#     Socket Mode (an outbound WebSocket to Slack — no public port at all);
+#     otherwise it binds a public TCP port for /slack/events +
+#     /slack/interactions (terminate TLS in front of it, e.g. Tailscale
+#     Funnel).
 #
 # This pack ships NO operator CLI binary: every verb is a bash wrapper
 # (commands/<verb>.sh) that POSTs to the adapter through gc's
@@ -33,10 +36,11 @@ schema = 2
 
 # proxy_process service: gc supervises the adapter as part of the city's
 # service set. The adapter binds a UDS at $GC_SERVICE_SOCKET for the verb
-# endpoints + /healthz; gc reverse-proxies /svc/slack-channel/* to it. The
-# adapter also binds public TCP (LISTEN_PUBLIC, default 0.0.0.0:8775) for
-# /slack/events + /slack/interactions. proxy_process owns only the UDS
-# lifecycle.
+# endpoints + /healthz; gc reverse-proxies /svc/slack-channel/* to it. In
+# HTTP mode the adapter also binds public TCP (LISTEN_PUBLIC, default
+# 0.0.0.0:8775) for /slack/events + /slack/interactions; in Socket Mode
+# (SLACK_APP_TOKEN set) it binds no public port. proxy_process owns only
+# the UDS lifecycle either way.
 #
 # The service is named "slack-channel" (matching the pack) so it does not
 # collide with a slack-mini or slack-full install. Per the tiering design,

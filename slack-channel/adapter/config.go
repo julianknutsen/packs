@@ -62,10 +62,17 @@ type config struct {
 	workspaceID         string
 	botToken            string
 	signingSecret       string
+	appToken            string
 	inboundTarget       string
 	slackAPIBase        string
 	registerOnStart     bool
 }
+
+// socketMode reports whether the adapter takes inbound over a Socket Mode
+// WebSocket instead of the public HTTP listener. The app-level token is the
+// selector: it is required for Socket Mode and useless without it, so its
+// presence is the whole contract — there is no second toggle to keep in sync.
+func (c config) socketMode() bool { return c.appToken != "" }
 
 func (c config) channelMappingsPath() string {
 	return filepath.Join(c.registryDir, "channel_mappings.json")
@@ -102,6 +109,7 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		workspaceID:     getenv("SLACK_WORKSPACE_ID"),
 		botToken:        getenv("SLACK_BOT_TOKEN"),
 		signingSecret:   getenv("SLACK_SIGNING_SECRET"),
+		appToken:        getenv("SLACK_APP_TOKEN"),
 		inboundTarget:   envOr("SLACK_CHANNEL_INBOUND_TARGET", defaultInboundTarget),
 		slackAPIBase:    strings.TrimRight(envOr("SLACK_API_BASE", defaultSlackAPIBase), "/"),
 		registerOnStart: envOr("REGISTER_ON_START", "true") == "true",
@@ -139,7 +147,11 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	if cfg.botToken == "" {
 		missing = append(missing, "SLACK_BOT_TOKEN")
 	}
-	if cfg.signingSecret == "" {
+	// The signing secret verifies HTTP webhook signatures. Socket Mode has no
+	// request signatures — authenticity comes from the app-token-authenticated
+	// connection the adapter itself opens — so requiring it there would be
+	// demanding a credential the transport never consults.
+	if cfg.signingSecret == "" && !cfg.socketMode() {
 		missing = append(missing, "SLACK_SIGNING_SECRET")
 	}
 	if cfg.cityName == "" {
@@ -147,6 +159,12 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	}
 	if len(missing) > 0 {
 		return cfg, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
+	}
+	// Fail fast on the easiest Socket Mode mistake: pasting the bot token
+	// (xoxb-) into SLACK_APP_TOKEN. Slack would answer invalid_auth on every
+	// reconnect forever, which reads as a network fault rather than a typo.
+	if cfg.socketMode() && !strings.HasPrefix(cfg.appToken, "xapp-") {
+		return cfg, errors.New("SLACK_APP_TOKEN must be an app-level token (xapp-...); the bot token belongs in SLACK_BOT_TOKEN")
 	}
 	// Tier 2 keeps on-disk registries, so it needs a place to put them.
 	// Require either GC_CITY_PATH (the normal gc-supervised path) or an

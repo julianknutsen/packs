@@ -89,8 +89,12 @@ func main() {
 	if cfg.serviceSocket != "" {
 		internalDescr = "uds:" + cfg.serviceSocket
 	}
-	log.Printf("starting gc-slack-channel-adapter public=%s internal=%s gc=%s city=%s registry=%s target=%s",
-		cfg.publicListen, internalDescr, cfg.gcAPIBase, cfg.cityName, cfg.registryDir, cfg.inboundTarget)
+	inboundDescr := "http:" + cfg.publicListen
+	if cfg.socketMode() {
+		inboundDescr = "socket-mode (no public listener)"
+	}
+	log.Printf("starting gc-slack-channel-adapter inbound=%s internal=%s gc=%s city=%s registry=%s target=%s",
+		inboundDescr, internalDescr, cfg.gcAPIBase, cfg.cityName, cfg.registryDir, cfg.inboundTarget)
 
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("/slack/events", srv.handleSlackEvents())
@@ -149,11 +153,27 @@ func main() {
 			cfg.provider, cfg.workspaceID, cfg.internalCallbackURL)
 	}
 
+	// Socket Mode owns the inbound path when enabled; the public listener is
+	// not merely unused but never bound, which is the point on a network that
+	// cannot accept inbound connections.
+	socketCtx, socketCancel := context.WithCancel(context.Background())
+	defer socketCancel()
+
 	errCh := make(chan error, 2)
-	go func() {
-		log.Printf("public listener serving on %s (Slack events + interactions)", cfg.publicListen)
-		errCh <- publicSrv.ListenAndServe()
-	}()
+	if cfg.socketMode() {
+		go func() {
+			// runSocketMode reconnects internally and returns only when its
+			// context is cancelled, so a return here means shutdown.
+			if err := srv.runSocketMode(socketCtx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- err
+			}
+		}()
+	} else {
+		go func() {
+			log.Printf("public listener serving on %s (Slack events + interactions)", cfg.publicListen)
+			errCh <- publicSrv.ListenAndServe()
+		}()
+	}
 	go func() {
 		if cfg.serviceSocket != "" {
 			log.Printf("internal listener serving on UDS %s (gc proxy_process)", cfg.serviceSocket)
@@ -179,6 +199,7 @@ func main() {
 			log.Printf("listener error: %v", err)
 		}
 	}
+	socketCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = publicSrv.Shutdown(ctx)

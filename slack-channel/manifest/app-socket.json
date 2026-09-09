@@ -1,0 +1,51 @@
+{
+  "display_information": {
+    "name": "gc-channel",
+    "description": "Bridge Slack channels and DMs to your Gas City sessions over Socket Mode - no public URL required.",
+    "background_color": "#1f2933",
+    "long_description": "slack-channel (Tier 2) bridges human Slack conversations to Gas City sessions. Bind a channel or DM to one or more gc sessions and every message there is delivered to them; address a session from any channel with '@handle'. Per-session display-name and avatar overrides use chat:write.customize so each bound session appears under its own identity. See https://github.com/gastownhall/gascity-packs/tree/main/slack-channel for setup."
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "gc-channel",
+      "always_online": true
+    },
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "channels:history",
+        "chat:write",
+        "chat:write.customize",
+        "chat:write.public",
+        "groups:history",
+        "im:history",
+        "mpim:history",
+        "reactions:write"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_mention",
+        "message.channels",
+        "message.groups",
+        "message.im",
+        "message.mpim"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": false
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}
