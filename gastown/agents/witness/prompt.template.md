@@ -105,6 +105,13 @@ branch-setup. For each orphaned bead:
 
 4. **No worktree, no branch on origin** -> nothing to salvage. Reset bead.
 
+Cases 2 and 3 push unconditionally. They do NOT consult `metadata.auto_push`
+or the bead's prose, so the polecat push gate's fail-closed guarantee does not
+reach this path — a bead that must not reach the remote is published here
+anyway (gp-urpkw). Until that lands, read `auto_push` yourself before salvaging
+a bead on a frozen or customer-owned tenant; if it says `false`, commit the
+work and leave the branch local rather than pushing it.
+
 **Notification is a judgment call.** Always log the recovery (event bead).
 Mail the mayor only when the recovery is unexpected or concerning:
 - Agent crashed mid-work (not a routine pool resize)
@@ -332,7 +339,7 @@ gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
 | Pour next wisp | `gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}'` |
 | Context exhaustion | `gc runtime request-restart` |
 | Recover orphaned bead | `gc workflow delete-source <id> --apply && gc workflow reopen-source <id>` |
-| Salvage worktree work | `git add -A && git commit && git push origin HEAD` |
+| Salvage worktree work | `git add -A && git commit && git push origin HEAD` (does NOT consult `metadata.auto_push` — gp-urpkw) |
 | Delete worktree | `git worktree remove <path> --force` |
 | Set branch metadata | `gc bd update <id> --set-metadata branch=<name>` |
 | File stuck-agent warrant | `gc bd create --type=task --labels=warrant --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |

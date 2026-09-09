@@ -325,6 +325,31 @@ test_rail_detection() {
     # pins it so a later edit cannot quietly drop it from one arm only.
     assert_rail push 'Establish why mirror-sync should not pushes twice.'
 
+    # Passive rails. Every other arm is active-voice adjacency, so all three of
+    # these scored ZERO hits and pushed, measured 2026-09-09 against the shipped
+    # patterns. The strip is deliberately NOT widened to `push(ing|es|ed)?` to
+    # buy them: it runs BEFORE the match, so widening it eats "pushed to main"
+    # back out of row 1 and returns it to a push even with the passive arm in
+    # place. The push row below is the control that keeps the arm from being
+    # bought with the past-tense narration the `never pushes` row protects.
+    assert_rail halt 'this branch must not be pushed to main'
+    assert_rail halt 'the branch should never be pushed to origin'
+    assert_rail halt 'this work is to be branch-only and must not be pushed anywhere'
+    assert_rail push 'branches are never pushed to main by polecats; open a PR.'
+
+    # `no[- ]push` is bounded on a NON-ALPHANUMERIC, with `(ing)?` kept. The old
+    # `([^e]|$)` only excluded pushes/pushed, so ordinary idiom halted and paged
+    # a human on the majority path. Both directions are pinned here because the
+    # obvious narrowing — dropping `(ing)?` — silently converts the `no pushing`
+    # rail into a push, and before this row NOTHING in the suite noticed.
+    assert_rail push 'Design review went fine, no pushback on the approach. Implement it.'
+    assert_rail push 'There was no pushback from the customer on the timeline.'
+    # Both halt rows are worded so the `no[- ]push` arm is the ONLY arm that can
+    # fire — no "operator publishes", no "branch-ready" — or dropping `(ing)?`
+    # would stay green on a borrowed match and the pin would pin nothing.
+    assert_rail halt 'no pushing to this repo; hand the branch to a reviewer.'
+    assert_rail halt 'no-push rail: hand it to whoever owns the tenant.'
+
     # The strip is case-insensitive because the scan is downcased first, NOT
     # because sed was asked to be (its I flag is GNU-only, and this gate runs
     # wherever a polecat runs). If the downcase went away these two would halt
@@ -616,6 +641,34 @@ JQSTUB
     saw   "(b) absent + rail" "$log" "MAIL"
     never "(b) absent + rail" "$log" "PUSH"
 
+    # (b2)/(b3) the same rail in DESIGN and in ACCEPTANCE_CRITERIA. Both are
+    # top-level bead JSON keys, written through the ledger CLI's --design and
+    # --acceptance flags, and both were blind until 2026-09-09: the extraction read
+    # description and notes only, so a rail written in either PUSHED. Measured
+    # read-only against this rig, 20 of the last 200 beads carry non-empty
+    # content in one of them, and (b3)'s wording is the suite's own in-use rail
+    # from the row table — acceptance-shaped text that only halted while it
+    # happened to be pasted into a description. Same shape as (b), one field
+    # over. Nothing else on these two beads asserts anything, so the field
+    # under test is the only thing that can produce the halt.
+    log=$(run_gate b2 '[{"metadata":{},"description":"Refactor the emissions-factor loader and add tests.","notes":"","design":"Land it on a branch only: do not push to origin, the operator publishes."}]')
+    saw   "(b2) rail in design" "$log" "halt_reason=no_push_rail_unresolved"
+    saw   "(b2) rail in design" "$log" "MAIL"
+    never "(b2) rail in design" "$log" "PUSH"
+
+    log=$(run_gate b3 '[{"metadata":{},"description":"Refactor the emissions-factor loader and add tests.","notes":"","acceptance_criteria":"ACCEPTANCE: full offline suite green. HALT branch-ready — do NOT deploy."}]')
+    saw   "(b3) rail in acceptance_criteria" "$log" "halt_reason=no_push_rail_unresolved"
+    saw   "(b3) rail in acceptance_criteria" "$log" "MAIL"
+    never "(b3) rail in acceptance_criteria" "$log" "PUSH"
+
+    # (b4) the widened extraction must not become a wall either: ordinary
+    # acceptance/design prose on a rail-less bead still pushes. Without this the
+    # cheap way to keep (b2)/(b3) green is to halt on any bead that has the
+    # fields at all.
+    log=$(run_gate b4 '[{"metadata":{},"description":"Add a retry to the ingest job when the API 429s.","notes":"","design":"Wrap the client in a bounded backoff.","acceptance_criteria":"ACCEPTANCE: the 429 path retries three times, then surfaces the error."}]')
+    saw   "(b4) design/acceptance, no rail" "$log" "PUSH"
+    never "(b4) design/acceptance, no rail" "$log" "halt_reason"
+
     # (c) absent metadata, no rail — the normal path must still push, or the
     # gate has stopped being a gate and started being a wall.
     log=$(run_gate c '[{"metadata":{},"description":"Add a retry to the ingest job when the API 429s.","notes":""}]')
@@ -740,6 +793,23 @@ JQSTUB
     saw   "(i7) auto_push=maybe" "$log" "MAIL"
     never "(i7) auto_push=maybe" "$log" "PUSH"
 
+    # (i8) the KEY in the wrong case. `has()` case-folded the VALUE and not the
+    # key, so a hand-typed `AUTO_PUSH` — env-var habit, and this key is written
+    # by hand by exactly the people with that habit — read as ABSENT, fell
+    # through to the prose scan and PUSHED despite a recorded opt-out. The
+    # prose here asserts nothing, so the metadata is the only record, and the
+    # halt can only come from the folded key.
+    log=$(run_gate i8 '[{"metadata":{"AUTO_PUSH":"false"},"description":"Refactor the loader.","notes":""}]')
+    saw   "(i8) AUTO_PUSH=false" "$log" "halt_reason=auto_push_false"
+    never "(i8) AUTO_PUSH=false" "$log" "PUSH"
+
+    # (i9) ...and folding the key must not fold the DECISION: the consent
+    # spelling still pushes, so (i8) cannot be satisfied by halting on any bead
+    # whose metadata mentions the key in any case.
+    log=$(run_gate i9 '[{"metadata":{"Auto_Push":"true"},"description":"no push — the mayor publishes","notes":""}]')
+    saw   "(i9) Auto_Push=true" "$log" "PUSH"
+    never "(i9) Auto_Push=true" "$log" "halt_reason"
+
     # ---- the scan's own failure is a rail ----------------------------------
 
     # (h) the PROSE extraction breaks after the probe has already succeeded.
@@ -769,12 +839,16 @@ JQSTUB
 # SHIPPED text: the block is lifted out of the prompt with exactly one edit (the
 # ledger read becomes a fixture read) and its answers are pinned.
 #
-# The three answers mirror the probe's three outcomes: a recorded value, `absent`
-# (nothing recorded, so the bead falls through to the prose scan), and
-# `unreadable` (the read itself failed, which the gate turns into the
-# metadata_unreadable halt). The third is the one worth pinning: a failed read
-# reported as a settled answer invites re-writing a bead whose state was never
-# actually read.
+# The answers mirror the probe's outcomes: the DECIDED value (`false`/`true`,
+# after the same closed vocabulary and the same case fold the gate applies to
+# both the key and the value), `absent` (nothing recorded, so the bead falls
+# through to the prose scan), `unreadable` (the read itself failed, which the
+# gate turns into the metadata_unreadable halt), and `unreadable (value outside
+# vocabulary)` (the read worked but the recorded word is not one the gate will
+# act on — same halt, different repair). The last two are the ones worth
+# pinning: an unusable answer reported as a settled one invites re-writing a
+# bead whose state was never actually read, or trusting a decision the gate is
+# about to refuse.
 test_mayor_readback_mirrors_probe() {
     if ! command -v jq >/dev/null 2>&1; then
         echo "  skip  jq not available (the recipe under test is a jq pipeline)"
@@ -824,7 +898,21 @@ PY
     answers "object metadata, false" false '[{"metadata":{"auto_push":false}}]'
     answers "object metadata, true"  true  '[{"metadata":{"auto_push":true}}]'
     answers "string metadata"        false '[{"metadata":"{\"auto_push\":false}"}]'
-    answers "string value"           no    '[{"metadata":{"auto_push":"no"}}]'
+
+    # The recipe reports the gate's DECISION, not the recorded word. `no` used
+    # to read back as `no`: coherent, but it left the operator doing the
+    # vocabulary mapping in their head on the beads worth checking, and `no` is
+    # not one of the outcomes the surrounding prose claims to mirror. These four
+    # rows pin both halves of the closed vocabulary through the fold.
+    answers "string value, no"  false '[{"metadata":{"auto_push":"no"}}]'
+    answers "string value, 0"   false '[{"metadata":{"auto_push":"0"}}]'
+    answers "case-variant value" false '[{"metadata":{"auto_push":"False"}}]'
+    answers "string value, yes"  true '[{"metadata":{"auto_push":"YES"}}]'
+
+    # The KEY is folded too, or the recipe answers `absent` for a bead the gate
+    # halts on — the very divergence this whole block exists to catch, moved
+    # from the value to the key.
+    answers "case-variant key" false '[{"metadata":{"AUTO_PUSH":"false"}}]'
 
     # `absent` is "nothing recorded", which is not a halt: it falls through to
     # the prose scan. A null VALUE is JSON's own spelling of nothing recorded, so
@@ -845,6 +933,16 @@ PY
     answers "bead record is not an object" unreadable '[7]'
     answers "undecodable string metadata"  unreadable '[{"metadata":"not json at all"}]'
     answers "metadata is a scalar"         unreadable '[{"metadata":7}]'
+
+    # A value OUTSIDE the closed vocabulary is the fourth outcome, and the one
+    # the recipe used to get wrong in the dangerous direction: it printed
+    # `maybe` at exit 0, which reads as a settled answer, while the gate answers
+    # the same bead with the metadata_unreadable halt. The suffix keeps it
+    # distinguishable from a failed READ, which is a different repair.
+    answers "value outside the vocabulary" "unreadable (value outside vocabulary)" \
+        '[{"metadata":{"auto_push":"maybe"}}]'
+    answers "empty-string value"           "unreadable (value outside vocabulary)" \
+        '[{"metadata":{"auto_push":""}}]'
 }
 
 test_gate_structure
