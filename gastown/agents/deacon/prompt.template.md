@@ -62,7 +62,7 @@ gc mail inbox
 
 # Step 3: Still nothing? Create patrol wisp (root-only — no child step beads)
 NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"
+gc bd update "$NEW_WISP" --assignee="$GC_ALIAS" --status=in_progress
 
 # Step 4: Read the formula recipe — these are the steps to execute
 # (Use 'gc bd formula show' for the recipe on disk; 'gc bd mol show' is
