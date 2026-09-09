@@ -726,6 +726,12 @@ def launcher_claims_message(config: dict[str, Any], channel_id: str, parent_id: 
     if parent and common.resolve_room_launcher(config, parent):
         return True
     if channel:
+        # Deliberate record read, unlike the config-only checks above: it is
+        # the only way to catch threads that outlive their launcher's config
+        # entry. Narrowing this back to a config lookup re-opens that gap
+        # silently -- lingering threads would fall through to extmsg's generic
+        # handler. Memoize per batch if the disk read ever costs too much; do
+        # not drop it.
         launch = common.load_room_launch(common.room_launch_record_id(channel))
         if launch and str(launch.get("thread_id", "")).strip() == channel:
             return True

@@ -914,6 +914,34 @@ class DiscordIntakeCommonTests(unittest.TestCase):
 
         self.assertEqual(handles, ["gasburger.mayor", "gc-packs/gasburger.crew"])
 
+    def test_extract_agent_handles_drops_sentence_final_dot(self) -> None:
+        # Dots are legal inside a segment, but a mention that ends a sentence
+        # names the seat, not "seat.": anything else fails every downstream
+        # lookup and answers ordinary prose with a rejected receipt.
+        handles = common.extract_agent_handles("please ask @@sky. thanks")
+
+        self.assertEqual(handles, ["sky"])
+
+    def test_extract_agent_handles_drops_trailing_dots_from_qualified_handle(self) -> None:
+        handles = common.extract_agent_handles("@@corp/sky... anyone?")
+
+        self.assertEqual(handles, ["corp/sky"])
+
+    def test_extract_agent_handles_collapses_dotted_and_bare_mention_of_one_seat(self) -> None:
+        handles = common.extract_agent_handles("@@sky. and @@sky")
+
+        self.assertEqual(handles, ["sky"])
+
+    def test_agent_handle_segment_rejects_trailing_dot(self) -> None:
+        # Defence in depth behind the extractor: the same pattern validates
+        # handles arriving from slash commands and stored records.
+        self.assertIsNone(common.AGENT_HANDLE_SEGMENT.fullmatch("sky."))
+        self.assertIsNotNone(common.AGENT_HANDLE_SEGMENT.fullmatch("gasburger.mayor"))
+        self.assertIsNotNone(common.AGENT_HANDLE_SEGMENT.fullmatch("sky"))
+        self.assertIsNotNone(common.AGENT_HANDLE_SEGMENT.fullmatch("s"))
+        self.assertIsNotNone(common.AGENT_HANDLE_SEGMENT.fullmatch("a" * 32))
+        self.assertIsNone(common.AGENT_HANDLE_SEGMENT.fullmatch("a" * 33))
+
     def test_build_command_payload_includes_rig_option(self) -> None:
         payload = common.build_command_payload("gc")
 
@@ -1763,6 +1791,79 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         self.assertEqual(participant["delivery_selector"], "corp--sky")
         self.assertEqual(launch["message_targets"]["msg-launch-13"], "corp/sky")
 
+    def _save_cross_rig_launch(self, launch_id: str, root_message_id: str) -> None:
+        common.save_room_launch(
+            {
+                "launch_id": launch_id,
+                "launcher_id": "launch-room:22",
+                "guild_id": "1",
+                "conversation_id": "22",
+                "root_message_id": root_message_id,
+                "qualified_handle": "daytripper/sky",
+                "session_alias": "daytripper/pack.sky",
+                "session_name": "s-gc-old",
+                "session_id": "gc-old",
+                "thread_id": "333",
+                "participants": {
+                    "daytripper/sky": {
+                        "qualified_handle": "daytripper/sky",
+                        "session_alias": "daytripper/pack.sky",
+                        "session_name": "s-gc-old",
+                        "session_id": "gc-old",
+                        "delivery_selector": "s-gc-old",
+                    }
+                },
+            }
+        )
+
+    def _publish_as_session(self, launch_id: str, alias: str, message_id: str) -> dict[str, object]:
+        config = common.set_room_launcher(common.load_config(), "1", "22")
+        route = common.resolve_publish_route(config, "launch-room:22")
+        assert route is not None
+        with mock.patch.object(
+            common, "post_channel_message", return_value={"id": message_id},
+        ), mock.patch.object(
+            common,
+            "resolve_session_identity",
+            return_value={"session_name": "pub--sky", "session_id": "gc-new", "alias": alias},
+        ):
+            return common.publish_binding_message(
+                route,
+                "hello from my new body",
+                source_context={"kind": "discord_human_message", "publish_launch_id": launch_id},
+                source_session_name="pub--sky",
+                source_session_id="gc-new",
+            )
+
+    def test_publish_binding_message_repins_participant_matched_by_pack_alias(self) -> None:
+        # Positive arm: a live session under the participant's own rig, stored
+        # under the pack-qualified alias, is the same seat and re-pins.
+        self._save_cross_rig_launch("room-launch:orig-14", "orig-14")
+
+        payload = self._publish_as_session("room-launch:orig-14", "daytripper/pack.sky", "msg-launch-14")
+
+        self.assertEqual(payload["record"]["source_qualified_handle"], "daytripper/sky")
+        launch = common.load_room_launch("room-launch:orig-14")
+        assert launch is not None
+        self.assertEqual(launch["participants"]["daytripper/sky"]["session_id"], "gc-new")
+
+    def test_publish_binding_message_does_not_repin_participant_across_rigs(self) -> None:
+        # Negative arm for the same guard: an identically named seat in
+        # another rig must not claim this participant. Without the rig check
+        # the re-pin silently redirects every later thread delivery into
+        # docbook, and nothing else in the suite notices.
+        self._save_cross_rig_launch("room-launch:orig-15", "orig-15")
+
+        payload = self._publish_as_session("room-launch:orig-15", "docbook/pack.sky", "msg-launch-15")
+
+        self.assertEqual(payload["record"]["source_qualified_handle"], "")
+        launch = common.load_room_launch("room-launch:orig-15")
+        assert launch is not None
+        participant = launch["participants"]["daytripper/sky"]
+        self.assertEqual(participant["session_id"], "gc-old")
+        self.assertEqual(participant["session_name"], "s-gc-old")
+        self.assertEqual(participant["delivery_selector"], "s-gc-old")
+
     def test_publish_binding_message_does_not_record_non_thread_launch_publish_target(self) -> None:
         common.set_chat_binding(common.load_config(), "room", "22", ["corp--sky"], guild_id="1")
         binding = common.resolve_chat_binding(common.load_config(), "room:22")
@@ -2154,6 +2255,30 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             identity = common.resolve_existing_session_for_handle("daytripper/fattony")
         self.assertEqual(identity, {})
 
+    def test_resolve_existing_session_for_handle_matches_city_scope_pack_alias(self) -> None:
+        # The platform qualifies an explicitly requested alias with the
+        # binding it resolves under, so a city-scoped seat requested as
+        # "emma" comes back stored as "employees.emma". Without the tail
+        # match the next @@emma misses the seat and spawns a second body.
+        sessions = [
+            {"id": "bo-7", "alias": "employees.emma",
+             "session_name": "s-bo-7", "state": "active", "running": True},
+        ]
+        with mock.patch.object(common, "list_city_sessions", return_value=sessions):
+            identity = common.resolve_existing_session_for_handle("emma")
+        self.assertEqual(identity["alias"], "employees.emma")
+
+    def test_resolve_existing_session_for_handle_bare_handle_does_not_cross_into_rig(self) -> None:
+        # Negative control for the tail match above: a bare handle is
+        # city-scoped and must not reach a rig-qualified seat.
+        sessions = [
+            {"id": "bo-8", "alias": "daytripper/gasburger.emma",
+             "session_name": "s-bo-8", "state": "active", "running": True},
+        ]
+        with mock.patch.object(common, "list_city_sessions", return_value=sessions):
+            identity = common.resolve_existing_session_for_handle("emma")
+        self.assertEqual(identity, {})
+
     def test_resolve_named_session_for_handle_matches_rig_scoped_named_session(self) -> None:
         with mock.patch.object(common, "load_city_toml", return_value={
             "named_session": [
@@ -2194,6 +2319,251 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             ref = common.resolve_named_session_for_handle("anything")
         self.assertEqual(ref, {})
 
+    def test_resolve_named_session_for_handle_expands_rig_scope_without_dir(self) -> None:
+        # The declared shape (gastown/pack.toml "witness") carries neither
+        # name nor dir. gc leaves the template as the public identity when
+        # name is omitted and stamps one seat per configured rig, so the
+        # addressable handle is <rig>/<template> for each of them.
+        city = {
+            "rigs": [{"name": "gascity"}, {"name": "beads"}],
+            "named_session": [
+                {"template": "gastown.witness", "scope": "rig", "mode": "always"},
+            ],
+        }
+        with mock.patch.object(common, "load_city_toml", return_value=city):
+            ref = common.resolve_named_session_for_handle("beads/gastown.witness")
+            first_rig = common.resolve_named_session_for_handle("gascity/gastown.witness")
+        self.assertEqual(ref["alias"], "gastown.witness")
+        self.assertEqual(ref["dir"], "beads")
+        self.assertEqual(ref["scope"], "rig")
+        self.assertEqual(ref["spawn_template"], "beads/gastown.witness")
+        self.assertEqual(first_rig["dir"], "gascity")
+        self.assertEqual(first_rig["spawn_template"], "gascity/gastown.witness")
+
+    def test_resolve_named_session_for_handle_expands_named_rig_scope_without_dir(self) -> None:
+        city = {
+            "rigs": [{"name": "gascity"}, {"name": "beads"}],
+            "named_session": [
+                {"template": "gastown.witness", "scope": "rig", "name": "witness"},
+            ],
+        }
+        with mock.patch.object(common, "load_city_toml", return_value=city):
+            ref = common.resolve_named_session_for_handle("beads/witness")
+        self.assertEqual(ref["alias"], "witness")
+        self.assertEqual(ref["dir"], "beads")
+        self.assertEqual(ref["spawn_template"], "beads/gastown.witness")
+
+    def test_resolve_named_session_for_handle_rig_scope_without_dir_is_not_city_addressable(self) -> None:
+        # A rig-scoped entry must not answer a bare handle: falling back to
+        # city scope hands the caller an unqualified spawn template that
+        # resolves outside every rig the declaration asked for.
+        city = {
+            "rigs": [{"name": "gascity"}, {"name": "beads"}],
+            "named_session": [
+                {"template": "gastown.witness", "scope": "rig", "mode": "always"},
+            ],
+        }
+        with mock.patch.object(common, "load_city_toml", return_value=city):
+            ref = common.resolve_named_session_for_handle("gastown.witness")
+        self.assertEqual(ref, {})
+
+    def test_resolve_named_session_for_handle_rig_scope_without_rigs_is_unaddressable(self) -> None:
+        city = {"named_session": [{"template": "gastown.witness", "scope": "rig"}]}
+        with mock.patch.object(common, "load_city_toml", return_value=city):
+            self.assertEqual(common.resolve_named_session_for_handle("gastown.witness"), {})
+            self.assertEqual(common.resolve_named_session_for_handle("gascity/gastown.witness"), {})
+
+    def _platform_stored_alias(self, spawn_template: str, requested_alias: str) -> str:
+        """The alias the platform stores for an explicitly requested one: the
+        request qualified by the binding it resolves under, i.e.
+        <rig>/<pack>.<alias> for a rig-scoped template and <pack>.<alias> for
+        a city-scoped one. Same premise as the hydration tests below.
+        """
+        rig, _, template = spawn_template.rpartition("/")
+        pack = template.rsplit(".", 1)[0] if "." in template else template
+        qualified = f"{pack}.{requested_alias}"
+        return f"{rig}/{qualified}" if rig else qualified
+
+    def test_named_session_round_trip_attaches_next_turn_rig_scope(self) -> None:
+        # Spawn -> stored alias -> next-turn attach. If the stored shape is
+        # unreachable by the attach lookup, every mention spawns another seat
+        # and "stable named session" is not stable at all.
+        city = {
+            "rigs": [{"name": "daytripper"}],
+            "named_session": [{"template": "gasburger.crew", "scope": "rig", "name": "fattony"}],
+        }
+        with mock.patch.object(common, "load_city_toml", return_value=city):
+            ref = common.resolve_named_session_for_handle("daytripper/fattony")
+        self.assertEqual(ref["spawn_template"], "daytripper/gasburger.crew")
+
+        stored_alias = self._platform_stored_alias(ref["spawn_template"], ref["alias"])
+        self.assertEqual(stored_alias, "daytripper/gasburger.fattony")
+        sessions = [{"id": "bo-1", "alias": stored_alias, "session_name": "s-bo-1",
+                     "state": "active", "running": True}]
+        with mock.patch.object(common, "list_city_sessions", return_value=sessions):
+            identity = common.resolve_existing_session_for_handle("daytripper/fattony")
+        self.assertEqual(identity["session_id"], "bo-1")
+        self.assertTrue(common._alias_matches_qualified_handle(stored_alias, "daytripper/fattony"))
+
+    def test_named_session_round_trip_attaches_next_turn_city_scope(self) -> None:
+        # Same round trip for the shape maintainer-city actually declares
+        # (scope = "city", template = "employees.emma").
+        city = {
+            "named_session": [{"template": "employees.emma", "scope": "city", "name": "emma"}],
+        }
+        with mock.patch.object(common, "load_city_toml", return_value=city):
+            ref = common.resolve_named_session_for_handle("emma")
+        self.assertEqual(ref["spawn_template"], "employees.emma")
+
+        stored_alias = self._platform_stored_alias(ref["spawn_template"], ref["alias"])
+        self.assertEqual(stored_alias, "employees.emma")
+        sessions = [{"id": "bo-2", "alias": stored_alias, "session_name": "s-bo-2",
+                     "state": "active", "running": True}]
+        with mock.patch.object(common, "list_city_sessions", return_value=sessions):
+            identity = common.resolve_existing_session_for_handle("emma")
+        self.assertEqual(identity["session_id"], "bo-2")
+        self.assertTrue(common._alias_matches_qualified_handle(stored_alias, "emma"))
+
+    def test_named_session_round_trip_city_scope_survives_pack_prefix(self) -> None:
+        # And when the platform prefixes a differently named seat the same
+        # way (requested "emma", stored "employees.emma" under a pack that
+        # is not the template's own), the bare handle still attaches.
+        sessions = [{"id": "bo-3", "alias": "gasburger.emma", "session_name": "s-bo-3",
+                     "state": "active", "running": True}]
+        with mock.patch.object(common, "list_city_sessions", return_value=sessions):
+            identity = common.resolve_existing_session_for_handle("emma")
+        self.assertEqual(identity["session_id"], "bo-3")
+
+    def test_alias_matches_qualified_handle_rejects_cross_rig(self) -> None:
+        # The publish-side re-pin's routing-integrity guard: a rig-A session
+        # whose tail matches must not claim a rig-B participant.
+        self.assertFalse(
+            common._alias_matches_qualified_handle("docbook/gasburger.fattony", "daytripper/fattony")
+        )
+        self.assertFalse(common._alias_matches_qualified_handle("docbook/fattony", "daytripper/fattony"))
+        self.assertTrue(
+            common._alias_matches_qualified_handle("daytripper/gasburger.fattony", "daytripper/fattony")
+        )
+        self.assertTrue(common._alias_matches_qualified_handle("daytripper/fattony", "daytripper/fattony"))
+
+    def test_alias_matches_qualified_handle_does_not_mix_scopes(self) -> None:
+        self.assertFalse(common._alias_matches_qualified_handle("daytripper/gasburger.emma", "emma"))
+        self.assertFalse(common._alias_matches_qualified_handle("employees.emma", "daytripper/emma"))
+        self.assertTrue(common._alias_matches_qualified_handle("employees.emma", "emma"))
+        self.assertFalse(common._alias_matches_qualified_handle("employees.emmalou", "emma"))
+        self.assertFalse(common._alias_matches_qualified_handle("", "emma"))
+        self.assertFalse(common._alias_matches_qualified_handle("employees.emma", ""))
+
+    def test_room_launch_poll_timeout_defaults_are_unchanged(self) -> None:
+        # The injectable seam exists so tests do not pay the deadline;
+        # production must keep waiting it out for a slow async accept.
+        self.assertEqual(common.ROOM_LAUNCH_IDENTITY_RESOLVE_TIMEOUT_SECONDS, 30.0)
+        self.assertEqual(common.ROOM_LAUNCH_READY_RESOLVE_TIMEOUT_SECONDS, 90.0)
+        self.assertEqual(common._poll_timeout(None, 30.0), 30.0)
+        self.assertEqual(common._poll_timeout(0.0, 30.0), 0.0)
+
+    def test_resolve_routable_session_candidate_eventually_honors_timeout_override(self) -> None:
+        sleeps: list[float] = []
+        with mock.patch.object(common, "list_city_sessions", return_value=[]), mock.patch.object(
+            common.time, "sleep", side_effect=sleeps.append,
+        ):
+            selector, identity = common.resolve_routable_session_candidate_eventually(
+                "nobody", timeout=0.0,
+            )
+        self.assertEqual((selector, identity), ("", {}))
+        self.assertEqual(sleeps, [])
+
+    def test_resolve_ready_session_candidate_eventually_honors_timeout_override(self) -> None:
+        sleeps: list[float] = []
+        with mock.patch.object(common, "list_city_sessions", return_value=[]), mock.patch.object(
+            common.time, "sleep", side_effect=sleeps.append,
+        ):
+            selector, identity = common.resolve_ready_session_candidate_eventually(
+                "nobody", timeout=0.0,
+            )
+        self.assertEqual((selector, identity), ("", {}))
+        self.assertEqual(sleeps, [])
+
+    def test_resolve_ready_session_candidate_eventually_matches_prefixed_alias_by_suffix(self) -> None:
+        # The ready poll's folded suffix attempt is the only path by which a
+        # spawn whose alias the platform stored pack-prefixed can become ready:
+        # no exact candidate can ever match that stored alias. Its identity-side
+        # twin is pinned through ensure_room_launch_session (the no-stall test);
+        # this one is pinned at the poll on purpose.
+        #
+        # Pinning the ready side end-to-end is not possible through
+        # ensure_room_launch_session: whenever a record is listed early enough
+        # for the ready stage to want it, the identity poll's twin resolves it
+        # first and writes that record's real alias/session_id/session_name onto
+        # the participant, so the ready stage exact-matches those hydrated
+        # selectors and never calls this poll at all (measured: 0 calls). An
+        # ensure-level test in that shape therefore passes unchanged with the
+        # block deleted, which is why the pin lives here.
+        sessions = [
+            {
+                "id": "bo-9cm",
+                "alias": "gasburger.dc-abc123-gasburgermayor",
+                "session_name": "s-bo-9cm",
+                "template": "gasburger.mayor",
+                "state": "active",
+                "running": True,
+                "created_at": "2026-08-02T16:58:14Z",
+            }
+        ]
+        sleeps: list[float] = []
+        with mock.patch.object(
+            common, "list_city_sessions", return_value=sessions,
+        ), mock.patch.object(
+            common.time, "sleep", side_effect=sleeps.append,
+        ):
+            selector, identity = common.resolve_ready_session_candidate_eventually(
+                "dc-abc123-gasburgermayor",
+                suffix_template="gasburger.mayor",
+                suffix_alias="dc-abc123-gasburgermayor",
+                timeout=0.0,
+            )
+        self.assertEqual(
+            selector,
+            "s-bo-9cm",
+            "the ready poll did not fall back to a suffix match: a pack-prefixed "
+            "spawn that is already running raises 'not ready yet' instead of "
+            "being adopted",
+        )
+        self.assertEqual(identity.get("session_id"), "bo-9cm")
+        self.assertEqual(identity.get("alias"), "gasburger.dc-abc123-gasburgermayor")
+        # Same iteration as the exact attempt, so the fallback costs no sleep.
+        self.assertEqual(sleeps, [])
+
+    def test_resolve_ready_session_candidate_eventually_suffix_still_requires_ready(self) -> None:
+        # The suffix fallback must keep the ready/routable distinction: a
+        # matching record that is not running yet is not a ready session, and
+        # accepting it here would hand the launcher a session it cannot deliver
+        # to. Pins the ready=True argument the poll passes, which a deletion
+        # probe alone would not catch.
+        sessions = [
+            {
+                "id": "bo-9cm",
+                "alias": "gasburger.dc-abc123-gasburgermayor",
+                "session_name": "s-bo-9cm",
+                "template": "gasburger.mayor",
+                "state": "active",
+                "running": False,
+                "created_at": "2026-08-02T16:58:14Z",
+            }
+        ]
+        with mock.patch.object(
+            common, "list_city_sessions", return_value=sessions,
+        ), mock.patch.object(
+            common.time, "sleep", side_effect=lambda _seconds: None,
+        ):
+            selector, identity = common.resolve_ready_session_candidate_eventually(
+                "dc-abc123-gasburgermayor",
+                suffix_template="gasburger.mayor",
+                suffix_alias="dc-abc123-gasburgermayor",
+                timeout=0.0,
+            )
+        self.assertEqual((selector, identity), ("", {}))
+
     def test_ensure_room_launch_session_spawns_named_session_with_alias(self) -> None:
         # For a named-session launch, we spawn via the qualified template
         # (e.g. daytripper/gasburger.crew) but with the declared alias
@@ -2230,7 +2600,11 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             common, "create_agent_session", return_value={},
         ) as create_agent_session, mock.patch.object(
             common, "deliver_session_message", return_value={"status": "accepted"},
-        ), mock.patch.object(common.time, "sleep"):
+        ), mock.patch.object(common.time, "sleep"), mock.patch.object(
+            common, "ROOM_LAUNCH_IDENTITY_RESOLVE_TIMEOUT_SECONDS", 1.0,
+        ), mock.patch.object(
+            common, "ROOM_LAUNCH_READY_RESOLVE_TIMEOUT_SECONDS", 1.0,
+        ):
             current = common.ensure_room_launch_session(
                 launch,
                 spawn_template_override="daytripper/gasburger.crew",
@@ -2312,13 +2686,67 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             common,
             "deliver_session_message",
             return_value={"status": "accepted", "id": "bo-9cm"},
-        ), mock.patch.object(common.time, "sleep"):
+        ), mock.patch.object(common.time, "sleep"), mock.patch.object(
+            common, "ROOM_LAUNCH_IDENTITY_RESOLVE_TIMEOUT_SECONDS", 0.0,
+        ), mock.patch.object(
+            common, "ROOM_LAUNCH_READY_RESOLVE_TIMEOUT_SECONDS", 0.0,
+        ):
             current = common.ensure_room_launch_session(launch)
 
         create_agent_session.assert_called_once()
         self.assertEqual(current["session_id"], "bo-9cm")
         self.assertEqual(current["session_name"], "s-bo-9cm")
         self.assertEqual(current["session_alias"], "gasburger.dc-abc123-gasburgermayor")
+
+    def test_ensure_room_launch_session_hydrates_prefixed_alias_without_waiting_out_the_deadline(self) -> None:
+        # The suffix match must run in the SAME poll iteration as the exact
+        # one. Sequenced after it instead, a pack-prefixed alias — which no
+        # exact candidate can ever match — costs the full identity deadline
+        # on every such spawn, spent holding the launch advisory lock that
+        # blocks concurrent deliveries and the publish-side re-pin. A session
+        # listed from the first poll must hydrate without the poll sleeping.
+        launch = {
+            "launch_id": "room-launch:no-stall",
+            "qualified_handle": "gasburger.mayor",
+            "session_alias": "dc-abc123-gasburgermayor",
+            "from_display": "thunderchief",
+        }
+        sessions = [
+            {
+                "id": "bo-9cm",
+                "alias": "gasburger.dc-abc123-gasburgermayor",
+                "session_name": "s-bo-9cm",
+                "template": "gasburger.mayor",
+                "state": "active",
+                "running": True,
+                "created_at": "2026-08-02T16:58:14Z",
+            }
+        ]
+        sleeps: list[float] = []
+
+        with mock.patch.object(
+            common, "list_city_sessions", return_value=sessions,
+        ), mock.patch.object(
+            common, "create_agent_session", return_value={},
+        ), mock.patch.object(
+            common, "deliver_session_message", return_value={"status": "accepted", "id": "bo-9cm"},
+        ), mock.patch.object(
+            common.time, "sleep", side_effect=sleeps.append,
+        ), mock.patch.object(
+            common, "ROOM_LAUNCH_IDENTITY_RESOLVE_TIMEOUT_SECONDS", 5.0,
+        ), mock.patch.object(
+            common, "ROOM_LAUNCH_READY_RESOLVE_TIMEOUT_SECONDS", 5.0,
+        ):
+            current = common.ensure_room_launch_session(launch)
+
+        self.assertEqual(current["session_id"], "bo-9cm")
+        self.assertEqual(
+            sleeps,
+            [],
+            "hydration kept polling after the session was already listed: the suffix "
+            "match is not folded into the exact-match poll, so every pack-prefixed "
+            "spawn stalls for the whole deadline under the launch lock",
+        )
 
     def test_ensure_room_launch_session_hydrates_routable_identity_after_longer_async_delay(self) -> None:
         launch = {
