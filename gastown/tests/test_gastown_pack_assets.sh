@@ -613,6 +613,24 @@ test_prime_prompts_are_city_generic_and_compact() {
         fail "operational awareness must require configured and probed endpoint evidence"
     grep -F 'endpoint is unknown and stop' "$awareness" >/dev/null ||
         fail "operational awareness must fail closed when endpoint discovery fails"
+    grep -F 'run_bounded() {' "$awareness" >/dev/null ||
+        fail "operational awareness should define a portable diagnostic timeout helper"
+    grep -F 'run_bounded 5 gc dolt sql' "$awareness" >/dev/null ||
+        fail "operational awareness should bound the process-list diagnostic"
+    grep -F 'run_bounded 60 gc dolt health --json' "$awareness" >/dev/null ||
+        fail "operational awareness should bound the health diagnostic"
+    grep -F 'run_bounded 10 gc dolt status' "$awareness" >/dev/null ||
+        fail "operational awareness should bound the status diagnostic"
+    grep -F 'python3 - "$bound_seconds" "$@"' "$awareness" >/dev/null ||
+        fail "operational awareness should use the portable Python timeout fallback"
+    grep -F 'process.wait(timeout=2)' "$awareness" >/dev/null ||
+        fail "operational awareness should grant a short SIGTERM grace period"
+    grep -F 'process.kill()' "$awareness" >/dev/null ||
+        fail "operational awareness should kill a diagnostic that ignores SIGTERM"
+    grep -F 'sys.exit(124)' "$awareness" >/dev/null ||
+        fail "operational awareness should use the conventional timeout exit status"
+    ! grep -E '(^|[[:space:]])timeout[[:space:]]+[0-9]' "$awareness" >/dev/null ||
+        fail "operational awareness must not require GNU coreutils timeout"
 }
 
 test_dog_assets_are_pack_local
