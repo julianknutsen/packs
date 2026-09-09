@@ -191,28 +191,25 @@ a NEW session with a different ID — the old one never comes back.
    busy city the session `command` fields are large and overflow ARG_MAX
    (`argument list too long: jq`). Build the map once:
    ```bash
-   SESSIONS_FILE=$(mktemp); SESSION_BEADS_FILE=$(mktemp)
+   SESSIONS_FILE=$(mktemp)
    gc session list --state=all --json > "$SESSIONS_FILE"
-   gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE"
 
-   LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" --slurpfile session_beads "$SESSION_BEADS_FILE" '
+   LIVENESS_MAP=$(jq -c '
      def add($m; $key; $state; $closed):
        if (($key // "") | length) == 0 then $m
        else $m + {($key): (if $closed then "closed" else ($state // "") end)}
        end;
-     (reduce ($sessions[0].sessions // [])[] as $s ({};
+     reduce (.sessions // [])[] as $s ({};
          add(.; $s.id;         $s.state; ($s.closed // false))
        | add(.; $s.name;       $s.state; ($s.closed // false))
        | add(.; $s.session_name; $s.state; ($s.closed // false))
        | add(.; $s.alias;      $s.state; ($s.closed // false))
        | add(.; $s.agent_name; $s.state; ($s.closed // false))
-     )) as $from_sessions
-     | reduce ($session_beads[0] // [])[] as $b ($from_sessions;
-         add(.; $b.metadata.configured_named_identity; $b.metadata.state; ($b.status == "closed")))')
+     )' "$SESSIONS_FILE")
 
    SESSION_COUNT=$(jq -r '(.sessions // []) | length' "$SESSIONS_FILE")
    MAP_COUNT=$(printf '%s' "$LIVENESS_MAP" | jq -r 'length')
-   rm -f "$SESSIONS_FILE" "$SESSION_BEADS_FILE"
+   rm -f "$SESSIONS_FILE"
    ```
 
    **Fail safe — never orphan on an empty map.** If the map is empty while
@@ -223,7 +220,12 @@ a NEW session with a different ID — the old one never comes back.
    ```bash
    if [ "${MAP_COUNT:-0}" -eq 0 ] && [ "${SESSION_COUNT:-0}" -gt 0 ]; then
      echo "FAIL-SAFE: empty liveness map with $SESSION_COUNT live sessions — skipping orphan recovery (treat all assignees as live)."
-     gc mail send mayor/ -s "WITNESS: orphan-recovery disabled — empty liveness map" -m "Built an empty assignee->state map from $SESSION_COUNT live sessions. gc session list --json schema likely drifted again (gc-3tn8g); skipping orphan recovery this cycle to avoid false-orphaning live agents. Re-check the recover-orphaned-beads liveness recipe."
+     LIVENESS_ALERT_SUBJECT="WITNESS: orphan-recovery disabled — empty liveness map"
+     LIVENESS_ALERT_BODY="Built an empty assignee->state map from $SESSION_COUNT live sessions. gc session list --json schema likely drifted again (gc-3tn8g); skipping orphan recovery this cycle to avoid false-orphaning live agents. Re-check the recover-orphaned-beads liveness recipe."
+     LIVENESS_ALERT_EXISTS=$(gc bd query --json 'ephemeral=true AND status=open' --limit=0 | jq -r --arg subject "$LIVENESS_ALERT_SUBJECT" --arg body "$LIVENESS_ALERT_BODY" '[.[] | select((.issue_type // .type // "") == "message" and .title == $subject and .description == $body)] | length')
+     if [ "${LIVENESS_ALERT_EXISTS:-0}" -eq 0 ]; then
+       gc mail send mayor/ -s "$LIVENESS_ALERT_SUBJECT" -m "$LIVENESS_ALERT_BODY"
+     fi
      # Skip the rest of this step; proceed to check-refinery.
    fi
    ```
