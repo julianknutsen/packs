@@ -453,7 +453,9 @@ class WorkerWorktreeTests(unittest.TestCase):
             cwd=str(lane_b), env={**base_env, "GC_DIR": str(lane_b), "WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM": "3"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        time.sleep(0.7)
+        # Start A only once B has observed the stale lock and entered its pause.
+        marker = b.stderr.readline()
+        self.assertIn("TEST pausing before reclaim", marker)
         a_started = time.monotonic()
         a = subprocess.run(
             ["sh", str(SCRIPT), "--no-fetch", "--bead", "gp-aaa1"],

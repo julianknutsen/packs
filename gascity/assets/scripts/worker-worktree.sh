@@ -222,7 +222,10 @@ while :; do
         break
     fi
     if lock_is_stale; then
-        [ -z "${WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM:-}" ] || sleep "$WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM"
+        if [ -n "${WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM:-}" ]; then
+            log "TEST pausing before reclaim"
+            sleep "$WORKER_WORKTREE_TEST_PAUSE_BEFORE_RECLAIM"
+        fi
         if reclaim_stale_lock; then
             continue
         fi
