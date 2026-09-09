@@ -783,12 +783,14 @@ func TestHandlePublishDedupesOnIdempotencyKey(t *testing.T) {
 	origBase := slackAPIBase
 	t.Cleanup(func() { slackAPIBase = origBase })
 	var posts int
+	var captured slackPostMessageReq
 	ts := "1700000000.000100"
-	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		posts++
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"ts":"` + ts + `"}`))
-	}))
+	// The readback has to echo the text actually posted, not the request text:
+	// a keyed publish is stamped with the reference marker, so a fake that
+	// confirmed "hello" would report a content mismatch, leave the receipt
+	// undelivered, and take the dedup cache — which only stores delivered
+	// receipts — out of the picture entirely.
+	fakeSlack := httptest.NewServer(newFakeSlackPublishHandler(t, &captured, ts, func() { posts++ }))
 	t.Cleanup(fakeSlack.Close)
 	slackAPIBase = fakeSlack.URL
 
@@ -850,10 +852,14 @@ func TestHandlePublishNoDedupWithoutKey(t *testing.T) {
 	origBase := slackAPIBase
 	t.Cleanup(func() { slackAPIBase = origBase })
 	var posts int
-	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		posts++
+	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"ts":"1.2"}`))
+		if r.URL.Path == "/conversations.history" {
+			_, _ = w.Write([]byte(`{"ok":true,"messages":[{"ts":"1.2","text":"hi"}]}`))
+			return
+		}
+		posts++
+		_, _ = w.Write([]byte(`{"ok":true,"channel":"C1","ts":"1.2"}`))
 	}))
 	t.Cleanup(fakeSlack.Close)
 	slackAPIBase = fakeSlack.URL
@@ -933,13 +939,7 @@ func TestHandlePublishAppendsReferenceMarkerWhenIdempotencyKeySet(t *testing.T) 
 	origBase := slackAPIBase
 	t.Cleanup(func() { slackAPIBase = origBase })
 	var captured slackPostMessageReq
-	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
-			t.Errorf("decode Slack request: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"ts":"1.2"}`))
-	}))
+	fakeSlack := httptest.NewServer(newFakeSlackPublishHandler(t, &captured, "1.2", nil))
 	t.Cleanup(fakeSlack.Close)
 	slackAPIBase = fakeSlack.URL
 
@@ -967,13 +967,7 @@ func TestHandlePublishOmitsReferenceMarkerWhenNoIdempotencyKey(t *testing.T) {
 	origBase := slackAPIBase
 	t.Cleanup(func() { slackAPIBase = origBase })
 	var captured slackPostMessageReq
-	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
-			t.Errorf("decode Slack request: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"ts":"1.2"}`))
-	}))
+	fakeSlack := httptest.NewServer(newFakeSlackPublishHandler(t, &captured, "1.2", nil))
 	t.Cleanup(fakeSlack.Close)
 	slackAPIBase = fakeSlack.URL
 
@@ -1122,13 +1116,7 @@ func TestHandlePublishSkipsReferenceMarkerWhenItCannotFitUnderSlackCeiling(t *te
 			origBase := slackAPIBase
 			t.Cleanup(func() { slackAPIBase = origBase })
 			var captured slackPostMessageReq
-			fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
-					t.Errorf("decode Slack request: %v", err)
-				}
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"ok":true,"ts":"1.2"}`))
-			}))
+			fakeSlack := httptest.NewServer(newFakeSlackPublishHandler(t, &captured, "1.2", nil))
 			t.Cleanup(fakeSlack.Close)
 			slackAPIBase = fakeSlack.URL
 
@@ -1221,6 +1209,18 @@ func TestHandlePublishSurfacesSlackTruncationOnTheReceipt(t *testing.T) {
 	t.Cleanup(func() { slackAPIBase = origBase })
 	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/conversations.history" {
+			// What a truncated message actually reads back as: the head of the
+			// post, with the tail Slack cut off — here the whole marker. A fake
+			// that echoed the full posted text would confirm a message Slack
+			// says it did not store intact, and the readback assertion below
+			// would be measuring nothing.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":       true,
+				"messages": []map[string]string{{"ts": "1.2", "text": "hi"}},
+			})
+			return
+		}
 		// Slack's delivered-but-truncated shape: ok, a real ts, and the
 		// warning as the only signal that the tail is gone.
 		_, _ = w.Write([]byte(`{"ok":true,"ts":"1.2","response_metadata":{"warnings":["message_truncated"]}}`))
@@ -1241,9 +1241,28 @@ func TestHandlePublishSurfacesSlackTruncationOnTheReceipt(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil {
 		t.Fatalf("decode receipt through gc's shim: %v (body=%q)", err, rec.Body.String())
 	}
-	if !receipt.Delivered || receipt.MessageID != "1.2" {
-		t.Fatalf("receipt delivered=%t message_id=%q, want a delivered receipt with ts 1.2: truncation does not fail the publish",
-			receipt.Delivered, receipt.MessageID)
+	if receipt.MessageID != "1.2" {
+		t.Fatalf("receipt message_id = %q, want 1.2: Slack accepted the post and the ts is real whatever the readback then finds",
+			receipt.MessageID)
+	}
+	// Truncation used to leave Delivered true, because chat.postMessage's own
+	// answer was the only evidence. The readback is now the evidence, and a
+	// truncated message reads back as different text, so the delivery is
+	// reported unconfirmed. The two signals are complementary and both must
+	// survive: "truncated" says what Slack did to the write, Delivered says
+	// what the read API could confirm afterwards.
+	//
+	// "permanent" is the kind on the wire because that is gc's word for it: the
+	// same oversized payload truncates identically on every retry, so re-sending
+	// can only add another visible partial message. The adapter's finer-grained
+	// classification rides in metadata, which is the only additive channel gc
+	// forwards.
+	if receipt.Delivered || receipt.FailureKind != "permanent" {
+		t.Fatalf("receipt delivered=%t failure_kind=%q, want a permanent failure: the readback cannot find the text that was posted once Slack truncates it, and re-posting it truncates the same way",
+			receipt.Delivered, receipt.FailureKind)
+	}
+	if got := receipt.Metadata[receiptMetadataKeyReadback]; got != slackReadbackUnconfirmed {
+		t.Errorf("receipt metadata[%q] = %q, want %q", receiptMetadataKeyReadback, got, slackReadbackUnconfirmed)
 	}
 	if receipt.Metadata["truncated"] != "true" {
 		t.Errorf(`receipt metadata = %v, want metadata["truncated"]="true": Slack warned that it truncated the post, and the receipt is the only place a caller can see that its marker did not survive`,
@@ -1282,13 +1301,10 @@ func TestHandlePublishStampsThreadRepliesWhichHistoryDoesNotReturn(t *testing.T)
 	origBase := slackAPIBase
 	t.Cleanup(func() { slackAPIBase = origBase })
 	var captured slackPostMessageReq
-	fakeSlack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
-			t.Errorf("decode Slack request: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"ts":"1699999999.000200"}`))
-	}))
+	// A threaded post is read back through conversations.replies, which is the
+	// scan-surface asymmetry this test exists to pin; the fake serves both
+	// endpoints so the readback cannot be what makes the assertions below move.
+	fakeSlack := httptest.NewServer(newFakeSlackPublishHandler(t, &captured, "1699999999.000200", nil))
 	t.Cleanup(fakeSlack.Close)
 	slackAPIBase = fakeSlack.URL
 

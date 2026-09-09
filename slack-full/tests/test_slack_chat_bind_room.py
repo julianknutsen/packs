@@ -7,6 +7,7 @@ end-to-end via gc events in the slack-pack README's verification recipe.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -187,6 +188,8 @@ def test_main_round_trip_with_fake_gc(monkeypatch: pytest.MonkeyPatch, capsys: p
             return {"ID": "group-xyz", "FanoutPolicy": body.get("fanout_policy") or {}}
         if path == "/extmsg/participants":
             return {"ID": "p-" + body["handle"], "Handle": body["handle"], "SessionID": body["session_id"]}
+        if path == "/extmsg/unbind":
+            return {"unbound": [{"ID": "binding-old", "SessionID": "gc-stale"}]}
         raise AssertionError(f"unexpected path {path}")
 
     monkeypatch.setattr(common, "gc_post", fake_post)
@@ -194,13 +197,25 @@ def test_main_round_trip_with_fake_gc(monkeypatch: pytest.MonkeyPatch, capsys: p
     rc = mod.main([
         "C0123ROOM01",
         "oversight-rig.mayor", "geo/oversight-rig.project-lead",
+        "--group-only",
         "--enable-peer-fanout",
         "--max-peer-triggered-publishes", "5",
     ])
     assert rc == 0
     paths = [c[0] for c in calls]
-    # No --binding-owner: bind-room only creates the group + N participants.
-    assert paths == ["/extmsg/groups", "/extmsg/participants", "/extmsg/participants"]
+    assert paths == [
+        "/extmsg/groups",
+        "/extmsg/participants",
+        "/extmsg/participants",
+        "/extmsg/unbind",
+    ]
+    assert calls[-1][1] == {"conversation": {
+        "scope_id": "test-city",
+        "provider": "slack",
+        "account_id": "T0TESTWS",
+        "conversation_id": "C0123ROOM01",
+        "kind": "room",
+    }}
 
     group_body = calls[0][1]
     assert group_body["root_conversation"]["kind"] == "room"
@@ -223,8 +238,7 @@ def test_main_round_trip_with_fake_gc(monkeypatch: pytest.MonkeyPatch, capsys: p
 
     cfg_path = pathlib.Path(os.environ["GC_CITY_PATH"]) / ".gc/services/slack/data/config.json"
     assert cfg_path.exists()
-    import json as _json
-    saved = _json.loads(cfg_path.read_text())
+    saved = json.loads(cfg_path.read_text())
     binding = saved["bindings"]["room:C0123ROOM01"]
     assert binding["group_id"] == "group-xyz"
     assert binding["default_handle"] == "mayor"
@@ -233,9 +247,132 @@ def test_main_round_trip_with_fake_gc(monkeypatch: pytest.MonkeyPatch, capsys: p
         "oversight-rig.mayor", "geo/oversight-rig.project-lead",
     ]
 
-    out = capsys.readouterr().out
-    assert "binding_key" in out
-    assert "group-xyz" in out
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["binding_key"] == "room:C0123ROOM01"
+    assert result["group_id"] == "group-xyz"
+    # A group-only run creates no binding, so there is no binding record — the
+    # bindings it *removed* are the thing the operator needs to see, and they
+    # get their own field instead of being stuffed into the one named for the
+    # other outcome.
+    assert result["binding_record"] is None
+    assert result["unbound_bindings"] == [{"ID": "binding-old", "SessionID": "gc-stale"}]
+    # ...and a removal nobody can see is a removal nobody can undo. The sweep
+    # can take out a binding another pack or operator created.
+    assert "gc-stale" in captured.err
+    assert "binding-old" in captured.err
+
+
+def test_main_requires_an_explicit_binding_authority_before_any_api_call(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+):
+    """Neither flag is an error, and it is raised before anything is mutated.
+
+    The group-only reconcile unbinds *every* active direct binding for the room.
+    Reaching that by omitting a flag means an operator who forgets
+    ``--binding-owner`` on a re-run silently severs the room's outbound
+    publishing — so the destructive path has to be declared, not defaulted into.
+    """
+    mod = _import_module()
+    common = sys.modules["slack_intake_common"]
+
+    def fake_post(path: str, body: dict):
+        raise AssertionError(f"no API call may be made: {path}")
+
+    monkeypatch.setattr(common, "gc_post", fake_post)
+
+    with pytest.raises(SystemExit, match="--binding-owner"):
+        mod.main(["C0123ROOM01", "oversight-rig.mayor"])
+
+    cfg_path = pathlib.Path(os.environ["GC_CITY_PATH"]) / ".gc/services/slack/data/config.json"
+    assert not cfg_path.exists()
+    assert capsys.readouterr().out == ""
+
+
+def test_main_rejects_binding_owner_together_with_group_only(monkeypatch: pytest.MonkeyPatch):
+    """The two flags declare opposite topologies; accepting both would hide which won."""
+    mod = _import_module()
+    common = sys.modules["slack_intake_common"]
+    monkeypatch.setattr(
+        common, "gc_post",
+        lambda path, body: (_ for _ in ()).throw(AssertionError(f"no API call may be made: {path}")),
+    )
+
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        mod.main(["C0123ROOM01", "oversight-rig.mayor",
+                  "--binding-owner", "gc-77139", "--group-only"])
+
+
+def test_fail_closed_error_names_the_owner_this_pack_recorded(monkeypatch: pytest.MonkeyPatch):
+    """The error names the session at risk when the local record knows one.
+
+    gc has no conversation-scoped binding read — ``GET /extmsg/bindings`` is
+    keyed by session_id — so the pack's own record is the only owner name
+    available. It is a hint, not authority, and its absence must not soften the
+    refusal (covered by the fail-closed test above, which runs with no record).
+    """
+    mod = _import_module()
+    common = sys.modules["slack_intake_common"]
+    common.save_pack_config({
+        "version": 1,
+        "bindings": {"room:C0123ROOM01": {"binding_owner": "gc-77139"}},
+    })
+    monkeypatch.setattr(
+        common, "gc_post",
+        lambda path, body: (_ for _ in ()).throw(AssertionError(f"no API call may be made: {path}")),
+    )
+
+    with pytest.raises(SystemExit, match="gc-77139"):
+        mod.main(["C0123ROOM01", "oversight-rig.mayor"])
+
+
+def test_fail_closed_survives_corrupt_local_state(monkeypatch: pytest.MonkeyPatch):
+    """Corrupt pack state degrades the hint, never the refusal.
+
+    Corrupt is the JSON-level failure: the bytes are readable and do not parse,
+    which ``load_pack_config`` converts into ``GCAPIError``. The unreadable
+    case below is a different arm and reaches the hint as ``OSError``.
+    """
+    mod = _import_module()
+    common = sys.modules["slack_intake_common"]
+    state = common.pack_state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "config.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(
+        common, "gc_post",
+        lambda path, body: (_ for _ in ()).throw(AssertionError(f"no API call may be made: {path}")),
+    )
+
+    with pytest.raises(SystemExit, match="--group-only"):
+        mod.main(["C0123ROOM01", "oversight-rig.mayor"])
+
+
+def test_fail_closed_survives_unreadable_local_state(monkeypatch: pytest.MonkeyPatch):
+    """State that exists but cannot be read degrades the hint, never the refusal.
+
+    ``load_pack_config`` wraps only ``json.JSONDecodeError``, so ``read_text``'s
+    ``OSError`` propagates past it and would surface as a traceback instead of
+    the curated refusal naming ``--binding-owner``/``--group-only``.
+
+    The unreadable file is a *directory* at the config path rather than a
+    chmod-000 file: ``path.exists()`` is still true so the early-return is not
+    taken, ``read_text`` raises ``IsADirectoryError`` (an ``OSError``), and
+    unlike a permission bit this reproduces for every uid — a chmod-000 file is
+    readable by root, which would make the test vacuous wherever the suite runs
+    privileged.
+    """
+    mod = _import_module()
+    common = sys.modules["slack_intake_common"]
+    state = common.pack_state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "config.json").mkdir()
+    monkeypatch.setattr(
+        common, "gc_post",
+        lambda path, body: (_ for _ in ()).throw(AssertionError(f"no API call may be made: {path}")),
+    )
+
+    with pytest.raises(SystemExit, match="--group-only"):
+        mod.main(["C0123ROOM01", "oversight-rig.mayor"])
 
 
 def test_main_with_binding_owner_emits_extmsg_bind(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
@@ -275,6 +412,7 @@ def test_main_with_binding_owner_emits_extmsg_bind(monkeypatch: pytest.MonkeyPat
     ]
     bind_body = calls[-1][1]
     assert bind_body["session_id"] == "gc-77139"
+    assert bind_body["replace"] is True
     assert bind_body["conversation"] == {
         "scope_id": "test-city",
         "provider": "slack",
@@ -289,6 +427,10 @@ def test_main_with_binding_owner_emits_extmsg_bind(monkeypatch: pytest.MonkeyPat
     binding = saved["bindings"]["room:C0123ROOM01"]
     assert binding["binding_owner"] == "gc-77139"
     assert binding["binding_record"] == "binding-1"
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["binding_record"] == {"ID": "binding-1", "SessionID": "gc-77139"}
+    assert result["unbound_bindings"] == []
 
 
 def test_binding_owner_can_be_separate_gcid_when_participants_are_aliases(monkeypatch: pytest.MonkeyPatch):
@@ -327,5 +469,31 @@ def test_binding_owner_can_be_separate_gcid_when_participants_are_aliases(monkey
     assert bind_call[1]["session_id"] == "gc-77139"
 
 
-# Module-level json import for the test above.
-import json  # noqa: E402
+@pytest.mark.parametrize("binding_owner", ["", "gc-77139"])
+def test_binding_reconciliation_failure_does_not_persist_or_report_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    binding_owner: str,
+):
+    mod = _import_module()
+    common = sys.modules["slack_intake_common"]
+
+    def fake_post(path: str, body: dict):
+        if path == "/extmsg/groups":
+            return {"ID": "group-xyz"}
+        if path == "/extmsg/participants":
+            return {"ID": "p-" + body["handle"]}
+        if path in {"/extmsg/bind", "/extmsg/unbind"}:
+            raise common.GCAPIError("authoritative binding store unavailable")
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(common, "gc_post", fake_post)
+    args = ["C0123ROOM01", "gc-77139", "--no-protocol-nudge"]
+    args.extend(["--binding-owner", binding_owner] if binding_owner else ["--group-only"])
+
+    with pytest.raises(SystemExit, match="authoritative binding store unavailable"):
+        mod.main(args)
+
+    cfg_path = pathlib.Path(os.environ["GC_CITY_PATH"]) / ".gc/services/slack/data/config.json"
+    assert not cfg_path.exists()
+    assert capsys.readouterr().out == ""

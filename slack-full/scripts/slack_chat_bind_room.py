@@ -198,6 +198,127 @@ def build_participants(
     return out
 
 
+def _recorded_binding_owner(binding_key: str) -> str:
+    """Best-effort read of the owner this pack last recorded for the room.
+
+    Only used to make the fail-closed error below name a session instead of
+    saying "something may be bound". gc has no conversation-scoped binding
+    read — ``GET /extmsg/bindings`` is keyed by ``session_id`` and
+    ``resolveActiveBinding`` is internal — so the local record is the only
+    owner name available to this script, and it is a hint, not authority: it
+    can be stale, and a binding created by other tooling never appears in it.
+    Every failure mode here (no city path, corrupt state, unreadable state,
+    absent record) degrades to "unknown owner", never to a wrong answer or an
+    abort. OSError is caught alongside GCAPIError because load_pack_config
+    only wraps json.JSONDecodeError, so a config.json that exists but cannot
+    be read raises straight through it — and a hint that cannot be produced
+    must never turn the curated refusal into a traceback.
+    """
+    try:
+        cfg = common.load_pack_config()
+    except (common.GCAPIError, OSError):
+        return ""
+    if not isinstance(cfg, dict):
+        return ""
+    record = (cfg.get("bindings") or {}).get(binding_key) or {}
+    if not isinstance(record, dict):
+        return ""
+    return str(record.get("binding_owner") or "")
+
+
+def resolve_binding_authority(args: argparse.Namespace, binding_key: str) -> str:
+    """Return the declared binding owner, or "" for an explicit group-only room.
+
+    Fails closed. Reconciliation writes gc's authoritative direct-binding
+    table, and the group-only arm is destructive: ``/extmsg/unbind`` with a
+    conversation-only body matches *every* active direct binding for the room
+    (gc ``binding_service.go``'s empty filter), including bindings this pack
+    never created. That is the right thing to do when an operator declares the
+    room group-only and the wrong thing to do by default, so it may not be
+    reachable by *omitting* a flag — an operator who forgets ``--binding-owner``
+    on a re-run would silently sever the room's outbound publishing.
+
+    So exactly one of ``--binding-owner`` / ``--group-only`` is required. The
+    check runs before any API call, so a rejected invocation has mutated
+    nothing.
+    """
+    binding_owner = args.binding_owner.strip()
+    if binding_owner and args.group_only:
+        raise SystemExit(
+            "--binding-owner and --group-only are mutually exclusive: "
+            "--binding-owner names the session that keeps the direct binding, "
+            "--group-only removes it")
+    if binding_owner:
+        return binding_owner
+    if args.group_only:
+        return ""
+    recorded = _recorded_binding_owner(binding_key)
+    owner_note = (
+        f"this pack last recorded {recorded!r} as the owner of {binding_key}; "
+        if recorded
+        else ""
+    )
+    raise SystemExit(
+        "refusing to reconcile the direct binding without an explicit "
+        "declaration: pass --binding-owner SESSION to keep (or hand over) the "
+        "room's outbound publisher, or --group-only to declare the room "
+        "group-routed and remove every active direct binding for it. "
+        f"{owner_note}"
+        "--group-only removes bindings created by other tooling too, so it is "
+        "never assumed")
+
+
+def reconcile_authoritative_binding(
+    conversation: dict[str, str], binding_owner: str
+) -> dict[str, Any]:
+    """Make extmsg's direct-binding table agree with the room topology.
+
+    Inbound resolution consults a direct binding before its group route. A
+    group-only room must therefore have no direct binding, while a room with a
+    publisher owner must replace any stale direct binding with that owner.
+
+    Returns a normalized record of what was reconciled::
+
+        {"action": "bind"|"unbind", "binding": {...}|None, "unbound": [...]}
+
+    The two API responses have different shapes — ``/extmsg/bind`` answers with
+    the binding it created, ``/extmsg/unbind`` with ``{"unbound": [...]}`` — and
+    flattening one into a field named for the other is how the removed bindings
+    stopped being legible to the operator who removed them.
+    """
+    try:
+        if binding_owner:
+            binding = common.gc_post(
+                "/extmsg/bind",
+                {
+                    "session_id": binding_owner,
+                    "conversation": conversation,
+                    "replace": True,
+                },
+            )
+            return {"action": "bind", "binding": binding or None, "unbound": []}
+        response = common.gc_post("/extmsg/unbind", {"conversation": conversation})
+        unbound = (response or {}).get("unbound") or []
+        return {"action": "unbind", "binding": None, "unbound": unbound}
+    except common.GCAPIError as exc:
+        raise SystemExit(f"reconcile authoritative binding: {exc}") from exc
+
+
+def report_unbound(unbound: list[Any]) -> None:
+    """Tell the operator which direct bindings the group-only sweep removed.
+
+    A removal nobody can see is a removal nobody can undo: the sweep can take
+    out a binding another pack or operator created, and until now the API's
+    answer was dropped on the floor.
+    """
+    for record in unbound:
+        if isinstance(record, dict):
+            detail = f"{record.get('SessionID') or '?'} (binding {record.get('ID') or '?'})"
+        else:
+            detail = str(record)
+        sys.stderr.write(f"unbound direct binding: {detail}\n")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description="Bind a Slack room/channel to one or more named gc sessions",
@@ -230,24 +351,36 @@ def main(argv: list[str]) -> int:
                              "is composing its own protocol delivery.")
     parser.add_argument("--binding-owner", default="",
                         metavar="SESSION",
-                        help="Also bind this session to the conversation as the publisher "
-                             "for /extmsg/outbound. Required to make outbound publishes "
-                             "work; without it, peer-fanout still fires but publishes need "
-                             "a separate /extmsg/bind call. Should refer semantically to one "
+                        help="Bind this session to the conversation as the publisher "
+                             "for /extmsg/outbound, replacing any stale direct binding. "
+                             "Required on every bind-room run that must preserve outbound "
+                             "publishing; pass --group-only instead to declare the room "
+                             "group-routed. Should refer semantically to one "
                              "of the participants. Pass the gc-id (e.g. gc-77139) when the "
                              "binding will be looked up by gc-id (e.g. resolve_rig_channel.py); "
                              "pass the participant alias when the rest of the system reads "
                              "the binding by alias. The script does NOT cross-check the owner "
                              "against the participant list — this is intentional so gc-ids "
                              "can be used alongside alias-based participants.")
+    parser.add_argument("--group-only", action="store_true",
+                        help="Declare the room purely group-routed: remove EVERY active "
+                             "direct binding for the conversation so none can shadow the "
+                             "group route, including bindings created by other tooling. "
+                             "Mutually exclusive with --binding-owner; one of the two is "
+                             "required, because this removal is destructive and must not be "
+                             "reachable by forgetting a flag.")
     args = parser.parse_args(argv)
+
+    binding_key = f"{args.kind}:{args.conversation_id}"
+    # Before any API call: a rejected declaration must not have created a
+    # group, upserted a participant, or touched the binding table.
+    binding_owner = resolve_binding_authority(args, binding_key)
 
     workspace_id = _slack_workspace_id()
     city = common.gc_city_name()
     overrides = _parse_handle_overrides(args.handle)
     participants = build_participants(args.session_names, overrides, args.default_handle)
     default_handle = args.default_handle or participants[0][0]
-    binding_owner = args.binding_owner.strip()
     conv = build_conversation_ref(
         conversation_id=args.conversation_id,
         kind=args.kind,
@@ -283,19 +416,11 @@ def main(argv: list[str]) -> int:
             raise SystemExit(f"upsert participant {handle}={session}: {exc}") from exc
         participant_records.append(res)
 
-    binding_record: dict[str, Any] | None = None
-    if binding_owner:
-        try:
-            binding_record = common.gc_post(
-                "/extmsg/bind",
-                {"session_id": binding_owner, "conversation": conv},
-            )
-        except common.GCAPIError as exc:
-            raise SystemExit(f"bind {binding_owner}: {exc}") from exc
+    reconciled = reconcile_authoritative_binding(conv, binding_owner)
+    report_unbound(reconciled["unbound"])
 
     cfg = common.load_pack_config()
     cfg.setdefault("bindings", {})
-    binding_key = f"{args.kind}:{args.conversation_id}"
     cfg["bindings"][binding_key] = {
         "kind": args.kind,
         "conversation": conv,
@@ -306,7 +431,7 @@ def main(argv: list[str]) -> int:
             {"handle": h, "session_name": s} for h, s in participants
         ],
         "binding_owner": binding_owner or None,
-        "binding_record": (binding_record or {}).get("ID", "") or None,
+        "binding_record": (reconciled["binding"] or {}).get("ID", "") or None,
     }
     common.save_pack_config(cfg)
 
@@ -329,7 +454,8 @@ def main(argv: list[str]) -> int:
         "fanout_policy": fanout_policy,
         "participants": participant_records,
         "binding_owner": binding_owner or None,
-        "binding_record": binding_record,
+        "binding_record": reconciled["binding"],
+        "unbound_bindings": reconciled["unbound"],
         "protocol_nudge": {
             "delivered_to": nudged,
             "failures": nudge_failures,
