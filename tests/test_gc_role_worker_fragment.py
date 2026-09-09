@@ -42,6 +42,8 @@ def test_workspace_section_sits_between_claim_and_close() -> None:
     assert "worker-worktree.sh" in workspace
     assert "<city>/.worktrees/<rig>/<bead>" in workspace
     assert "check that branch out in the new worktree" in workspace
+    assert "if `git branch --show-current` prints" in workspace
+    assert "restamp it when they differ" in workspace
     assert "--set-metadata 'work_dir=<absolute worktree path>'" in workspace
     assert "--set-metadata 'gc.work_branch=<branch>'" in workspace
 
