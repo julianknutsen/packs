@@ -95,7 +95,7 @@ agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized
 agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "--age"
 
 # ---------------------------------------------------------------------------
-# 3. x20, gc <= v1.4.1 only: the scanner ran past the pipe, and did not know
+# 3. x22, gc <= v1.4.1 only: the scanner ran past the pipe, and did not know
 #    about `gc bd`'s own scope flags
 #
 # Two separate scanner defects, both fixed by gascity 7724983de ("fix(bdflags):
@@ -122,6 +122,8 @@ agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized
 #                                              bd is correctly rejected)
 # ---------------------------------------------------------------------------
 # @section: pre-5220
+agents/boot/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
+agents/boot/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
 agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
 agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"
 agents/deacon/prompt.template.md: bd-unknown-flag: bd mol wisp uses unrecognized flag "-r"

@@ -435,6 +435,112 @@ test_witness_handoff_recovery_is_guarded_and_fail_closed() {
         fail "Step 3b must still reopen the source bead for fall-through recoveries"
 }
 
+test_boot_wisp_queries_pin_include_infra() {
+    local prompt formula total flagged
+    prompt="$GASTOWN/agents/boot/prompt.template.md"
+    formula="$GASTOWN/formulas/mol-boot-patrol.toml"
+
+    # Same contract as the witness guard above, scoped to boot: boot's patrol
+    # loop reconciles to exactly one open wisp, and without --include-infra
+    # every one of its queries returns [] regardless of status, so the surplus
+    # burn never runs and each cycle pours a fresh wisp while its predecessor
+    # leaks. Boot shipped with the bare form on all three sites one commit
+    # after the witness fix, so scope this per-agent rather than widening the
+    # witness test: a pack-wide assertion is red either way (measured 10/21 at
+    # this commit) because the deacon and refinery sites are still bare and
+    # tracked separately in #252.
+    total=$(grep -h -- '--type=molecule' "$prompt" "$formula" |
+        grep -c -F 'gc bd list' || true)
+    flagged=$(grep -h -- '--type=molecule' "$prompt" "$formula" |
+        grep -F 'gc bd list' | grep -c -- '--include-infra' || true)
+
+    # -ge for the same reason as the witness guard: the flagged/total assertion
+    # owns the contract, so the count is a floor that catches a deleted query
+    # site, not a cardinality pin that a legitimate fourth query would break.
+    [[ "$total" -ge 3 ]] ||
+        fail "expected at least 3 boot --type=molecule wisp queries (5 at this commit: 2 prompt + 3 formula), found $total"
+    [[ "$flagged" -eq "$total" ]] ||
+        fail "boot --type=molecule wisp queries must pass --include-infra ($flagged/$total do)"
+}
+
+test_boot_patrol_burn_resolves_current_wisp() {
+    local prompt formula asset name burn_lines bare
+
+    prompt="$GASTOWN/agents/boot/prompt.template.md"
+    formula="$GASTOWN/formulas/mol-boot-patrol.toml"
+
+    # gc never sets GC_BEAD_ID for a named session: the session env builder
+    # exports GC_SESSION_ID/NAME/ALIAS/TEMPLATE/ORIGIN/AGENT, and GC_BEAD_ID is
+    # exported only into ralph check scripts. Boot has no hook-claim block to
+    # export it, so a bare "$GC_BEAD_ID" burn target expands to the empty
+    # string: "burn this wisp" reclaims nothing and leaves the wisp behind on
+    # every cycle -- the same leak the --include-infra guard above exists for,
+    # arriving by a different route. Every other patrol prompt resolves through
+    # CURRENT_WISP with an in-progress fallback query, and so does every other
+    # patrol formula except the witness's, which burns an agent-resolved
+    # <this-wisp-id> placeholder instead. So pin that idiom on both boot assets
+    # rather than the burn line alone: the deletion of either half is what
+    # makes the target silently empty.
+    for asset in "$prompt" "$formula"; do
+        name=$(basename "$asset")
+
+        grep -qF 'CURRENT_WISP=${GC_BEAD_ID:-}' "$asset" ||
+            fail "$name must seed CURRENT_WISP from \$GC_BEAD_ID"
+        grep -q -- 'CURRENT_WISP=\$(gc bd list .*--status=in_progress .*--include-infra' "$asset" ||
+            fail "$name must fall back to an in-progress wisp query when \$GC_BEAD_ID is unset"
+        grep -qF 'gc bd mol burn "$CURRENT_WISP" --force' "$asset" ||
+            fail "$name must burn the resolved \$CURRENT_WISP"
+    done
+
+    # No burn call anywhere in boot's assets may address GC_BEAD_ID directly.
+    # This is the assertion that survives a rewrite of the block above, and it
+    # is what catches a *new* bare burn site rather than a mutated one. Same
+    # prose tradeoff as the guards above: a doc line carrying both tokens fails
+    # loudly, in the safe direction.
+    burn_lines=$(grep -h -F 'gc bd mol burn' "$prompt" "$formula" || true)
+    [[ -n "$burn_lines" ]] ||
+        fail "expected boot assets to carry gc bd mol burn calls, found none"
+    bare=$(printf '%s\n' "$burn_lines" | grep -c -F 'GC_BEAD_ID' || true)
+    [[ "$bare" -eq 0 ]] ||
+        fail "boot burn targets must resolve through \$CURRENT_WISP, not a bare \$GC_BEAD_ID ($bare do not)"
+}
+
+test_boot_deacon_observation_query_sees_wisps_tier() {
+    local prompt formula asset name lines unflagged
+
+    prompt="$GASTOWN/agents/boot/prompt.template.md"
+    formula="$GASTOWN/formulas/mol-boot-patrol.toml"
+
+    # The tier census above cannot protect this site. Reverting the
+    # deacon-observation query to its blind pre-fix form drops --type=molecule
+    # too, so the line leaves the numerator and the denominator together (5/5
+    # -> 4/4) and the -ge 3 floor absorbs the loss: whole suite green, while
+    # the decision table's wisp-keyed rows ("young wisp -> backoff", "very
+    # stale wisp -> warrant") go back to being untriggerable because a patrol
+    # wisp never shows in the deacon's work. Pin the site by its distinctive
+    # text instead of by tier membership. The prompt's quick-reference row is
+    # deliberately untyped -- it asks about deacon work generally -- so it
+    # matches no counter at all and this is the only guard that reaches it.
+    for asset in "$prompt" "$formula"; do
+        name=$(basename "$asset")
+
+        # || true is load-bearing: the suite runs under set -euo pipefail, so
+        # an unguarded grep would kill the run with no diagnostic on exactly
+        # the deletion arm the next assertion exists to report.
+        lines=$(grep -- 'gc bd list --assignee=.*deacon' "$asset" || true)
+        [[ -n "$lines" ]] ||
+            fail "$name must keep a deacon-observation query"
+
+        # Every matching line, not merely one of them: a grep -q over the whole
+        # match set passes as soon as any deacon query carries the flag, so a
+        # new blind one added beside a good one reads as covered. That is the
+        # same addition shape the bare-burn census above exists to catch.
+        unflagged=$(printf '%s\n' "$lines" | grep -c -v -- '--include-infra' || true)
+        [[ "$unflagged" -eq 0 ]] ||
+            fail "$name deacon-observation queries must pass --include-infra ($unflagged do not)"
+    done
+}
+
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed() {
     local formula direct_block
     formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
@@ -520,6 +626,9 @@ test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_witness_wisp_queries_pin_include_infra
 test_witness_handoff_recovery_is_guarded_and_fail_closed
+test_boot_wisp_queries_pin_include_infra
+test_boot_patrol_burn_resolves_current_wisp
+test_boot_deacon_observation_query_sees_wisps_tier
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
 
 echo "gastown pack asset tests passed"
