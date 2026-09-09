@@ -122,11 +122,34 @@ for candidate in \
 done
 [ -n "$VALIDATOR" ] || fail "validate_build_artifact.py not found beside $SCRIPT_DIR or under GC_WORK_DIR"
 
-if OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" 2>&1)"; then
-  echo "build artifact valid: schema=$SCHEMA path=$ARTIFACT_PATH"
-  exit 0
+if ! OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" 2>&1)"; then
+  echo "build-artifact-check: schema=$SCHEMA path=$ARTIFACT_PATH failed validation" >&2
+  printf '%s\n' "$OUTPUT" >&2
+  exit 1
 fi
 
-echo "build-artifact-check: schema=$SCHEMA path=$ARTIFACT_PATH failed validation" >&2
-printf '%s\n' "$OUTPUT" >&2
-exit 1
+# Decomposition artifacts additionally bind live bead edges to the declared
+# work-item order: a sequential chain wired backwards drains back-to-front, so
+# assert edge orientation at creation time rather than at drain time.
+if [ "$SCHEMA" = "gc.build.decomposition.v1" ]; then
+  EDGE_CHECK=""
+  for candidate in \
+    ${GC_WORK_DIR:+"$GC_WORK_DIR/gascity/assets/scripts/validate_decomposition_edges.py"} \
+    "$(dirname "$VALIDATOR")/validate_decomposition_edges.py"; do
+    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+      EDGE_CHECK="$candidate"
+      break
+    fi
+  done
+  [ -n "$EDGE_CHECK" ] || fail "validate_decomposition_edges.py not found beside $VALIDATOR or under GC_WORK_DIR"
+  if EDGE_OUTPUT="$(python3 "$EDGE_CHECK" --path "$ARTIFACT_PATH" 2>&1)"; then
+    [ -n "$EDGE_OUTPUT" ] && printf '%s\n' "$EDGE_OUTPUT"
+  else
+    echo "build-artifact-check: schema=$SCHEMA path=$ARTIFACT_PATH failed dependency-orientation check" >&2
+    printf '%s\n' "$EDGE_OUTPUT" >&2
+    exit 1
+  fi
+fi
+
+echo "build artifact valid: schema=$SCHEMA path=$ARTIFACT_PATH"
+exit 0

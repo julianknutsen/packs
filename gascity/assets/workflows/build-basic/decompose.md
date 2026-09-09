@@ -49,6 +49,25 @@ Include the required schema sections:
 - Implementation Convoy
 - Work Items
 
+The Work Items section must include a machine-readable dependency table with
+ID, Bead, and Depends On columns, one row per work item, rows in intended
+execution order:
+
+| ID | Bead | Depends On |
+| --- | --- | --- |
+| WI-1 | <WI-1-bead-id> | - |
+| WI-2 | <WI-2-bead-id> | WI-1 |
+
+- Every Depends On entry must reference an EARLIER row's ID; use commas for
+  several prerequisites and `-` for none.
+- Do not add a Status column to this table; the validator reads any table with
+  ID and Status columns as the coverage matrix.
+- The validation gate verifies live bead edges against this table: each row's
+  bead must depend on the beads of its Depends On entries, and no earlier
+  row's bead may depend on a later row's bead. Orientation failures name the
+  exact `gc bd dep add` / `gc bd dep remove` repair commands; repair the
+  EDGES with those commands, not just the artifact text.
+
 Create work-item beads first, then create a new implementation convoy for those
 work units. Do not reuse the source or launch convoy from `gc.var.convoy_id`.
 
@@ -66,6 +85,24 @@ Use the convoy creation flow exactly:
 Do not create an empty convoy. Do not call `gc convoy add` for newly-created beads.
 The freshly-created IDs may not be visible to that path yet. Do not call `gc bd show <implementation-convoy-id>`.
 Convoy IDs are not bd issue IDs.
+
+Wire work-item dependencies immediately after creating the convoy, exactly as
+declared in the dependency table:
+
+- The command is `gc bd dep add <dependent> <prerequisite>`: the FIRST
+  argument is the work item that must WAIT, the SECOND is what it waits for.
+  Read it as "<dependent> depends on <prerequisite>".
+- For the declared order WI-1 then WI-2 (WI-2 depends on WI-1):
+  - RIGHT: `gc bd dep add <WI-2-bead> <WI-1-bead>` (WI-2 needs WI-1)
+  - WRONG: `gc bd dep add <WI-1-bead> <WI-2-bead>` — that is the temporal
+    misreading ("WI-1 comes before WI-2"); it makes WI-1 wait on WI-2, and a
+    chain wired this way drains back-to-front.
+- For a strict sequential chain, run one command per consecutive pair, always
+  naming the LATER work item first.
+- Self-check before closing: the first work item must show no blocking
+  dependencies in `gc bd dep list <WI-1-bead> --json`, every later work item
+  must list exactly its declared prerequisites, and for a strict chain only
+  the first of the new work items may be ready.
 
 Record the decomposition output on the workflow root bead with
 `gc bd update "<workflow-root-id>" --set-metadata "gc.build.decomposition_path=<absolute path>"`.

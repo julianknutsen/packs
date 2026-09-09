@@ -6,6 +6,8 @@ Create or adopt an implementation convoy for the work units. The convoy must con
 
 Write the decomposition artifact to `{{decomposition_path}}` when supplied; otherwise write it under `{{artifact_root}}` as the default decomposition artifact. The decomposition must include work item IDs, requirement and plan traceability, expected files or formula assets, verification expectations, dependencies, skipped work, and blocked work with rationale.
 
+Declare work-item dependencies in a machine-readable table with ID, Bead, and Depends On columns (rows in intended execution order; every Depends On entry references an earlier row; no Status column), and wire the live edges to match: `gc bd dep add <dependent> <prerequisite>` — the first argument WAITS, the second is what it waits for. Never wire a declared sequence temporally (`gc bd dep add <earlier> <later>` is inverted and drains back-to-front). The validation gate verifies live edge orientation against the declared table and fails with the exact `gc bd dep add`/`gc bd dep remove` repair commands; repair the edges, not just the artifact text.
+
 Record the implementation convoy ID on the workflow root bead as both:
 
 - `gc.input_convoy_id=<implementation-convoy-id>` for the drain contract.
