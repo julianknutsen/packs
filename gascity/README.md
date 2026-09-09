@@ -170,6 +170,59 @@ Default formula routes use these qualified targets: `gc.run-operator`,
 `gc.implementation-worker`, `gc.gap-analyst`, `gc.implementation-reviewer`,
 and `gc.publisher`.
 
+## Worker workspaces
+
+A rig role agent starts in the rig root unless its `work_dir` says otherwise.
+Rigs whose `AGENTS` rules forbid working in the root (a shared checkout that
+lags `origin/main`, other agents' branches) give each worker its own worktree
+before the first turn, using two core surfaces: `work_dir` (gc creates it,
+starts the session in it, exports it as `$GC_DIR`, and materializes the
+agent's skills and hooks into it because it differs from the scope root) and
+`pre_start` (runs before the session, in `$GC_DIR`, with the session
+environment, including `GC_TRIGGER_BEAD_ID` for a slung bead).
+
+This pack ships `assets/scripts/worker-worktree.sh` for the `pre_start` half.
+Copy it into the city's scripts directory, which gc mirrors into every session
+work dir, and point the agent at it:
+
+```sh
+cp path/to/gascity/assets/scripts/worker-worktree.sh "$CITY/.gc/scripts/"
+```
+
+```toml
+# agents/implementation-worker-codex/agent.toml — a second role instance on
+# another provider (see the repository README, "Codex code workers"); the same
+# two keys work in a [[rigs.patches]] or [[patches.agent]] entry.
+scope = "rig"
+dir = "my-repo"
+provider = "codex"
+work_dir = ".worktrees/{{.Rig}}/lane-{{.AgentBase}}"
+pre_start = ["sh {{.CityRoot}}/.gc/scripts/worker-worktree.sh"]
+```
+
+The script makes `$GC_DIR` a worktree of `$GC_RIG_ROOT`'s repository and
+never touches the rig root's working tree. With a trigger bead it reuses the
+one branch whose name contains the bead id (local or on the remote) or
+creates `<bead id>` from `origin/HEAD`; a branch checked out in another
+worktree is not stolen (the lane is left detached at its tip, with a WARN).
+Nothing is ever deleted: a lane with tracked modifications, or a non-empty
+directory that is not a worktree, is moved to `<lane>.aside-<utc stamp>`
+first. Untracked files (materialized skills, hooks, `node_modules`) do not
+count as modifications. Because the lane is on the bead's branch when the
+worker claims, `gc hook --claim` stamps a correct `gc.work_branch` instead of
+inheriting a stale one. `sh worker-worktree.sh --help` lists the flags.
+
+Two related core behaviors complete the picture:
+
+- A bead carrying `work_dir=<absolute path>` metadata, assigned and in
+  progress, starts its next session in that directory (an existing per-bead
+  worktree wins over the agent's lane). The role prompt tells workers to stamp
+  it, with `gc.work_branch`, before closing a bead whose work continues.
+- Toolchain on the worker PATH belongs to the provider: `[providers.<name>]
+  env = { PATH = "..." }` (values expand `$VAR` against the controller
+  environment) or a command shim that prepends a directory of wrappers. The
+  role prompt does not install package managers.
+
 ## Build Methodology Contract
 
 `build-base` is the virtual full-lifecycle workflow contract. It defines the

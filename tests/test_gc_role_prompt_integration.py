@@ -131,6 +131,8 @@ def assert_clean_worker_render(prompt: str, persona_heading: str) -> None:
     assert "CLAIMED_ROOT_BEAD_ID" in prompt
     assert "CLAIMED_CONTINUATION_GROUP" in prompt
     assert 'gc bd update "$CLAIMED_BEAD_ID"' in prompt
+    assert "An absent key is an empty value, never a failed claim." in prompt
+    assert prompt.count("## Workspace") == 1
     assert "An empty continuation group is a hard session boundary" in prompt
 
 
