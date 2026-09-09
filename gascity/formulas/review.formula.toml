@@ -10,10 +10,12 @@ Launch inputs:
 """
 formula = "review"
 version = 1
-contract = "graph.v2"
 extends = ["code-review-base"]
 target_required = false
 mode = "report"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [catalog]
 name = "review"

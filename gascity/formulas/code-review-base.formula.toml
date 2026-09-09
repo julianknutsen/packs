@@ -7,10 +7,12 @@ scoring while entrypoint adapters keep GitHub/comment lifecycle ownership.
 """
 formula = "code-review-base"
 version = 1
-contract = "graph.v2"
 target_required = false
 internal = true
 mode = "report"
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.context_path]
