@@ -236,6 +236,378 @@ def test_reply_current_exits_nonzero_on_gc_outbound_delivered_false(
 
 
 # --------------------------------------------------------------------------
+# Thread inheritance from the latest inbound (gp-i62).
+# --------------------------------------------------------------------------
+
+
+def _inbound_conv(conversation_id: str) -> dict[str, str]:
+    return {
+        "scope_id": "test-city",
+        "provider": "slack",
+        "account_id": "T0TESTWS",
+        "conversation_id": conversation_id,
+        "kind": "room",
+    }
+
+
+def test_threaded_inbound_inherits_thread_ts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """gp-i62 repro: threaded inbound + explicit --conversation-id.
+
+    Twice on 2026-08-09 an inbound carrying thread context ('in thread
+    1786250478.963679') was answered with reply-current --conversation-id,
+    and the reply landed at CHANNEL level. The reply must inherit the
+    inbound's thread root by default.
+    """
+    rc, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(
+        common, "find_latest_inbound_thread_for_session",
+        lambda _sid: ("1786291407.960839", "1786250478.963679", _inbound_conv("C0GASTOWN")))
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+    ])
+    assert exit_code == 0
+    assert captured["body"]["reply_to_message_id"] == "1786250478.963679"
+
+
+def test_unthreaded_inbound_stays_channel_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A plain (unthreaded) inbound keeps the channel-level reply."""
+    rc, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(
+        common, "find_latest_inbound_thread_for_session",
+        lambda _sid: ("1786291407.960839", "", _inbound_conv("C0GASTOWN")))
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+    ])
+    assert exit_code == 0
+    assert "reply_to_message_id" not in captured["body"]
+
+
+def test_thread_not_inherited_across_conversations(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit --conversation-id naming a DIFFERENT conversation than the
+    latest inbound must not borrow that inbound's thread anchor — a foreign
+    thread_ts would strand the reply."""
+    rc, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(
+        common, "find_latest_inbound_thread_for_session",
+        lambda _sid: ("1786291407.960839", "1786250478.963679", _inbound_conv("C0ELSEWHERE")))
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+    ])
+    assert exit_code == 0
+    assert "reply_to_message_id" not in captured["body"]
+
+
+def test_no_thread_flag_forces_channel_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    rc, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(
+        common, "find_latest_inbound_thread_for_session",
+        lambda _sid: ("1786291407.960839", "1786250478.963679", _inbound_conv("C0GASTOWN")))
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+        "--no-thread",
+    ])
+    assert exit_code == 0
+    assert "reply_to_message_id" not in captured["body"]
+
+
+def test_no_thread_rejects_reply_to_combination(monkeypatch: pytest.MonkeyPatch) -> None:
+    rc, common = _import_modules()
+    monkeypatch.setattr(common, "find_latest_inbound_for_session", lambda _sid: None)
+    monkeypatch.setattr(common, "look_up_binding", lambda _sid: None)
+    with pytest.raises(SystemExit, match="--no-thread cannot be combined"):
+        rc.main([
+            "--session", "gc-test-session",
+            "--conversation-id", "C0GASTOWN",
+            "--body", "x",
+            "--reply-to", "1700000.000100",
+            "--no-thread",
+        ])
+
+
+def test_explicit_reply_to_wins_over_inherited_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    rc, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+
+    def fail_lookup(_sid: str):
+        raise AssertionError("--reply-to must not trigger the inheritance lookup")
+
+    monkeypatch.setattr(common, "find_latest_inbound_thread_for_session", fail_lookup)
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+        "--reply-to", "1700000.000100",
+    ])
+    assert exit_code == 0
+    assert captured["body"]["reply_to_message_id"] == "1700000.000100"
+
+
+def test_thread_current_anchors_at_thread_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--thread-current on a thread-reply inbound anchors at the ROOT ts.
+
+    Slack threads hang off the parent message; thread_ts pointing at a
+    child message strands the reply. Before gp-i62 this used the child's
+    own ts."""
+    rc, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(
+        common, "find_latest_inbound_thread_for_session",
+        lambda _sid: ("1786291407.960839", "1786250478.963679", _inbound_conv("C0GASTOWN")))
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+        "--thread-current",
+    ])
+    assert exit_code == 0
+    assert captured["body"]["reply_to_message_id"] == "1786250478.963679"
+
+
+def test_thread_current_unthreaded_uses_own_ts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--thread-current on a plain inbound threads under that message itself."""
+    rc, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(
+        common, "find_latest_inbound_thread_for_session",
+        lambda _sid: ("1786291407.960839", "", _inbound_conv("C0GASTOWN")))
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+        "--thread-current",
+    ])
+    assert exit_code == 0
+    assert captured["body"]["reply_to_message_id"] == "1786291407.960839"
+
+
+def test_inheritance_lookup_failure_degrades_to_channel_level(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """A gc outage during the best-effort inheritance lookup must not sink
+    the reply (--via adapter works without gc) — warn and post unthreaded."""
+    rc, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"delivered": True}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+
+    def failing_lookup(_sid: str):
+        raise common.GCAPIError("GET /events failed: connection refused")
+
+    monkeypatch.setattr(common, "find_latest_inbound_thread_for_session", failing_lookup)
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+        "--via", "adapter",
+    ])
+    assert exit_code == 0
+    assert "reply_to_message_id" not in captured["body"]
+    assert "thread-inheritance lookup failed" in capsys.readouterr().err
+
+
+def test_inheritance_lookup_timeout_degrades_to_channel_level(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """A *wedged* gc degrades like a refused one.
+
+    A refused connection reaches the guard as GCAPIError (URLError), but a
+    gc that accepts the connection and then stalls raises a bare
+    TimeoutError out of resp.read() — an OSError, not a GCAPIError. That
+    shape used to escape the degrade guard and kill the reply with a
+    traceback, on a path that made no gc call at all before inheritance
+    existed. _request wraps it so every best-effort caller degrades.
+    """
+    rc, common = _import_modules()
+    published: dict[str, Any] = {}
+
+    def wedged_urlopen(*_args: Any, **_kwargs: Any):
+        raise TimeoutError("timed out")
+
+    # Only the lookup goes over HTTP here; publish is stubbed, so the real
+    # find_latest_inbound_thread_for_session -> _request path runs.
+    monkeypatch.setattr(common.urllib.request, "urlopen", wedged_urlopen)
+    monkeypatch.setattr(
+        common, "publish_via_adapter",
+        lambda **kwargs: published.update(kwargs) or {"delivered": True})
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+        "--via", "adapter",
+    ])
+    assert exit_code == 0
+    assert published["reply_to_message_id"] == ""
+    assert "thread-inheritance lookup failed" in capsys.readouterr().err
+
+
+def test_request_wraps_timeout_as_gcapi_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_request turns a read timeout into GCAPIError for every caller.
+
+    urllib raises TimeoutError (an OSError, not a URLError) when the server
+    accepts the connection and then stalls, so without this wrap it slips
+    past every `except GCAPIError` degrade guard in the pack.
+    """
+    _rc, common = _import_modules()
+
+    def wedged_urlopen(*_args: Any, **_kwargs: Any):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(common.urllib.request, "urlopen", wedged_urlopen)
+    with pytest.raises(common.GCAPIError) as exc:
+        common._request("GET", "http://127.0.0.1:8372/v0/city/test-city/events",
+                        csrf=False)
+    assert "timed out" in str(exc.value)
+
+
+def test_inheritance_lookup_reset_degrades_to_channel_level(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """A gc that dies mid-response degrades like one that stalls.
+
+    The stall arrives as TimeoutError, but a gc killed after the headers
+    sends an RST and resp.read() raises ConnectionResetError — neither a
+    URLError nor a TimeoutError, so it escaped both of _request's wrapping
+    arms and killed the reply with a traceback on the same best-effort path
+    the timeout wrap exists to keep alive.
+    """
+    rc, common = _import_modules()
+    published: dict[str, Any] = {}
+
+    class _ResetResponse:
+        def __enter__(self) -> "_ResetResponse":
+            return self
+
+        def __exit__(self, *_exc: Any) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            raise ConnectionResetError(104, "Connection reset by peer")
+
+    # Headers arrive, then the body read is reset: the shape that reaches
+    # read() rather than urlopen(). Publish is stubbed, so the real
+    # find_latest_inbound_thread_for_session -> _request path runs.
+    monkeypatch.setattr(common.urllib.request, "urlopen",
+                        lambda *_a, **_k: _ResetResponse())
+    monkeypatch.setattr(
+        common, "publish_via_adapter",
+        lambda **kwargs: published.update(kwargs) or {"delivered": True})
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+        "--via", "adapter",
+    ])
+    assert exit_code == 0
+    assert published["reply_to_message_id"] == ""
+    assert "thread-inheritance lookup failed" in capsys.readouterr().err
+
+
+def test_inheritance_logs_the_anchor_and_reports_it(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Inheriting an anchor is announced on stderr and in the result JSON.
+
+    The re-anchor is the one decision on the success path that rewrites
+    where the reply lands, and the anchor is the conversation's newest
+    inbound rather than provably the message being answered — so a reply
+    in an unexpected thread has to be traceable to the inbound that
+    donated the ts, or the report is unreproducible.
+    """
+    rc, common = _import_modules()
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        return {"Receipt": {"Delivered": True}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(
+        common, "find_latest_inbound_thread_for_session",
+        lambda _sid: ("1786291407.960839", "1786250478.963679", _inbound_conv("C0GASTOWN")))
+
+    exit_code = rc.main([
+        "--session", "gc-test-session",
+        "--conversation-id", "C0GASTOWN",
+        "--body", "reply",
+    ])
+    assert exit_code == 0
+    streams = capsys.readouterr()
+    assert "inheriting thread 1786250478.963679 from inbound 1786291407.960839" in streams.err
+    assert json.loads(streams.out)["reply_to_message_id"] == "1786250478.963679"
+
+
+# --------------------------------------------------------------------------
 # Company-context awareness (company rooms 2b) — additive to the legacy path.
 # --------------------------------------------------------------------------
 

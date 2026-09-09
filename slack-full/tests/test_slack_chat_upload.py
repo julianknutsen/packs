@@ -160,19 +160,12 @@ def test_thread_ts_and_idempotency_propagate_through_gc_path(
     assert body["filename"] == "out.txt"
 
 
-def test_thread_current_unwraps_helper_tuple(
+def _upload_thread_current(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
-) -> None:
-    """Regression for the gc-j8h live-smoke bug.
-
-    `find_latest_inbound_message_id_for_session` returns
-    `tuple[str, dict]`; the upload script must extract `match[0]`
-    rather than passing the whole tuple as `thread_ts`. Without
-    the unpack, gc rejects the request with a 422 because
-    `reply_to_message_id` arrives on the wire as a 2-element list
-    instead of a string.
-    """
+    lookup: Any,
+) -> dict[str, Any]:
+    """Run `upload --thread-current` against a stubbed thread lookup."""
     upload, common = _import_modules()
     captured: dict[str, Any] = {}
 
@@ -184,10 +177,7 @@ def test_thread_current_unwraps_helper_tuple(
     monkeypatch.setattr(common, "_request", fake_request)
     monkeypatch.setattr(common, "look_up_binding", lambda _sid: _fake_binding())
     monkeypatch.setattr(
-        common,
-        "find_latest_inbound_message_id_for_session",
-        lambda _sid: ("1777779766.848799", _fake_binding()),
-    )
+        common, "find_latest_inbound_thread_for_session", lookup)
 
     file_path = _make_file(tmp_path)
     upload.main([
@@ -195,10 +185,57 @@ def test_thread_current_unwraps_helper_tuple(
         "--session", "gc-test-session",
         "--thread-current",
     ])
-    body = captured["body"]
-    # Critical: a plain string, NOT the (msg_id, conversation) tuple.
+    return captured["body"]
+
+
+def test_thread_current_unwraps_helper_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Regression for the gc-j8h live-smoke bug.
+
+    The lookup returns a tuple; the upload script must extract the ts
+    rather than passing the whole tuple as `thread_ts`. Without the
+    unpack, gc rejects the request with a 422 because
+    `reply_to_message_id` arrives on the wire as a list instead of a
+    string.
+    """
+    body = _upload_thread_current(
+        monkeypatch, tmp_path,
+        lambda _sid: ("1777779766.848799", "", _fake_binding()))
+    # Critical: a plain string, NOT the lookup tuple.
     assert body["reply_to_message_id"] == "1777779766.848799"
     assert isinstance(body["reply_to_message_id"], str)
+
+
+def test_thread_current_anchors_at_thread_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """`upload --thread-current` anchors at the ROOT ts of a thread-reply
+    inbound, matching `reply-current --thread-current`.
+
+    upload/help.md promises "same logic as `gc slack reply-current`". While
+    upload consumed the mid-only wrapper, a thread-reply inbound anchored
+    the upload at the child's own ts — Slack hangs threads off the parent,
+    so the file stranded outside the thread the human was reading (gp-i62)
+    and the parity claim was false.
+    """
+    body = _upload_thread_current(
+        monkeypatch, tmp_path,
+        lambda _sid: ("1786291407.960839", "1786250478.963679", _fake_binding()))
+    assert body["reply_to_message_id"] == "1786250478.963679"
+
+
+def test_thread_current_unthreaded_uses_own_ts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A plain (unthreaded) inbound still anchors the upload at its own ts."""
+    body = _upload_thread_current(
+        monkeypatch, tmp_path,
+        lambda _sid: ("1786291407.960839", "", _fake_binding()))
+    assert body["reply_to_message_id"] == "1786291407.960839"
 
 
 # --------------------------------------------------------------------------

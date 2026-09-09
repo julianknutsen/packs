@@ -137,3 +137,46 @@ def test_truncated_scan_warns_on_stderr(
     err = capsys.readouterr().err
     assert "truncated to 0/750" in err
     assert err.count("warning: inbound event scan") == len(common._INBOUND_SCAN_WINDOWS)
+
+
+def test_thread_lookup_returns_root_for_threaded_inbound(gc_mock: "GcMock") -> None:
+    # gp-i62: the transcript entry for a thread-reply inbound carries the
+    # thread root in ReplyToMessageID (adapter stamps Slack's thread_ts
+    # there). The full event→transcript chain must surface it so
+    # reply-current can inherit the thread.
+    common = _import_common()
+    gc_mock.register_inbound_event(
+        target_session="gc-test-session", conversation_id="C0THREADED",
+    )
+    gc_mock.register_transcript_entry(
+        conversation_id="C0THREADED",
+        provider_message_id="1786291407.960839",
+        reply_to_message_id="1786250478.963679",
+    )
+
+    match = common.find_latest_inbound_thread_for_session("gc-test-session")
+
+    assert match is not None
+    mid, thread_root, conv = match
+    assert mid == "1786291407.960839"
+    assert thread_root == "1786250478.963679"
+    assert conv["conversation_id"] == "C0THREADED"
+
+
+def test_thread_lookup_returns_empty_root_for_plain_inbound(gc_mock: "GcMock") -> None:
+    common = _import_common()
+    gc_mock.register_inbound_event(
+        target_session="gc-test-session", conversation_id="C0PLAIN",
+    )
+    gc_mock.register_transcript_entry(
+        conversation_id="C0PLAIN",
+        provider_message_id="1786291407.960839",
+    )
+
+    match = common.find_latest_inbound_thread_for_session("gc-test-session")
+
+    assert match is not None
+    mid, thread_root, conv = match
+    assert mid == "1786291407.960839"
+    assert thread_root == ""
+    assert conv["conversation_id"] == "C0PLAIN"
