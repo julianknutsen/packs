@@ -29,10 +29,12 @@ Launch inputs:
 """
 formula = "build-from-decompose-base"
 version = 1
-contract = "graph.v2"
 extends = ["build-from-convoy-base"]
 target_required = false
 internal = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [metadata.gc.methodology]
 allowed_drain_policies = ["separate", "same-session"]

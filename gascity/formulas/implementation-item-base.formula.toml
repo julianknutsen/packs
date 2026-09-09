@@ -7,10 +7,12 @@ per-item procedure while keeping shared-drain sequencing stable.
 """
 formula = "implementation-item-base"
 version = 1
-contract = "graph.v2"
 target_required = true
 internal = true
 single_lane = true
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.context_path]
