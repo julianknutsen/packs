@@ -253,6 +253,67 @@ test_composition_is_documented() {
         fail "pack.toml should not reference the retired maintenance pack import"
 }
 
+test_boot_watchdog_uses_ordered_on_demand_lifecycle() {
+    local pack order script prompt
+    pack="$GASTOWN/pack.toml"
+    order="$GASTOWN/orders/boot-watchdog.toml"
+    script="$GASTOWN/assets/scripts/boot-watchdog.sh"
+    prompt="$GASTOWN/agents/boot/prompt.template.md"
+
+    [[ -f "$order" ]] || fail "boot watchdog order should be present"
+    [[ -f "$script" ]] || fail "boot watchdog script should be present"
+    [[ -x "$script" ]] || fail "boot watchdog script should be executable"
+    parse_toml "$pack" "$order"
+
+    python3 - "$pack" <<'PY' || fail "boot named session should be on_demand, not always"
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    data = tomllib.load(handle)
+for session in data.get("named_session", []):
+    if session.get("template") == "boot":
+        if session.get("scope") != "city" or session.get("mode") != "on_demand":
+            raise SystemExit(1)
+        break
+else:
+    raise SystemExit(1)
+PY
+
+    python3 - "$order" <<'PY' || fail "boot watchdog order should be a city-scoped cooldown exec"
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    order = tomllib.load(handle)["order"]
+if order.get("scope") != "city":
+    raise SystemExit(1)
+if order.get("trigger") != "cooldown":
+    raise SystemExit(1)
+if order.get("interval") != "30m":
+    raise SystemExit(1)
+if order.get("timeout") != "30s":
+    raise SystemExit(1)
+if order.get("idempotent") is not True:
+    raise SystemExit(1)
+if order.get("exec") != '"$PACK_DIR/assets/scripts/boot-watchdog.sh"':
+    raise SystemExit(1)
+PY
+
+    grep -F 'message=${GASTOWN_BOOT_MESSAGE:-"Boot watchdog tick"}' "$script" >/dev/null ||
+        fail "boot watchdog script should default to the standard tick message"
+    grep -F 'gc session nudge "$target" "$message"' "$script" >/dev/null ||
+        fail "boot watchdog script should nudge the resolved boot target"
+    grep -F 'GASTOWN_BOOT_TARGET' "$script" >/dev/null ||
+        fail "boot watchdog script should expose an explicit target override"
+    ! grep -F '`mode = "always"` keeps the `boot` identity present' "$prompt" >/dev/null ||
+        fail "boot prompt must not describe boot as an always session"
+    grep -F '`mode = "on_demand"` reserves the `boot` identity' "$prompt" >/dev/null ||
+        fail "boot prompt should document the on_demand lifecycle"
+    grep -F 'cooldown order' "$prompt" >/dev/null ||
+        fail "boot prompt should explain that an order wakes boot"
+}
+
 test_polecat_startup_uses_standard_hook_claim() {
     local agent prompt propulsion
     agent="$GASTOWN/agents/polecat/agent.toml"
@@ -515,6 +576,7 @@ test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_work_bead_resolution_discriminator_is_pinned
 test_composition_is_documented
+test_boot_watchdog_uses_ordered_on_demand_lifecycle
 test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact

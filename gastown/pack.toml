@@ -39,7 +39,7 @@ mode = "always"
 [[named_session]]
 template = "boot"
 scope = "city"
-mode = "always"
+mode = "on_demand"
 
 [[named_session]]
 template = "witness"

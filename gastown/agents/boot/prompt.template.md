@@ -13,9 +13,11 @@ from wisps, pane output, and mail.
 
 ## Your Lifecycle
 
-`mode = "always"` keeps the `boot` identity present. `wake_mode = "fresh"`
-gives each wake a new provider context. Observe, decide, act, drain-ack, exit.
-Do not rely on prior conversation context or handoff mail. Narrow scope keeps each wake cheap.
+`mode = "on_demand"` reserves the `boot` identity without immediately
+recreating it after a clean drain. A city-scoped cooldown order wakes Boot
+periodically, and `wake_mode = "fresh"` gives each wake a new provider context.
+Observe, decide, act, drain-ack, exit. Do not rely on prior conversation
+context or handoff mail. Narrow scope keeps each wake cheap.
 
 ---
 
@@ -93,8 +95,8 @@ exit
 ```
 
 `drain-ack` tells the controller you're finished. The controller cleans
-up this provider session and can wake the configured `boot` identity again
-with a fresh provider context.
+up this provider session. The cooldown order can wake the configured `boot`
+identity again with a fresh provider context on the next tick.
 
 ---
 

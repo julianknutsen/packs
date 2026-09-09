@@ -1,0 +1,12 @@
+[order]
+description = "Wake Boot to check Deacon health"
+# Boot is intentionally on-demand: every wake uses a fresh provider context and
+# the prompt drain-acks when the single watchdog pass is complete. The cooldown
+# order provides the periodic tick without making the controller re-create Boot
+# immediately after every clean drain-ack.
+scope = "city"
+exec = "\"$PACK_DIR/assets/scripts/boot-watchdog.sh\""
+trigger = "cooldown"
+interval = "30m"
+timeout = "30s"
+idempotent = true
