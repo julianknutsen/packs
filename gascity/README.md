@@ -37,10 +37,12 @@ and your project added as a rig (`gc rig add .` inside the repo). See the
    source = "https://github.com/gastownhall/gascity-packs.git//gascity/roles"
    ```
 
-   Both imports are required. The rig-scoped roles pack supplies agents but,
-   by design, rig imports do not register city commands; importing roles alone
-   renders prompts that reference `gc gc claim` without installing that
-   command. Keep the top-level Gas City pack imported at city scope.
+   Both imports are required for the full workflow. The rig-scoped roles pack
+   supplies agents but, by design, rig imports do not register city commands.
+   Worker prompts use the built-in `gc hook --claim --drain-ack --json`, which
+   works with any import alias. Keep the top-level Gas City pack imported at
+   city scope for formulas, the mayor skill, and the optional claim wrapper
+   (`gc <alias> claim`, here `gc gc claim`).
 
    (Contributors hacking on packs can point this source at a local clone.)
 

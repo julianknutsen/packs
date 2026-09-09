@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import textwrap
 
@@ -185,11 +186,16 @@ def assert_clean_worker_render(prompt: str, persona_heading: str) -> None:
     assert persona_heading in prompt
     assert prompt.count("# GC Role Worker") == 1
     assert '{{ template "gc-role-worker" . }}' not in prompt
-    assert "gc gc claim" in prompt
+    assert "gc hook --claim --drain-ack --json" in prompt
+    assert "gc gc claim" not in prompt
     assert "CLAIMED_BEAD_ID" in prompt
     assert "CLAIMED_ROOT_BEAD_ID" in prompt
     assert "CLAIMED_CONTINUATION_GROUP" in prompt
     assert 'gc bd update "$CLAIMED_BEAD_ID"' in prompt
+    assert "--set-metadata 'gc.outcome=pass'" in prompt
+    assert "--set-metadata 'gc.work_outcome=shipped'" in prompt
+    assert 'gc.work_commit=$WORK_COMMIT' in prompt
+    assert 'gc.work_branch=$WORK_BRANCH' in prompt
     assert "An empty continuation group is a hard session boundary" in prompt
 
 
@@ -242,6 +248,8 @@ def test_plain_gastown_polecat_sling_starts_default_graph_workflow(
     ("city_binding", "pack_path", "agent", "persona_heading"),
     (
         ("gc", "gascity", "gc.implementation-worker", "# GC Role Worker"),
+        ("gascity", "gascity", "gc.implementation-worker", "# GC Role Worker"),
+        ("custom", "gascity", "gc.implementation-worker", "# GC Role Worker"),
         ("bmad", "bmad", "bmad.story-implementer", "# BMAD Story Implementer"),
         (
             "superpowers",
@@ -286,6 +294,16 @@ def test_role_prompts_render_public_worker_fragment(
 
     assert result.returncode == 0, result.stderr
     assert_clean_worker_render(result.stdout, persona_heading)
+
+    # The city command binding may differ from the rig role binding. Exercise
+    # the command actually rendered, without claiming work in the fixture.
+    claim = result.stdout.split("```bash\n", 1)[1].split("\n", 1)[0]
+    command = shlex.split(claim)
+    assert command == ["gc", "hook", "--claim", "--drain-ack", "--json"]
+    help_result = run_gc(gc_test_bin, workspace, *command[1:], "--help")
+    assert help_result.returncode == 0, help_result.stderr
+    assert "--claim" in help_result.stdout
+    assert "--drain-ack" in help_result.stdout
 
 
 def test_registered_claim_command_dispatches_store_aware_show_and_normalizes_json(
