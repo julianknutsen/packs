@@ -38,6 +38,24 @@ Never ask a human whether to proceed after a successful claim. Do not stop for
 confirmation in a headless workflow. If required task input is missing, record
 the bead's failure contract and close it instead of idling.
 
+## Codex gates
+
+When a bead calls for a Codex gate on citadel, commit the delta, then use the
+installed helper so the final verdict is validated:
+
+```bash
+"$GC_CITY_PATH/assets/ops/mayor-tools/codex-gate.sh" review \
+  --base "$REVIEW_BASE" -C "$REPO_DIR" --output "$REVIEW_OUTPUT" \
+  --model gpt-6-astra
+```
+
+The helper invokes `codex -p city -m gpt-6-astra exec --skip-git-repo-check`
+with read-only execution and stdin from `/dev/null`. For a prompt-file gate,
+replace `review --base "$REVIEW_BASE"` with `exec "$PROMPT_FILE"`.
+Provision the `city` profile and helper on the host before using these commands.
+Honor the bead's reviewer requirements: Codex-built changes still need a Fable
+adversarial review when the bead requests the cross-model gate.
+
 ## Close
 
 Honor bead's requested `gc.outcome` metadata. If no failure contract exists,
