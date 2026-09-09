@@ -43,8 +43,20 @@ sync_worktree() {
     if ! git -C "$WT" remote get-url origin >/dev/null 2>&1; then
         return 0
     fi
-    git -C "$WT" fetch origin 2>/dev/null || true
-    git -C "$WT" pull --rebase 2>/dev/null || true
+    # Fetch and rebase against the origin branch of the SAME name explicitly,
+    # rather than relying on `git pull --rebase`'s implicit upstream
+    # (`branch.<name>.remote`/`.merge`). A worktree branch created via the
+    # no-start-point fallback below (no `origin/HEAD` at creation time) never
+    # gets that tracking config, so the implicit form fails with "no tracking
+    # information for the current branch" -- silently, since both git calls
+    # here are best-effort. That failure is permanent: nothing later sets the
+    # missing tracking config, so every subsequent --sync repeats it forever.
+    # Naming the branch explicitly sidesteps the missing config entirely, and
+    # is a no-op (as before) when origin has no branch of this name yet.
+    CUR_BRANCH=$(git -C "$WT" symbolic-ref --short HEAD 2>/dev/null || true)
+    [ -n "$CUR_BRANCH" ] || return 0
+    git -C "$WT" fetch origin "$CUR_BRANCH" 2>/dev/null || return 0
+    git -C "$WT" pull --rebase origin "$CUR_BRANCH" 2>/dev/null || true
 }
 
 branch_name() {
