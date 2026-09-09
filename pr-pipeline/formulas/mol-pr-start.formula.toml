@@ -90,20 +90,131 @@ REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 
 ### Gate 1 — Competing PR
 
-Any open PR already targeting this issue, or already-merged fix?
+Does an open PR already COVER this issue? A PR that merely mentions it does
+not. This gate is two phases and they must stay separate — it is the same
+decision procedure `mol-pr-triage` follows, deliberately, so the two gates
+cannot drift.
+
+Getting this wrong is asymmetric here, worse than in triage: a false block
+aborts the authoring run and closes the root bead, so nobody works an issue
+nobody is fixing. A false pass costs one wasted read. Prefer passing.
+
+**Phase 1 — candidate discovery (a hit nominates a PR; it does NOT block):**
 
 ```bash
-COMPETING_PRS=$(gh pr list --repo "$REPO" --state open \\
-    --search "{{issue}}" --json number,title,author,createdAt)
+DEFAULT_BRANCH=$(gh repo view "$REPO" --json defaultBranchRef \\
+    -q .defaultBranchRef.name)
+
+CANDIDATE_PRS=$(gh pr list --repo "$REPO" --state open --search "{{issue}}" \\
+    --limit 1000 \\
+    --json number,title,body,author,createdAt,baseRefName)
 
 ISSUE_STATE=$(gh issue view {{issue}} --repo "$REPO" --json state -q .state)
 ```
 
-**If `COMPETING_PRS` is non-empty OR `ISSUE_STATE` is `CLOSED`, STOP:**
+`--search "{{issue}}"` is an untyped full-text query: it matches those digits
+anywhere in any open PR — a References/Related footer, a diff snippet, a line
+number, a byte count. It proves a PR's text CONTAINS the number, nothing more.
+`body` and `baseRefName` are not optional; Phase 2 cannot be decided without
+them.
+
+`--limit 1000` is not padding. `gh pr list` silently caps at 30, and this
+search is untyped, so a common number can easily return more than 30 incidental
+hits — a byte count here, a line number there. The genuinely covering PR is
+then truncated away, Phase 2 never sees it, and the gate passes an issue that
+IS being fixed. Fetch the whole practical result set and let Phase 2 decide.
+
+**Phase 2 — coverage decision (run per candidate PR; a candidate covers
+{{issue}} on exactly one of these two branches):**
+
+- **Closing keyword — mechanical and sufficient.** The candidate's body binds a
+  GitHub closing keyword to THIS issue on one line: `Closes|Fixes|Resolves
+  #{{issue}}` (also the singular/past forms `close/closed`, `fix/fixed`,
+  `resolve/resolved`; the reference may be `#{{issue}}`, `GH-{{issue}}`,
+  `owner/repo#{{issue}}`, or a full issue URL). A qualified reference counts
+  only when it names THIS repo — `Fixes octo/other#42` is about someone else's
+  #42 — and GitHub honours closing keywords only on PRs targeting the default
+  branch, so require `baseRefName == $DEFAULT_BRANCH`. Keywords inside code
+  spans or fences do not count. No judgment needed. Record
+  `coverage_basis: closing-keyword`.
+
+- **Structured coverage verdict — for keywordless coverage.** A PR may genuinely
+  supersede an issue without any keyword. Read the candidate's body in full and
+  emit one verdict per candidate:
+  ```json
+  { "issue": {{issue}}, "covers": true|false,
+    "evidence": ["<span quoted verbatim from the PR body>", ...],
+    "reasoning": "<why the change does or does not resolve the issue>" }
+  ```
+  Every `evidence` span MUST be copied verbatim from the PR body, and must be
+  substantial enough to be evidence: at least 12 characters and at least 2
+  words after trimming. Without that floor a single "." is quoted from every
+  body and the provenance check is vacuous. A covering verdict that cites
+  nothing, cites a span absent from the body, or cites a span below the floor
+  is invalid — discard it and treat that candidate as non-covering. Record
+  `coverage_basis: model-verdict`.
+
+Within the verdict branch, an explicit scope disclaimer is evidence AGAINST
+coverage — the PR author has already answered the question. Treat "intentionally
+does not cover", "not a fix for", "directionally aligned with ... not a fix",
+"adjacent", and "groundwork for" as `covers: false` unless the diff plainly
+contradicts the author.
+
+A disclaimer does NOT override a closing keyword, and that is deliberate. GitHub
+parses `Fixes #N` without reading the surrounding sentence, so even "this does
+not fix #42" closes #42 on merge.
+
+YOU apply the two phases above — nothing in this formula shells out to a
+validator, so the discipline is yours to keep.
+`pr-pipeline/tests/coverage_contract.py` is the reference implementation of
+exactly these rules, shared with `mol-pr-triage` and regression-tested against
+real PR bodies (fixtures in `pr-pipeline/tests/fixtures/`). Read it when a case
+is ambiguous; it is the tiebreaker. Keep the prose and the harness in step when
+either changes — they are coupled by convention, not by execution.
+
+Phase 2 produces one entry per candidate you decided COVERS {{issue}} — an
+empty array when none does. Write it to a run-scoped artifact:
 
 ```bash
-REASON="competing PR exists or issue already closed"
-DETAIL=$(echo "$COMPETING_PRS" | jq -c '.')
+COVERING_JSON="/tmp/pr-start-covering-$ROOT_ID.json"
+```
+
+The `$ROOT_ID` in that name is load-bearing. Several polecats share this
+machine and run this formula concurrently, so a fixed `/tmp` path is one
+run reading another run's verdicts: a stale covering entry from a neighbour
+blocks an issue nobody is fixing, and a neighbour's empty array passes one
+somebody is. Scope the path, and never hardcode the unscoped name.
+
+Write this shape to `$COVERING_JSON`:
+
+```
+[ { "number": <N>,
+    "coverage_basis": "closing-keyword" | "model-verdict",
+    "coverage_evidence": ["<verbatim PR-body span>", ...] } ]
+```
+
+`coverage_evidence` is empty on the `closing-keyword` basis (the keyword IS the
+evidence) and required on `model-verdict`. Write it atomically — a partial read
+of a half-written array is a miscount, and this count decides whether the run
+lives:
+
+```bash
+# ...write your Phase 2 result to "$COVERING_JSON.tmp" first...
+mv -f "$COVERING_JSON.tmp" "$COVERING_JSON"
+
+COVERING_PRS=$(jq -c '.' "$COVERING_JSON")
+COVERING_COUNT=$(jq 'length' "$COVERING_JSON")
+```
+
+Count the entries; do not test the string. `[]` is a non-empty *string*, so a
+`-n "$COVERING_PRS"` test blocks every run — which is the bug this gate is being
+fixed for, reintroduced one layer down.
+
+**If `COVERING_COUNT` is greater than 0 OR `ISSUE_STATE` is `CLOSED`, STOP:**
+
+```bash
+REASON="covering PR exists or issue already closed"
+DETAIL="$COVERING_PRS"
 gc bd update "$ROOT_ID" --notes "status: blocked
 gate: competing_pr
 detail: $DETAIL
@@ -111,9 +222,22 @@ issue_state: $ISSUE_STATE"
 echo "[pr-plan] BLOCKED — $REASON"
 echo "[pr-plan]   Detail: $DETAIL"
 echo "[pr-plan]   Caller options: pivot to a different issue, review the"
-echo "[pr-plan]                   competing PR, or coordinate with author."
+echo "[pr-plan]                   covering PR, or coordinate with author."
 gc bd close "$ROOT_ID" --reason "$REASON"
 exit 0
+```
+
+**Otherwise CONTINUE — including when candidates were found but none covers.**
+Surface them as context so the planner knows the neighbours, and so a reader can
+tell "checked, not covered" from "never checked":
+
+```bash
+MENTIONS=$(echo "$CANDIDATE_PRS" | jq -c '[.[] | {number, title}]')
+gc bd update "$ROOT_ID" --notes "gate: competing_pr
+result: pass
+mentioning_prs: $MENTIONS"
+echo "[pr-plan] Gate 1 pass — no open PR covers {{issue}}."
+echo "[pr-plan]   Mentioning PRs (context only): $MENTIONS"
 ```
 
 ### Gate 2 — Architectural refactor
